@@ -183,9 +183,10 @@ DISCLAIMER = (
 )
 
 # ── Scheduler ✅ ──────────────────────────────────────────────────────────────
-# Fixed hourly Active Check slots (IST hours, on the hour).
-# Scans fire at exactly 09:00, 10:00 … 15:00. No rolling intervals.
+# Fixed hourly Active Check slots (IST, half past each hour).
+# Scans fire at exactly 09:30, 10:30 … 15:30. No rolling intervals.
 ACTIVE_CHECK_HOURS = [9, 10, 11, 12, 13, 14, 15]
+ACTIVE_CHECK_MINUTE = 30
 
 # Passive check interval while market is closed (seconds).
 PASSIVE_CHECK_INTERVAL = 300   # 5 minutes

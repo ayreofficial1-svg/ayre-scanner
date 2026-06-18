@@ -31,8 +31,8 @@ import requests
 # comparisons use IST wall-clock time regardless of the host timezone.
 _IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
-from auth.fyers_auth import connect_fyers, reconnect_fyers
-from config.settings import ACTIVE_CHECK_HOURS, PASSIVE_CHECK_INTERVAL
+from auth.fyers_auth import reconnect_fyers
+from config.settings import ACTIVE_CHECK_HOURS, ACTIVE_CHECK_MINUTE, PASSIVE_CHECK_INTERVAL
 from data.symbols import fetch_nifty500, plain_constituents_for_market
 from scanner.watchlist import (
     load_watchlist, clean_watchlist, save_watchlist,
@@ -90,13 +90,27 @@ _fyers      = None
 _symbols    = None
 _start_time = time.time()   # for /api/status uptime tracking
 
-# Market hours (IST) — scanner runs only within this window
-_MARKET_OPEN  = datetime.time(9,  0)   # 09:00 IST — first scan trigger
-_MARKET_CLOSE = datetime.time(15, 30)  # 15:30 IST — no new scans after this
+# Market hours (IST) — scanner runs only within this window.
+# NSE regular session opens at 09:15; scans are intentionally fixed to
+# 09:30, 10:30, ... 15:30 so the first data pull has a settled opening range.
+_MARKET_OPEN  = datetime.time(9,  15)
+_MARKET_CLOSE = datetime.time(15, 30)
+_POST_CLOSE_PASSIVE_START = datetime.time(16, 0)
+
+# Free-source market-status checks are cached separately from price snapshots.
+# The short active-window TTL lets the app notice market-open transitions without
+# polling Yahoo/NSE on every frontend request; the closed TTL keeps overnight
+# checks light for a 24/7 process.
+_MARKET_STATUS_ACTIVE_TTL = 60
+_MARKET_STATUS_CLOSED_TTL = PASSIVE_CHECK_INTERVAL
 
 # ── Market snapshot cache ─────────────────────────────────────────────────────
 _market_lock = threading.Lock()
 _market_cache = {
+    "data"      : None,
+    "expires_at": 0.0,
+}
+_market_status_cache = {
     "data"      : None,
     "expires_at": 0.0,
 }
@@ -175,6 +189,12 @@ def api_results():
 def api_rescan():
     if _state["scanning"]:
         return jsonify({"status": "already_running"})
+    if not _fyers_market_data_allowed():
+        return jsonify({
+            "status": "market_closed",
+            "message": "Manual scans are allowed only while free sources confirm the market is open.",
+            "market_status": _free_market_status(),
+        }), 409
     _state["scanning"] = True
     threading.Thread(target=_do_scan, daemon=True).start()
     return jsonify({"status": "started"})
@@ -207,10 +227,12 @@ def api_status():
 
     summary = get_log_summary()
     uptime  = int(time.time() - _start_time)
+    market_status = _free_market_status()
 
     return jsonify({
         "status"          : "scanning" if _state["scanning"] else "live",
-        "market_open"     : _is_market_open(),
+        "market_open"     : market_status.get("status") == "open" and _is_market_open(),
+        "market_status"   : market_status,
         "uptime_seconds"  : uptime,
         "signals_logged"  : summary["total_signals"],
         "logs_days"       : summary["days_logged"],
@@ -370,6 +392,10 @@ def _do_scan():
     _state["scanning"] = True
     _state["error"]    = None
     try:
+        if not _fyers_market_data_allowed():
+            _state["error"] = "Scan skipped because the market is not source-confirmed open."
+            return
+
         watchlist = clean_watchlist(load_watchlist())
         alert_log = clean_alert_log(load_alert_log())
         save_watchlist(watchlist)
@@ -404,12 +430,14 @@ def _do_scan():
 
 def _seconds_until_next_active_slot() -> float | None:
     """
-    Seconds until the next fixed Active Check slot (whole hour, IST).
-    Returns None when all slots for today have passed (after 15:00).
+    Seconds until the next fixed Active Check slot (HH:30, IST).
+    Returns None when all slots for today have passed (after 15:30).
     """
     now = datetime.datetime.now(_IST)
     for h in ACTIVE_CHECK_HOURS:
-        target = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        target = now.replace(
+            hour=h, minute=ACTIVE_CHECK_MINUTE, second=0, microsecond=0
+        )
         diff = (target - now).total_seconds()
         if diff > 5.0:
             return diff
@@ -427,58 +455,161 @@ def _is_market_open() -> bool:
     return _MARKET_OPEN <= datetime.datetime.now(_IST).time() <= _MARKET_CLOSE
 
 
-def _passive_market_status() -> str:
+def _next_scan_slot_after(now: datetime.datetime | None = None) -> datetime.datetime:
+    now = now or datetime.datetime.now(_IST)
+    for h in ACTIVE_CHECK_HOURS:
+        target = now.replace(
+            hour=h, minute=ACTIVE_CHECK_MINUTE, second=0, microsecond=0
+        )
+        if target > now:
+            return target
+    tomorrow = now + datetime.timedelta(days=1)
+    return tomorrow.replace(
+        hour=ACTIVE_CHECK_HOURS[0],
+        minute=ACTIVE_CHECK_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _seconds_until_next_scan_slot() -> float:
+    now = datetime.datetime.now(_IST)
+    return max(0.0, (_next_scan_slot_after(now) - now).total_seconds())
+
+
+def _is_post_close_passive_window(now: datetime.datetime | None = None) -> bool:
+    now = now or datetime.datetime.now(_IST)
+    return now.time() >= _POST_CLOSE_PASSIVE_START or now.time() < _MARKET_OPEN
+
+
+def _market_status_payload(status: str, source: str, detail: str = "") -> dict:
+    return {
+        "status": status,
+        "source": source,
+        "detail": detail,
+        "checked_at": datetime.datetime.now(_IST).isoformat(),
+    }
+
+
+def _fetch_market_status_from_yahoo() -> dict:
     """
     Lightweight market-state probe using Yahoo Finance only. No Fyers.
-    Returns 'open' | 'closed' | 'holiday'.
-    Only called during the passive window (outside 09:00-15:30 IST).
+    Returns a payload with status 'open' | 'closed' | 'holiday'.
     """
-    try:
-        resp = requests.get(
-            "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI",
-            params={"interval": "1m", "range": "1d"},
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        resp.raise_for_status()
-        result = resp.json().get("chart", {}).get("result") or []
-        if not result:
-            return "closed"
-        meta = result[0].get("meta", {})
-        state = str(meta.get("marketState", "")).upper()
-        if state in ("REGULAR",):
-            return "open"
-        if not result[0].get("timestamp"):
-            return "holiday"
-        return "closed"
-    except Exception:
-        return "closed"
-
-
-def _seconds_until_market_open() -> float:
-    """
-    Seconds to sleep until the next 09:00 IST market open.
-    Used when the scanner is started outside market hours or after close.
-    """
-    now       = datetime.datetime.now(_IST)
-    today_open = now.replace(
-        hour=_MARKET_OPEN.hour, minute=_MARKET_OPEN.minute,
-        second=0, microsecond=0,
+    resp = requests.get(
+        "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI",
+        params={"interval": "1m", "range": "1d"},
+        timeout=8,
+        headers={"User-Agent": "Mozilla/5.0"},
     )
-    if now >= today_open:
-        # Already past today's open — wait for tomorrow's open
-        today_open += datetime.timedelta(days=1)
-    return (today_open - now).total_seconds()
+    resp.raise_for_status()
+    result = resp.json().get("chart", {}).get("result") or []
+    if not result:
+        return _market_status_payload("closed", "yahoo", "empty chart result")
+
+    row = result[0]
+    meta = row.get("meta", {})
+    state = str(meta.get("marketState", "")).upper()
+    if state == "REGULAR":
+        return _market_status_payload("open", "yahoo", state)
+    if not row.get("timestamp"):
+        return _market_status_payload("holiday", "yahoo", state or "no ticks")
+    return _market_status_payload("closed", "yahoo", state or "not regular")
+
+
+def _fetch_market_status_from_nse() -> dict:
+    """
+    Free NSE fallback for market-state checks. No Fyers.
+
+    NSE does not expose a dedicated open/closed flag here, so this uses the
+    index feed timestamp as confirmation during the regular session window.
+    """
+    session = _get_nse_session()
+    response = session.get("https://www.nseindia.com/api/allIndices", timeout=10)
+    response.raise_for_status()
+    indices = response.json().get("data", [])
+    item = next(
+        (
+            row for row in indices
+            if str(row.get("indexSymbol") or row.get("index") or "").upper().strip()
+            == "NIFTY 50"
+        ),
+        None,
+    )
+    if not item:
+        return _market_status_payload("closed", "nse", "NIFTY 50 missing")
+
+    timestamp = str(item.get("lastUpdateTime") or item.get("timeVal") or "").strip()
+    now = datetime.datetime.now(_IST)
+    timestamp_is_today = False
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M", "%d-%m-%Y %H:%M:%S"):
+        try:
+            timestamp_is_today = (
+                datetime.datetime.strptime(timestamp, fmt).date() == now.date()
+            )
+            break
+        except ValueError:
+            continue
+    if _MARKET_OPEN <= now.time() <= _MARKET_CLOSE and timestamp_is_today:
+        return _market_status_payload("open", "nse", timestamp)
+    if not timestamp:
+        return _market_status_payload("holiday", "nse", "no timestamp")
+    return _market_status_payload("closed", "nse", timestamp)
+
+
+def _free_market_status(*, force: bool = False) -> dict:
+    """
+    Cached market-state check using Yahoo/NSE only. No Fyers calls.
+    """
+    now = time.time()
+    with _market_lock:
+        cached = _market_status_cache["data"]
+        if not force and cached is not None and _market_status_cache["expires_at"] > now:
+            return dict(cached)
+
+    for fetcher in (_fetch_market_status_from_yahoo, _fetch_market_status_from_nse):
+        try:
+            data = fetcher()
+            ttl = (
+                _MARKET_STATUS_ACTIVE_TTL
+                if data.get("status") == "open"
+                else _MARKET_STATUS_CLOSED_TTL
+            )
+            with _market_lock:
+                _market_status_cache["data"] = dict(data)
+                _market_status_cache["expires_at"] = now + ttl
+            return data
+        except Exception:
+            continue
+
+    data = _market_status_payload("unknown", "fallback", "free sources unavailable")
+    with _market_lock:
+        _market_status_cache["data"] = dict(data)
+        _market_status_cache["expires_at"] = now + min(60, PASSIVE_CHECK_INTERVAL)
+    return data
+
+
+def _free_sources_confirm_market_open(*, force: bool = False) -> bool:
+    return _is_market_open() and _free_market_status(force=force).get("status") == "open"
+
+
+def _fyers_market_data_allowed() -> bool:
+    """
+    Fyers may be used only inside regular hours after a free source confirms
+    that the market is actually open. This prevents holiday/weekend burn.
+    """
+    return _free_sources_confirm_market_open(force=False)
 
 
 def _scan_loop() -> None:
     """
     Unified scheduler: Passive Check (closed) -> Active Check (open).
 
-    Passive  (15:30-09:00 IST): polls _passive_market_status() every
+    Passive  (closed): polls free market-status sources every
              PASSIVE_CHECK_INTERVAL seconds. No Fyers calls.
-    Active   (09:00-15:30 IST): fires at fixed hourly slots 9-15.
-             Re-authenticates Fyers once per trading day before first scan.
+    Active   (source-confirmed open): fires at fixed half-hour slots
+             09:30-15:30. Re-authenticates Fyers once per trading day before
+             the first scan.
     """
     global _fyers
     _last_auth_date: datetime.date | None = None
@@ -486,16 +617,17 @@ def _scan_loop() -> None:
     while True:
         now_ist = datetime.datetime.now(_IST)
         today = now_ist.date()
+        _state["next_scan_time"] = _next_scan_slot_after(now_ist).strftime("%d %b %Y %H:%M:%S")
 
         # ── PASSIVE WINDOW ────────────────────────────────────────────────────
-        if not _is_market_open():
-            wait = _seconds_until_market_open()
-            next_open = now_ist + datetime.timedelta(seconds=wait)
-            _state["next_scan_time"] = next_open.strftime("%d %b %Y %H:%M:%S")
-
-            status = _passive_market_status()
-            if status == "holiday":
-                print(f"📅  Trading holiday - passive check in {PASSIVE_CHECK_INTERVAL}s")
+        market_status = _free_market_status(force=_is_post_close_passive_window(now_ist))
+        if not _is_market_open() or market_status.get("status") != "open":
+            status = market_status.get("status", "unknown")
+            if status in ("holiday", "closed"):
+                print(
+                    f"📅  Market {status} via {market_status.get('source')} - "
+                    f"passive check in {PASSIVE_CHECK_INTERVAL}s"
+                )
             time.sleep(PASSIVE_CHECK_INTERVAL)
             continue
 
@@ -511,16 +643,18 @@ def _scan_loop() -> None:
                     print(f"   ⚠️  Re-auth attempt {attempt + 1}/3 failed: {e}")
                     time.sleep(30)
             else:
-                print("   ❌ All re-auth attempts failed - will retry on next passive cycle.")
+                print("   ❌ All re-auth attempts failed - will retry before the next scan slot.")
                 time.sleep(PASSIVE_CHECK_INTERVAL)
                 continue
 
         sleep_secs = _seconds_until_next_active_slot()
         if sleep_secs is None:
-            h, rem = divmod(int(_seconds_until_market_open()), 3600)
+            h, rem = divmod(int(_seconds_until_next_scan_slot()), 3600)
             m, s = divmod(rem, 60)
-            print(f"\n🔴  Active slots exhausted. Passive resumes. "
-                  f"Next market open in {h}h {m}m {s}s")
+            print(
+                f"\n🔴  Active slots exhausted. Passive resumes. "
+                f"Next first scan slot in {h}h {m}m {s}s"
+            )
             time.sleep(PASSIVE_CHECK_INTERVAL)
             continue
 
@@ -532,8 +666,12 @@ def _scan_loop() -> None:
 
         time.sleep(sleep_secs)
 
-        if not _is_market_open():
-            print("\n🔴  Woke after market close — skipping scan.")
+        if not _free_sources_confirm_market_open(force=True):
+            print("\n🔴  Market is not source-confirmed open — skipping scan.")
+            continue
+
+        if _state["scanning"]:
+            print("\n⏭️   Previous scan still running — skipping this fixed slot.")
             continue
 
         print(f"\n🟢  Active check — {datetime.datetime.now(_IST).strftime('%H:%M')} IST")
@@ -548,7 +686,7 @@ def _refresh_quotes() -> None:
     """Fetch live LTPs for all stocks in _state and update _quotes_cache."""
     global _quotes_cache, _quotes_updated_at
 
-    if _fyers is None:
+    if _fyers is None or not _fyers_market_data_allowed():
         return
 
     all_items = _state["signals"] + _state["watchlist_items"]
@@ -584,7 +722,7 @@ def _start_quotes_poller(interval_seconds: int = 15) -> None:
         print(f"📈  Quotes poller started (every {interval_seconds}s via Fyers bulk quotes)")
         while True:
             try:
-                if _is_market_open():
+                if _fyers_market_data_allowed():
                     _refresh_quotes()
             except Exception:
                 pass
@@ -607,9 +745,8 @@ def _get_market_snapshot() -> dict:
             return cached
 
     # Source waterfall: NSE (free, primary) → Fyers → Yahoo → hardcoded fallback
-    # Fyers is only used as a fallback during market hours — calling it outside
-    # the trading window burns the daily rate limit before the market opens.
-    if _is_market_open():
+    # Fyers is only used after free sources confirm the market is open.
+    if _fyers_market_data_allowed():
         fetchers = (_fetch_market_from_nse, _fetch_market_from_fyers, _fetch_market_from_yahoo)
     else:
         fetchers = (_fetch_market_from_nse, _fetch_market_from_yahoo)
@@ -805,7 +942,6 @@ def _get_constituents(market_cfg: dict) -> dict:
     except Exception as e:
         # Surface a partial response rather than a 500 error.
         # Use plain hardcoded symbols so the frontend always gets a list.
-        from data.symbols import plain_constituents_for_market
         syms   = plain_constituents_for_market(market_key)
         stocks = _constituent_dicts_from_plain_symbols(syms)
         data   = {
@@ -908,7 +1044,7 @@ def _constituent_dicts_from_plain_symbols(symbols: list[str]) -> list[dict]:
 def _merge_fyers_into_constituent_stocks(stocks: list[dict]) -> bool:
     """Enrich rows with batched Fyers quotes. Returns True if any field updated."""
     global _fyers
-    if not stocks or _fyers is None:
+    if not stocks or _fyers is None or not _fyers_market_data_allowed():
         return False
     syms = [s["symbol"] for s in stocks if s.get("symbol")]
     qmap = fetch_constituents_quotes_bulk(_fyers, syms)
@@ -945,7 +1081,8 @@ def _merge_fyers_into_constituent_stocks(stocks: list[dict]) -> bool:
 def _build_constituents_payload(market_cfg: dict) -> dict:
     """
     Compose index constituents: NSE table when available, CSV/API fallbacks,
-    then batched Fyers quotes (≤2 calls for 50) for live LTP / high / low.
+    then batched Fyers quotes for live LTP / high / low only while market-data
+    use is allowed.
     """
     market_key = market_cfg["market_key"]
     session    = _get_nse_session()
@@ -1100,12 +1237,20 @@ def _start_market_poller(interval_seconds: int = 5) -> None:
                 _get_market_snapshot()
             except Exception:
                 pass
-            sleep = interval_seconds if _is_market_open() else 60
+            if _fyers_market_data_allowed():
+                sleep = interval_seconds
+            elif _is_market_open():
+                sleep = 60
+            else:
+                sleep = PASSIVE_CHECK_INTERVAL
             time.sleep(sleep)
 
     t = threading.Thread(target=_poll, daemon=True, name="market-poller")
     t.start()
-    print(f"📡  Market poller started (every {interval_seconds}s during market hours — NSE → Fyers → Yahoo)")
+    print(
+        f"📡  Market poller started "
+        f"(every {interval_seconds}s while source-confirmed open — NSE → Fyers → Yahoo)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1136,8 +1281,11 @@ def main():
     print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")
     print(f"    Stocks     : {len(_symbols)}")
 
-    print(f"\n🔄  Starting fixed-slot scan loop "
-          f"(09:00–15:30 IST, hourly at {ACTIVE_CHECK_HOURS}) …")
+    slot_labels = [f"{h:02d}:{ACTIVE_CHECK_MINUTE:02d}" for h in ACTIVE_CHECK_HOURS]
+    print(
+        f"\n🔄  Starting fixed-slot scan loop "
+        f"({slot_labels[0]}–{slot_labels[-1]} IST via {', '.join(slot_labels)}) …"
+    )
     threading.Thread(target=_scan_loop, daemon=True, name="scan-loop").start()
     _start_market_poller(interval_seconds=5)
     _start_quotes_poller(interval_seconds=15)

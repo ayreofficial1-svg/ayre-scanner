@@ -90,7 +90,14 @@ python main.py
 
 ## How it works
 
-The scanner runs every 5 minutes during market hours (9:15 AM – 3:30 PM IST, Mon–Fri).
+The scanner runs continuously and automatically, but scan execution is fixed to
+hourly IST slots: 9:30 AM, 10:30 AM, 11:30 AM, 12:30 PM, 1:30 PM, 2:30 PM,
+and 3:30 PM. Slots are clock-aligned, so a slow scan does not push the next
+scan to one hour after completion.
+
+Fyers is used only after free market-status sources confirm that the Indian
+market is open. Outside market hours, and on holidays, the app uses Yahoo
+Finance/NSE checks instead of spending Fyers requests.
 
 **Three conditions must ALL be true:**
 1. SMA44 passes the daily C1 trend checks, optionally after the weekly SMA44 rising pre-filter.
@@ -100,8 +107,9 @@ The scanner runs every 5 minutes during market hours (9:15 AM – 3:30 PM IST, M
 Stocks passing 1+2 but not 3 go into the **watchlist** while MACD remains pending. Payloads include informational tags such as `ma_type`, `is_double_bottom`, `price_interaction_type`, and `weekly_rising`.
 
 ## Token refresh
-Fyers token is refreshed **automatically every day** using your TOTP key + PIN.
-No manual steps needed after initial setup.
+Fyers token is refreshed **automatically each source-confirmed trading day**
+using your TOTP key + PIN before the first 9:30 AM scan. No manual steps needed
+after initial setup, provided the FYERS credentials and TOTP secret remain valid.
 
 ## Legal
 This tool is intended for use by SEBI-registered Research Analysts (RA).
