@@ -99,6 +99,11 @@ Fyers is used only after free market-status sources confirm that the Indian
 market is open. Outside market hours, and on holidays, the app uses Yahoo
 Finance/NSE checks instead of spending Fyers requests.
 
+After market close, passive market-status checks are fixed to clock times:
+hourly from 4:00 PM IST onward, plus a 9:15 AM IST pre-open check so the app
+can authenticate before the first 9:30 AM scan. These passive checks use only
+Yahoo Finance/NSE and never call Fyers.
+
 **Three conditions must ALL be true:**
 1. SMA44 passes the daily C1 trend checks, optionally after the weekly SMA44 rising pre-filter.
 2. The latest daily candle touches SMA44 within the configured buffer and closes at or above SMA44.

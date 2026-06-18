@@ -85,6 +85,7 @@ _state = {
     "scanning"        : False,
     "error"           : None,
     "next_scan_time"  : None, # ISO timestamp of next scheduled boundary
+    "next_passive_check_time": None,
 }
 _fyers      = None
 _symbols    = None
@@ -200,19 +201,29 @@ def api_rescan():
     return jsonify({"status": "started"})
 
 
+def _format_ist(dt: datetime.datetime | None) -> str | None:
+    if dt is None:
+        return None
+    return dt.astimezone(_IST).strftime("%d %b %Y %H:%M:%S")
+
+
 @app.route("/api/status")
 def api_status():
     """
-    Returns system health, uptime, and next scheduled scan time.
+    Returns system health, uptime, next scheduled scan time, and next passive
+    free-source market-status check.
 
     Response shape
     ──────────────
     {
         "status"         : "live" | "scanning",
+        "market_open"    : true,
+        "market_status"  : {"status": "open", "source": "yahoo", ...},
         "uptime_seconds" : 3600,
         "signals_logged" : 256,
         "logs_days"      : 42,
         "next_scan"      : "05 Apr 2026 10:30:00",
+        "next_passive_check": "05 Apr 2026 16:00:00",
         "total_scanned"  : 404,
         "total_attempted": 498,
         "memory_mb"      : 125.4
@@ -237,6 +248,7 @@ def api_status():
         "signals_logged"  : summary["total_signals"],
         "logs_days"       : summary["days_logged"],
         "next_scan"       : _state.get("next_scan_time"),
+        "next_passive_check": _state.get("next_passive_check_time"),
         "total_scanned"   : _state["total_scanned"],
         "total_attempted" : _state["total_attempted"],
         "memory_mb"       : mem_mb,
@@ -268,7 +280,8 @@ def api_market():
 
     Flutter integration notes
     ──────────────────────────
-    - Poll every 5 s during market hours.
+    - Poll this endpoint at the frontend's display refresh cadence.
+      Backend caching and Fyers gating keep external requests bounded.
     - markets list is always in fixed order: Nifty → Sensex → Bank Nifty.
     - Infinite carousel: nextIndex = (currentIndex + 1) % markets.length
     - On tap, pass markets[i].key to GET /api/market/<key>/constituents.
@@ -349,8 +362,8 @@ def api_quotes():
         "updated_at": "<ISO timestamp>"
     }
 
-    Poll every 15 s during market hours. Rapid polling is safe — the backend
-    has a minimum-interval guard inside data/quotes.py.
+    Poll every 15 s only while source-confirmed market data is allowed. Rapid
+    frontend polling is safe because this endpoint returns the backend cache.
     """
     with _quotes_lock:
         return jsonify({
@@ -477,9 +490,47 @@ def _seconds_until_next_scan_slot() -> float:
     return max(0.0, (_next_scan_slot_after(now) - now).total_seconds())
 
 
-def _is_post_close_passive_window(now: datetime.datetime | None = None) -> bool:
+def _clock_hour_at_or_after(now: datetime.datetime) -> datetime.datetime:
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    if current_hour >= now:
+        return current_hour
+    return current_hour + datetime.timedelta(hours=1)
+
+
+def _today_at(now: datetime.datetime, clock_time: datetime.time) -> datetime.datetime:
+    return now.replace(
+        hour=clock_time.hour,
+        minute=clock_time.minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _next_passive_status_check_at_or_after(now: datetime.datetime | None = None) -> datetime.datetime:
+    """
+    Next fixed passive market-status check, including a boundary due now.
+
+    After the regular session, checks are aligned hourly from 16:00 IST. A
+    special 09:15 IST pre-open check lets the app authenticate before 09:30
+    when Yahoo/NSE indicate the market has opened.
+    """
     now = now or datetime.datetime.now(_IST)
-    return now.time() >= _POST_CLOSE_PASSIVE_START or now.time() < _MARKET_OPEN
+    candidates: list[datetime.datetime] = []
+
+    today_preopen = _today_at(now, _MARKET_OPEN)
+    if today_preopen >= now:
+        candidates.append(today_preopen)
+
+    today_post_close = _today_at(now, _POST_CLOSE_PASSIVE_START)
+    if today_post_close >= now:
+        candidates.append(today_post_close)
+
+    candidates.append(_clock_hour_at_or_after(now))
+    return min(candidate for candidate in candidates if candidate >= now)
+
+
+def _sleep_until(target: datetime.datetime) -> None:
+    time.sleep(max(0.0, (target - datetime.datetime.now(_IST)).total_seconds()))
 
 
 def _market_status_payload(status: str, source: str, detail: str = "") -> dict:
@@ -605,8 +656,9 @@ def _scan_loop() -> None:
     """
     Unified scheduler: Passive Check (closed) -> Active Check (open).
 
-    Passive  (closed): polls free market-status sources every
-             PASSIVE_CHECK_INTERVAL seconds. No Fyers calls.
+    Passive  (closed): checks Yahoo/NSE market status at fixed clock times:
+             hourly from 16:00 IST after close, and 09:15 IST before the first
+             scan. No Fyers calls.
     Active   (source-confirmed open): fires at fixed half-hour slots
              09:30-15:30. Re-authenticates Fyers once per trading day before
              the first scan.
@@ -617,23 +669,43 @@ def _scan_loop() -> None:
     while True:
         now_ist = datetime.datetime.now(_IST)
         today = now_ist.date()
-        _state["next_scan_time"] = _next_scan_slot_after(now_ist).strftime("%d %b %Y %H:%M:%S")
+        _state["next_scan_time"] = _format_ist(_next_scan_slot_after(now_ist))
 
         # ── PASSIVE WINDOW ────────────────────────────────────────────────────
-        market_status = _free_market_status(force=_is_post_close_passive_window(now_ist))
-        if not _is_market_open() or market_status.get("status") != "open":
-            status = market_status.get("status", "unknown")
-            if status in ("holiday", "closed"):
-                print(
-                    f"📅  Market {status} via {market_status.get('source')} - "
-                    f"passive check in {PASSIVE_CHECK_INTERVAL}s"
-                )
-            time.sleep(PASSIVE_CHECK_INTERVAL)
+        if not _is_market_open():
+            next_check = _next_passive_status_check_at_or_after(now_ist)
+            _state["next_passive_check_time"] = _format_ist(next_check)
+            print(
+                f"\n🔵  Market outside trading window. "
+                f"Next passive status check at {next_check.strftime('%H:%M')} IST "
+                f"(next scan slot {_next_scan_slot_after(now_ist).strftime('%H:%M')} IST)."
+            )
+            _sleep_until(next_check)
+            status = _free_market_status(force=True)
+            print(
+                f"🔵  Passive status check: market {status.get('status')} "
+                f"via {status.get('source')} — no Fyers calls."
+            )
             continue
+
+        market_status = _free_market_status(force=True)
+        if market_status.get("status") != "open":
+            status = market_status.get("status", "unknown")
+            next_check = _next_passive_status_check_at_or_after(now_ist)
+            _state["next_passive_check_time"] = _format_ist(next_check)
+            print(
+                f"\n🔵  Market {status} via {market_status.get('source')} "
+                f"during trading window. Next passive status check at "
+                f"{next_check.strftime('%H:%M')} IST — no Fyers calls."
+            )
+            _sleep_until(next_check)
+            continue
+
+        _state["next_passive_check_time"] = None
 
         # ── ACTIVE WINDOW ─────────────────────────────────────────────────────
         if _last_auth_date != today:
-            print(f"\n🔑  New trading day ({today}) - refreshing Fyers token …")
+            print(f"\n🔑  Source-confirmed trading day ({today}) - refreshing Fyers token before scan slots …")
             for attempt in range(3):
                 try:
                     _fyers = reconnect_fyers()
@@ -643,8 +715,13 @@ def _scan_loop() -> None:
                     print(f"   ⚠️  Re-auth attempt {attempt + 1}/3 failed: {e}")
                     time.sleep(30)
             else:
-                print("   ❌ All re-auth attempts failed - will retry before the next scan slot.")
-                time.sleep(PASSIVE_CHECK_INTERVAL)
+                retry_at = _next_passive_status_check_at_or_after(datetime.datetime.now(_IST))
+                _state["next_passive_check_time"] = _format_ist(retry_at)
+                print(
+                    "   ❌ All re-auth attempts failed - will retry after the next "
+                    f"passive status check at {retry_at.strftime('%H:%M')} IST."
+                )
+                _sleep_until(retry_at)
                 continue
 
         sleep_secs = _seconds_until_next_active_slot()
@@ -652,14 +729,13 @@ def _scan_loop() -> None:
             h, rem = divmod(int(_seconds_until_next_scan_slot()), 3600)
             m, s = divmod(rem, 60)
             print(
-                f"\n🔴  Active slots exhausted. Passive resumes. "
-                f"Next first scan slot in {h}h {m}m {s}s"
+                f"\n🔴  Active scan slots exhausted. "
+                f"Next first scan slot in {h}h {m}m {s}s."
             )
-            time.sleep(PASSIVE_CHECK_INTERVAL)
             continue
 
         next_dt = datetime.datetime.now(_IST) + datetime.timedelta(seconds=sleep_secs)
-        _state["next_scan_time"] = next_dt.strftime("%d %b %Y %H:%M:%S")
+        _state["next_scan_time"] = _format_ist(next_dt)
         _, rem = divmod(int(sleep_secs), 3600)
         m, s = divmod(rem, 60)
         print(f"\n⏰  Next active scan at {next_dt.strftime('%H:%M')} IST (in {m}m {s}s)")
@@ -667,7 +743,7 @@ def _scan_loop() -> None:
         time.sleep(sleep_secs)
 
         if not _free_sources_confirm_market_open(force=True):
-            print("\n🔴  Market is not source-confirmed open — skipping scan.")
+            print("\n🔴  Market is not source-confirmed open — skipping this fixed scan slot.")
             continue
 
         if _state["scanning"]:
@@ -719,7 +795,10 @@ def _start_quotes_poller(interval_seconds: int = 15) -> None:
     def _poll():
         while not (_state["signals"] or _state["watchlist_items"]):
             time.sleep(2)
-        print(f"📈  Quotes poller started (every {interval_seconds}s via Fyers bulk quotes)")
+        print(
+            f"📈  Quotes poller started "
+            f"(checks every {interval_seconds}s; Fyers only while source-confirmed open)"
+        )
         while True:
             try:
                 if _fyers_market_data_allowed():
@@ -1221,10 +1300,10 @@ def _get_nse_session() -> requests.Session:
 
 def _start_market_poller(interval_seconds: int = 5) -> None:
     """
-    Background thread that refreshes the market snapshot cache every interval.
+    Background thread that refreshes the market snapshot cache.
     Cache is always warm — Flutter clients get instant responses.
-    Outside market hours the poll slows to 60 s (index values don't change)
-    and Fyers is never called, preserving the daily API rate limit.
+    Fyers is only allowed after Yahoo/NSE confirm the market is open. Outside
+    market hours the poll slows to PASSIVE_CHECK_INTERVAL and uses free sources.
     """
     def _poll():
         try:
@@ -1249,7 +1328,8 @@ def _start_market_poller(interval_seconds: int = 5) -> None:
     t.start()
     print(
         f"📡  Market poller started "
-        f"(every {interval_seconds}s while source-confirmed open — NSE → Fyers → Yahoo)"
+        f"({interval_seconds}s while source-confirmed open; "
+        f"{PASSIVE_CHECK_INTERVAL // 60}m outside market hours; NSE/Yahoo free-source fallback)"
     )
 
 
@@ -1275,7 +1355,7 @@ def main():
         print("     Or for dev: npm run dev → open http://localhost:5173\n")
 
     _symbols = fetch_nifty500()
-    print("   Auth will run automatically before first market-open scan.")
+    print("   Auth will run automatically after Yahoo/NSE confirm a trading day, before the first scan slot.")
 
     summary = get_log_summary()
     print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")

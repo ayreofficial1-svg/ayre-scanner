@@ -188,5 +188,7 @@ DISCLAIMER = (
 ACTIVE_CHECK_HOURS = [9, 10, 11, 12, 13, 14, 15]
 ACTIVE_CHECK_MINUTE = 30
 
-# Passive check interval while market is closed (seconds).
-PASSIVE_CHECK_INTERVAL = 300   # 5 minutes
+# Passive market-status check interval while market is closed (seconds).
+# Checks are aligned to fixed clock boundaries, not scheduled relative to the
+# previous check. After market close they run hourly from 16:00 IST onward.
+PASSIVE_CHECK_INTERVAL = 3600
