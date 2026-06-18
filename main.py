@@ -1287,7 +1287,7 @@ def main():
         f"({slot_labels[0]}–{slot_labels[-1]} IST via {', '.join(slot_labels)}) …"
     )
     threading.Thread(target=_scan_loop, daemon=True, name="scan-loop").start()
-    _start_market_poller(interval_seconds=5)
+    _start_market_poller(interval_seconds=60)
     _start_quotes_poller(interval_seconds=15)
 
     url = f"http://localhost:{args.port}"
