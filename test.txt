@@ -1,0 +1,283 @@
+Let me read all three uploaded files carefully.Good. I have everything I need. Here's the full analysis and decision:
+
+---
+
+## File Completeness
+
+All required files are present. No missing files.
+
+---
+
+## Core Problem: Why Auth is Still Manual
+
+The automated flow (`_generate_access_token`) **already works** — TOTP, PIN, auth code extraction are all implemented. The reason you still see the browser fallback is:
+
+**`_generate_access_token` uses `app_id: FYERS_APP_TYPE` (value `"100"`) in the OTP request.** Fyers's vagator endpoint expects `app_id: "2"` (a hardcoded internal constant), not the SDK app type. This is the single most common cause of the 400/OTP failure that triggers the browser fallback.
+
+Additionally, the browser fallback (`_browser_auth_flow`) is **unreachable headlessly** on Railway — it opens a browser and blocks for 5 minutes waiting for a callback that never arrives.
+
+---
+
+## Evaluation: Uploaded Version vs Previous Suggestions
+
+| Aspect | Uploaded `main.py` | Previous suggestion |
+|---|---|---|
+| Boundary scheduler | `_next_boundary_seconds()` — rolling :00/:30 | Fixed hourly slots (9–15) |
+| Market-closed sleep | Sleeps full duration until 9 AM | Passive poll loop every 5 min |
+| Daily re-auth | None | `reconnect_fyers()` before first scan |
+| `_is_market_open()` | Time-only check, no holiday awareness | Same |
+| `_seconds_until_market_open()` | Correct, clean | Slightly redundant rewrite |
+
+**Decision:** Keep the uploaded `main.py`'s scheduler architecture (`_next_boundary_seconds`, `_seconds_until_market_open`, the `_scan_loop` structure) — it's clean and drift-free. Augment it with: fixed hourly slots instead of :00/:30, daily re-auth injection, and passive status polling during the closed window.
+
+---
+
+## Exact Changes Required
+
+### `auth/fyers_auth.py` — 3 changes
+
+**Change 1:** Fix the OTP request `app_id`. This is the root cause of the browser fallback.
+
+In `_generate_access_token`, find:
+```python
+login_otp = session.post(
+    _URL_LOGIN_OTP,
+    json={"fy_id": FYERS_CLIENT_ID, "app_id": FYERS_APP_TYPE},
+    timeout=15,
+)
+```
+Replace with:
+```python
+login_otp = session.post(
+    _URL_LOGIN_OTP,
+    json={"fy_id": FYERS_CLIENT_ID, "app_id": "2"},
+    timeout=15,
+)
+```
+`"2"` is the fixed internal identifier Fyers's vagator API expects for the TOTP login flow. `FYERS_APP_TYPE` (`"100"`) is the SDK's app-type suffix, which is different.
+
+**Change 2:** Remove the browser fallback from `_generate_access_token`. On Railway there is no browser. Replace the fallback block (lines 272–287) with a hard raise:
+
+```python
+    if login_otp.status_code != 200:
+        try:
+            err = login_otp.json()
+        except Exception:
+            err = login_otp.text
+        raise RuntimeError(
+            f"Fyers OTP request failed ({login_otp.status_code}): {err}\n"
+            "Check FYERS_CLIENT_ID (must be your login ID, e.g. XY12345) "
+            "and that TOTP 2FA is enabled on your account."
+        )
+```
+
+**Change 3:** Add `reconnect_fyers()` at the bottom of the file for daily re-auth without `sys.exit`:
+
+```python
+def reconnect_fyers() -> fyersModel.FyersModel:
+    """
+    Force fresh authentication, bypassing cache.
+    Called automatically before the first Active Check of each trading day.
+    Raises RuntimeError on failure (caller retries) instead of sys.exit.
+    """
+    _clear_cached_token()
+    print("\n🔄  Fyers daily re-auth …")
+    token = _generate_access_token()
+    _save_token(token)
+    fyers = _build_fyers_client(token)
+    profile = fyers.get_profile()
+    if str(profile.get("code")) != "200":
+        raise RuntimeError(f"Re-auth profile check failed: {profile}")
+    name = profile.get("data", {}).get("name", FYERS_CLIENT_ID)
+    print(f"   ✅ Re-authenticated as {name}")
+    return fyers
+```
+
+Also remove the `threading` and `http.server` imports since `_browser_auth_flow` (which used them) is now dead code. Remove `_OAuthCallbackHandler` and `_browser_auth_flow` entirely.
+
+---
+
+### `config/settings.py` — 1 change
+
+Append at the bottom:
+
+```python
+# ── Scheduler ✅ ──────────────────────────────────────────────────────────────
+# Fixed hourly Active Check slots (IST hours, on the hour).
+# Scans fire at exactly 09:00, 10:00 … 15:00. No rolling intervals.
+ACTIVE_CHECK_HOURS    = [9, 10, 11, 12, 13, 14, 15]
+# Passive check interval while market is closed (seconds).
+PASSIVE_CHECK_INTERVAL = 300   # 5 minutes
+```
+
+---
+
+### `main.py` — 4 changes
+
+**Change 1:** Update the import line:
+
+```python
+from auth.fyers_auth import connect_fyers, reconnect_fyers
+```
+And add to the settings import block:
+```python
+from config.settings import ACTIVE_CHECK_HOURS, PASSIVE_CHECK_INTERVAL
+```
+
+**Change 2:** Remove `_SCAN_BOUNDARY_MINUTES = 60` (line 93) — it's replaced by `ACTIVE_CHECK_HOURS`. Keep `_MARKET_OPEN` and `_MARKET_CLOSE`.
+
+**Change 3:** Replace `_next_boundary_seconds()` with `_seconds_until_next_active_slot()`. Keep `_seconds_until_market_open()` unchanged — it's correct.
+
+```python
+def _seconds_until_next_active_slot() -> float | None:
+    """
+    Seconds until the next fixed Active Check slot (whole hour, IST).
+    Returns None when all slots for today have passed (after 15:00).
+    """
+    now = datetime.datetime.now(_IST)
+    for h in ACTIVE_CHECK_HOURS:
+        target = now.replace(hour=h, minute=0, second=0, microsecond=0)
+        diff = (target - now).total_seconds()
+        if diff > 5.0:
+            return diff
+    return None
+```
+
+**Change 4:** Replace `_scan_loop()` entirely:
+
+```python
+def _scan_loop() -> None:
+    """
+    Unified scheduler: Passive Check (closed) → Active Check (open).
+
+    Passive  (15:30–09:00 IST): polls _passive_market_status() every
+             PASSIVE_CHECK_INTERVAL seconds. No Fyers calls.
+    Active   (09:00–15:30 IST): fires at fixed hourly slots 9–15.
+             Re-authenticates Fyers once per trading day before first scan.
+    """
+    global _fyers
+    _last_auth_date: datetime.date | None = None
+
+    while True:
+        now_ist = datetime.datetime.now(_IST)
+        today   = now_ist.date()
+
+        # ── PASSIVE WINDOW ────────────────────────────────────────────────────
+        if not _is_market_open():
+            # Compute and display time until next 09:00
+            wait      = _seconds_until_market_open()
+            next_open = now_ist + datetime.timedelta(seconds=wait)
+            _state["next_scan_time"] = next_open.strftime("%d %b %Y %H:%M:%S")
+
+            status = _passive_market_status()
+            if status == "holiday":
+                print(f"📅  Trading holiday — passive check in {PASSIVE_CHECK_INTERVAL}s")
+            # Either closed or holiday: sleep and re-check
+            time.sleep(PASSIVE_CHECK_INTERVAL)
+            continue
+
+        # ── ACTIVE WINDOW ─────────────────────────────────────────────────────
+        # Refresh Fyers auth once per trading day, before the first scan.
+        if _last_auth_date != today:
+            print(f"\n🔑  New trading day ({today}) — refreshing Fyers token …")
+            for attempt in range(3):
+                try:
+                    _fyers = reconnect_fyers()
+                    _last_auth_date = today
+                    break
+                except Exception as e:
+                    print(f"   ⚠️  Re-auth attempt {attempt+1}/3 failed: {e}")
+                    time.sleep(30)
+            else:
+                print("   ❌ All re-auth attempts failed — will retry on next passive cycle.")
+                time.sleep(PASSIVE_CHECK_INTERVAL)
+                continue
+
+        # Find next fixed slot
+        sleep_secs = _seconds_until_next_active_slot()
+        if sleep_secs is None:
+            # All slots done — back to passive
+            h, rem = divmod(int(_seconds_until_market_open()), 3600)
+            m, s   = divmod(rem, 60)
+            print(f"\n🔴  Active slots exhausted. Passive resumes. "
+                  f"Next market open in {h}h {m}m {s}s")
+            time.sleep(PASSIVE_CHECK_INTERVAL)
+            continue
+
+        next_dt = datetime.datetime.now(_IST) + datetime.timedelta(seconds=sleep_secs)
+        _state["next_scan_time"] = next_dt.strftime("%d %b %Y %H:%M:%S")
+        _, rem = divmod(int(sleep_secs), 3600)
+        m, s   = divmod(rem, 60)
+        print(f"\n⏰  Next active scan at {next_dt.strftime('%H:%M')} IST (in {m}m {s}s)")
+
+        time.sleep(sleep_secs)
+
+        if not _is_market_open():
+            print("\n🔴  Woke after market close — skipping scan.")
+            continue
+
+        print(f"\n🟢  Active check — {datetime.datetime.now(_IST).strftime('%H:%M')} IST")
+        _do_scan()
+```
+
+**Change 5:** Add `_passive_market_status()` after `_is_market_open()`:
+
+```python
+def _passive_market_status() -> str:
+    """
+    Lightweight market-state probe using Yahoo Finance only. No Fyers.
+    Returns 'open' | 'closed' | 'holiday'.
+    Only called during the passive window (outside 09:00–15:30 IST).
+    """
+    try:
+        resp = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI",
+            params={"interval": "1m", "range": "1d"},
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        resp.raise_for_status()
+        result = resp.json().get("chart", {}).get("result") or []
+        if not result:
+            return "closed"
+        meta  = result[0].get("meta", {})
+        state = str(meta.get("marketState", "")).upper()
+        if state in ("REGULAR",):
+            return "open"
+        # No timestamps today → holiday
+        if not result[0].get("timestamp"):
+            return "holiday"
+        return "closed"
+    except Exception:
+        return "closed"   # safe default: don't trigger active mode on error
+```
+
+**Change 6:** In `main()`, remove `connect_fyers()` from startup. Initial auth is now handled by `_scan_loop` before the first active scan. Replace:
+
+```python
+_fyers   = connect_fyers()
+_symbols = fetch_nifty500()
+```
+with:
+```python
+_symbols = fetch_nifty500()
+print("   Auth will run automatically before first market-open scan.")
+```
+
+This is safe because `_fyers` starts as `None` and `_do_scan`, `_refresh_quotes`, and `_get_market_snapshot` all guard against `_fyers is None` already.
+
+---
+
+## Summary
+
+| File | Change | Why |
+|---|---|---|
+| `fyers_auth.py` | `app_id: "2"` in OTP request | Root cause of browser fallback |
+| `fyers_auth.py` | Remove browser fallback | Headless on Railway; raises instead |
+| `fyers_auth.py` | Add `reconnect_fyers()` | Non-fatal daily re-auth for scheduler |
+| `fyers_auth.py` | Remove `_browser_auth_flow`, `_OAuthCallbackHandler`, dead imports | Cleanup |
+| `settings.py` | Add `ACTIVE_CHECK_HOURS`, `PASSIVE_CHECK_INTERVAL` | Config |
+| `main.py` | Replace `_scan_loop()` | Passive/Active state machine |
+| `main.py` | Add `_seconds_until_next_active_slot()` | Fixed-slot arithmetic |
+| `main.py` | Add `_passive_market_status()` | Yahoo-only status probe |
+| `main.py` | Remove `connect_fyers()` from `main()` | Auth deferred to scheduler |
