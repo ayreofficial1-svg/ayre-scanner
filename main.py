@@ -104,6 +104,7 @@ _POST_CLOSE_PASSIVE_START = datetime.time(16, 0)
 # checks light for a 24/7 process.
 _MARKET_STATUS_ACTIVE_TTL = 60
 _MARKET_STATUS_CLOSED_TTL = PASSIVE_CHECK_INTERVAL
+_YAHOO_FRESH_TICK_MAX_AGE_SECONDS = 5 * 60
 
 # ── Market snapshot cache ─────────────────────────────────────────────────────
 _market_lock = threading.Lock()
@@ -542,6 +543,26 @@ def _market_status_payload(status: str, source: str, detail: str = "") -> dict:
     }
 
 
+def _yahoo_regular_period_contains_now(meta: dict, now: datetime.datetime) -> bool:
+    regular = (meta.get("currentTradingPeriod") or {}).get("regular") or {}
+    try:
+        start = datetime.datetime.fromtimestamp(int(regular["start"]), _IST)
+        end = datetime.datetime.fromtimestamp(int(regular["end"]), _IST)
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+    return start <= now <= end
+
+
+def _latest_yahoo_tick_at(row: dict) -> datetime.datetime | None:
+    timestamps = row.get("timestamp") or []
+    if not timestamps:
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(int(timestamps[-1]), _IST)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def _fetch_market_status_from_yahoo() -> dict:
     """
     Lightweight market-state probe using Yahoo Finance only. No Fyers.
@@ -563,9 +584,33 @@ def _fetch_market_status_from_yahoo() -> dict:
     state = str(meta.get("marketState", "")).upper()
     if state == "REGULAR":
         return _market_status_payload("open", "yahoo", state)
-    if not row.get("timestamp"):
+
+    now_ist = datetime.datetime.now(_IST)
+    latest_tick = _latest_yahoo_tick_at(row)
+    if latest_tick is not None:
+        tick_age = (now_ist - latest_tick).total_seconds()
+        tick_is_fresh = 0 <= tick_age <= _YAHOO_FRESH_TICK_MAX_AGE_SECONDS
+        if (
+            _MARKET_OPEN <= now_ist.time() <= _MARKET_CLOSE
+            and _yahoo_regular_period_contains_now(meta, now_ist)
+            and latest_tick.date() == now_ist.date()
+            and tick_is_fresh
+        ):
+            return _market_status_payload(
+                "open",
+                "yahoo",
+                f"fresh 1m tick at {latest_tick.strftime('%H:%M:%S')} IST; "
+                f"marketState={state or 'missing'}",
+            )
+
+    if latest_tick is None:
         return _market_status_payload("holiday", "yahoo", state or "no ticks")
-    return _market_status_payload("closed", "yahoo", state or "not regular")
+
+    return _market_status_payload(
+        "closed",
+        "yahoo",
+        f"{state or 'not regular'}; last tick {latest_tick.strftime('%d %b %Y %H:%M:%S')} IST",
+    )
 
 
 def _fetch_market_status_from_nse() -> dict:
@@ -618,9 +663,15 @@ def _free_market_status(*, force: bool = False) -> dict:
         if not force and cached is not None and _market_status_cache["expires_at"] > now:
             return dict(cached)
 
+    fallback_data = None
+    inside_trading_window = _is_market_open()
     for fetcher in (_fetch_market_status_from_yahoo, _fetch_market_status_from_nse):
         try:
             data = fetcher()
+            if fallback_data is None:
+                fallback_data = data
+            if inside_trading_window and data.get("status") != "open":
+                continue
             ttl = (
                 _MARKET_STATUS_ACTIVE_TTL
                 if data.get("status") == "open"
@@ -633,10 +684,17 @@ def _free_market_status(*, force: bool = False) -> dict:
         except Exception:
             continue
 
-    data = _market_status_payload("unknown", "fallback", "free sources unavailable")
+    data = fallback_data or _market_status_payload(
+        "unknown", "fallback", "free sources unavailable"
+    )
     with _market_lock:
         _market_status_cache["data"] = dict(data)
-        _market_status_cache["expires_at"] = now + min(60, PASSIVE_CHECK_INTERVAL)
+        ttl = (
+            _MARKET_STATUS_ACTIVE_TTL
+            if data.get("status") == "open"
+            else min(60, PASSIVE_CHECK_INTERVAL)
+        )
+        _market_status_cache["expires_at"] = now + ttl
     return data
 
 
