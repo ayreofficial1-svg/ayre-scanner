@@ -21,8 +21,6 @@ import os
 import sys
 import datetime
 import argparse
-import base64
-import hashlib
 import hmac
 import threading
 import time
@@ -194,14 +192,14 @@ def _auth_credentials_configured() -> bool:
 
 def _configured_users() -> dict[str, str]:
     """
-    Return configured username -> password_hash entries.
+    Return configured username -> password entries.
 
-    Preferred Railway env:
-      SCANNER_USERS=alice:pbkdf2_sha256$... , bob:pbkdf2_sha256$...
+    Railway env:
+      SCANNER_USERS=alice:password1,bob:password2
 
     Backward-compatible fallback:
       SCANNER_USERNAME=alice
-      SCANNER_PASSWORD_HASH=pbkdf2_sha256$...
+      SCANNER_PASSWORD=password1
     """
     users: dict[str, str] = {}
     raw_users = os.environ.get("SCANNER_USERS", "")
@@ -209,37 +207,18 @@ def _configured_users() -> dict[str, str]:
         entry = entry.strip()
         if not entry or ":" not in entry:
             continue
-        username, password_hash = entry.split(":", 1)
+        username, password = entry.split(":", 1)
         username = username.strip()
-        password_hash = password_hash.strip()
-        if username and password_hash:
-            users[username] = password_hash
+        password = password.strip()
+        if username and password:
+            users[username] = password
 
     legacy_username = os.environ.get("SCANNER_USERNAME")
-    legacy_hash = os.environ.get("SCANNER_PASSWORD_HASH")
-    if legacy_username and legacy_hash:
-        users.setdefault(legacy_username, legacy_hash)
+    legacy_password = os.environ.get("SCANNER_PASSWORD")
+    if legacy_username and legacy_password:
+        users.setdefault(legacy_username, legacy_password)
 
     return users
-
-
-def _verify_password(password: str, stored_hash: str) -> bool:
-    """
-    Verify pbkdf2_sha256$iterations$salt_b64$digest_b64 hashes from Railway env.
-
-    Generate one locally with:
-      python -c "import os,hashlib,base64; p=b'YOUR_PASSWORD'; s=os.urandom(16); i=260000; print('pbkdf2_sha256$%d$%s$%s'%(i,base64.b64encode(s).decode(),base64.b64encode(hashlib.pbkdf2_hmac('sha256',p,s,i)).decode()))"
-    """
-    try:
-        algorithm, iterations, salt_b64, digest_b64 = stored_hash.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        salt = base64.b64decode(salt_b64.encode("ascii"), validate=True)
-        expected = base64.b64decode(digest_b64.encode("ascii"), validate=True)
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
-        return hmac.compare_digest(actual, expected)
-    except Exception:
-        return False
 
 
 def _is_authenticated() -> bool:
@@ -289,9 +268,9 @@ def api_auth_login():
     username = str(payload.get("username", ""))
     password = str(payload.get("password", ""))
     users = _configured_users()
-    expected_hash = users.get(username)
+    expected_password = users.get(username)
 
-    if expected_hash and _verify_password(password, expected_hash):
+    if expected_password and hmac.compare_digest(password, expected_password):
         session.clear()
         session["authenticated"] = True
         session["username"] = username
