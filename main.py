@@ -312,8 +312,9 @@ def api_rescan():
     return jsonify({"status": "started"})
 
 
+@app.route("/api/backtest/scan", methods=["POST"])
 @app.route("/api/debug/scan", methods=["POST"])
-def api_debug_scan():
+def api_backtest_scan():
     global _fyers, _symbols
 
     payload = request.get_json(silent=True) or {}
@@ -325,9 +326,10 @@ def api_debug_scan():
 
     today_ist = datetime.datetime.now(_IST).date()
     if target_date > today_ist:
-        return jsonify({"error": "Debug scans cannot run for a future date."}), 400
+        return jsonify({"error": "Backtests cannot run for a future date."}), 400
 
     try:
+        print(f"🧪  Backtest API request: date={target_date.isoformat()}")
         if _symbols is None:
             _symbols = fetch_nifty500()
         if _fyers is None:
@@ -340,11 +342,19 @@ def api_debug_scan():
             datetime.date.fromisoformat(result["resolved_date"]).strftime("%d %b %Y")
             if result.get("resolved_date") else None
         )
-        label = f"Debug scan — requested {requested}"
+        label = f"Backtest — requested {requested}"
         if resolved and resolved != requested:
             label += f", resolved {resolved}"
 
         report = result["report"]
+        print(
+            "🧪  Backtest API response: "
+            f"attempted={report.get('attempted', 0)} "
+            f"evaluated={report.get('evaluated', 0)} "
+            f"signals={len(result['signals'])} "
+            f"watchlist={len(result['watchlist_items'])} "
+            f"status_counts={report.get('status_counts', {})}"
+        )
         return jsonify({
             "scanning": False,
             "scan_time": f"{label} · ran {scan_time}",
@@ -358,6 +368,8 @@ def api_debug_scan():
                 "resolved_date": result.get("resolved_date"),
                 "window_start": result.get("window_start"),
                 "runtime_seconds": report.get("runtime_seconds"),
+                "status_counts": report.get("status_counts", {}),
+                "stage_counts": report.get("stage_counts", {}),
             },
         })
     except Exception as e:

@@ -6,7 +6,7 @@ import ScanRing from './components/ScanRing'
 import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
 
-type View = 'scanner' | 'debug'
+type View = 'scanner' | 'backtest'
 type AuthState = 'checking' | 'authenticated' | 'login'
 
 const DEFAULT_STATE: ScanState = {
@@ -25,9 +25,9 @@ export default function App() {
   const [auth, setAuth] = useState<AuthState>('checking')
   const [view, setView] = useState<View>('scanner')
   const [state, setState] = useState<ScanState>(DEFAULT_STATE)
-  const [debugState, setDebugState] = useState<ScanState>(DEFAULT_STATE)
-  const [debugDate, setDebugDate] = useState(todayIso)
-  const [debugLoading, setDebugLoading] = useState(false)
+  const [backtestState, setBacktestState] = useState<ScanState>(DEFAULT_STATE)
+  const [backtestDate, setBacktestDate] = useState(todayIso)
+  const [backtestLoading, setBacktestLoading] = useState(false)
   const [loginError, setLoginError] = useState<string | null>(null)
   const [authConfigured, setAuthConfigured] = useState(true)
 
@@ -75,27 +75,33 @@ export default function App() {
     poll()
   }
 
-  const submitDebug = async (event: FormEvent) => {
+  const submitBacktest = async (event: FormEvent) => {
     event.preventDefault()
-    setDebugLoading(true)
-    setDebugState(s => ({ ...s, scanning: true, error: null }))
+    setBacktestLoading(true)
+    setBacktestState(s => ({ ...s, scanning: true, error: null }))
     try {
-      const res = await fetch('/api/debug/scan', {
+      const res = await fetch('/api/backtest/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ date: debugDate }),
+        body: JSON.stringify({ date: backtestDate }),
       })
       if (res.status === 401) {
         setAuth('login')
         return
       }
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Debug scan failed')
-      setDebugState(data as ScanState)
+      if (!res.ok) throw new Error(data.error || 'Backtest failed')
+      console.info('Backtest response', {
+        total_scanned: data.total_scanned,
+        signals: Array.isArray(data.signals) ? data.signals.length : 'missing',
+        watchlist_items: Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
+        debug: data.debug,
+      })
+      setBacktestState(data as ScanState)
     } catch (error) {
-      setDebugState({ ...DEFAULT_STATE, error: error instanceof Error ? error.message : 'Debug scan failed' })
+      setBacktestState({ ...DEFAULT_STATE, error: error instanceof Error ? error.message : 'Backtest failed' })
     } finally {
-      setDebugLoading(false)
+      setBacktestLoading(false)
     }
   }
 
@@ -139,7 +145,7 @@ export default function App() {
               <p className="login-copy">Sign in to continue.</p>
             </div>
             {!authConfigured && (
-              <div className="error-bar">Set SCANNER_USERNAME and SCANNER_PASSWORD_HASH in Railway before logging in.</div>
+              <div className="error-bar">Set SCANNER_USERS in Railway before logging in.</div>
             )}
             {loginError && <div className="error-bar">{loginError}</div>}
             <label className="field">
@@ -157,7 +163,7 @@ export default function App() {
     )
   }
 
-  const activeState = view === 'debug' ? debugState : state
+  const activeState = view === 'backtest' ? backtestState : state
   const { scanning, scan_time, total_scanned, signals, watchlist_items, error } = activeState
 
   return (
@@ -180,7 +186,7 @@ export default function App() {
 
           <nav className="nav-tabs" aria-label="Primary">
             <button className={view === 'scanner' ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
-            <button className={view === 'debug' ? 'active' : ''} onClick={() => setView('debug')}>Debug</button>
+            <button className={view === 'backtest' ? 'active' : ''} onClick={() => setView('backtest')}>Backtest</button>
           </nav>
 
           <div className="header-meta">
@@ -189,14 +195,14 @@ export default function App() {
           </div>
         </header>
 
-        {view === 'debug' && (
-          <form className="debug-form" onSubmit={submitDebug}>
+        {view === 'backtest' && (
+          <form className="debug-form" onSubmit={submitBacktest}>
             <label className="field inline-field">
               <span>Date</span>
-              <input type="date" value={debugDate} max={todayIso()} onChange={e => setDebugDate(e.target.value)} required />
+              <input type="date" value={backtestDate} max={todayIso()} onChange={e => setBacktestDate(e.target.value)} required />
             </label>
-            <button className="rescan-btn" type="submit" disabled={debugLoading}>
-              {debugLoading ? 'Running...' : 'Run Debug'}
+            <button className="rescan-btn" type="submit" disabled={backtestLoading}>
+              {backtestLoading ? 'Running...' : 'Run Backtest'}
             </button>
           </form>
         )}
@@ -217,6 +223,15 @@ export default function App() {
         </div>
 
         {error && <div className="error-bar">{error}</div>}
+
+        {view === 'backtest' && activeState.debug && (
+          <div className="backtest-summary">
+            <span>{activeState.total_scanned || 0} evaluated</span>
+            <span>{signals.length} trade ready</span>
+            <span>{watchlist_items.length} watchlist</span>
+            <span>{activeState.debug.status_counts?.none ?? 0} rejected</span>
+          </div>
+        )}
 
         <Results state={activeState} />
       </div>

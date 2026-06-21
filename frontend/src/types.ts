@@ -45,4 +45,12 @@ export interface ScanState {
   signals: Signal[]
   watchlist_items: Signal[]
   error: string | null
+  debug?: {
+    requested_date?: string
+    resolved_date?: string
+    window_start?: string
+    runtime_seconds?: number
+    status_counts?: Record<string, number>
+    stage_counts?: Record<string, number>
+  }
 }

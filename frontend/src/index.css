@@ -522,6 +522,23 @@ tbody tr:hover td {
   padding: 0 0 2rem; margin-top: -1rem;
 }
 
+.backtest-summary {
+  display: flex; flex-wrap: wrap; gap: 0.75rem 1.5rem;
+  margin: -1.5rem 0 2rem;
+  padding: 0.85rem 0;
+  border-top: 1px solid var(--border-hover);
+  border-bottom: 1px solid var(--border-hover);
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.backtest-summary span {
+  white-space: nowrap;
+}
+
 .field {
   display: flex; flex-direction: column; gap: 0.45rem;
 }
