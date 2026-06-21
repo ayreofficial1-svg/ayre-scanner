@@ -21,6 +21,9 @@ import os
 import sys
 import datetime
 import argparse
+import base64
+import hashlib
+import hmac
 import threading
 import time
 import webbrowser
@@ -39,11 +42,12 @@ from scanner.watchlist import (
     load_alert_log, clean_alert_log, save_alert_log,
 )
 from scanner.engine import run_scan
+from scanner.historical import run_historical_scan
 from utils.logger import get_log_summary
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk
 
 try:
-    from flask import Flask, jsonify, send_from_directory
+    from flask import Flask, jsonify, request, send_from_directory, session
 except ImportError:
     sys.exit("❌  Flask not installed. Run: pip install flask")
 
@@ -57,6 +61,12 @@ except ImportError:
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.environ.get("SESSION_SECRET") or os.urandom(32)
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "").lower() in {"1", "true", "yes"},
+)
 
 # ── CORS — required for Flutter web / mobile clients ─────────────────────────
 if _CORS_AVAILABLE:
@@ -170,9 +180,130 @@ _quotes_cache : dict[str, float | None] = {}
 _quotes_updated_at: str | None = None
 
 
+# ── Session authentication ───────────────────────────────────────────────────
+_AUTH_PUBLIC_API = {
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/session",
+}
+
+
+def _auth_credentials_configured() -> bool:
+    return bool(_configured_users())
+
+
+def _configured_users() -> dict[str, str]:
+    """
+    Return configured username -> password_hash entries.
+
+    Preferred Railway env:
+      SCANNER_USERS=alice:pbkdf2_sha256$... , bob:pbkdf2_sha256$...
+
+    Backward-compatible fallback:
+      SCANNER_USERNAME=alice
+      SCANNER_PASSWORD_HASH=pbkdf2_sha256$...
+    """
+    users: dict[str, str] = {}
+    raw_users = os.environ.get("SCANNER_USERS", "")
+    for entry in raw_users.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        username, password_hash = entry.split(":", 1)
+        username = username.strip()
+        password_hash = password_hash.strip()
+        if username and password_hash:
+            users[username] = password_hash
+
+    legacy_username = os.environ.get("SCANNER_USERNAME")
+    legacy_hash = os.environ.get("SCANNER_PASSWORD_HASH")
+    if legacy_username and legacy_hash:
+        users.setdefault(legacy_username, legacy_hash)
+
+    return users
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    """
+    Verify pbkdf2_sha256$iterations$salt_b64$digest_b64 hashes from Railway env.
+
+    Generate one locally with:
+      python -c "import os,hashlib,base64; p=b'YOUR_PASSWORD'; s=os.urandom(16); i=260000; print('pbkdf2_sha256$%d$%s$%s'%(i,base64.b64encode(s).decode(),base64.b64encode(hashlib.pbkdf2_hmac('sha256',p,s,i)).decode()))"
+    """
+    try:
+        algorithm, iterations, salt_b64, digest_b64 = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        salt = base64.b64decode(salt_b64.encode("ascii"), validate=True)
+        expected = base64.b64decode(digest_b64.encode("ascii"), validate=True)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def _is_authenticated() -> bool:
+    return bool(session.get("authenticated"))
+
+
+def _is_static_asset(path: str) -> bool:
+    return bool(path and os.path.isfile(os.path.join(STATIC_DIR, path)))
+
+
+@app.before_request
+def _require_authentication():
+    if request.method == "OPTIONS":
+        return None
+    if request.path in _AUTH_PUBLIC_API:
+        return None
+    if request.path.startswith("/assets/") or _is_static_asset(request.path.lstrip("/")):
+        return None
+    if _is_authenticated():
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify({"authenticated": False, "error": "Authentication required"}), 401
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API routes (defined before the catch-all)
 # ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/auth/session")
+def api_auth_session():
+    return jsonify({
+        "authenticated": _is_authenticated(),
+        "configured": _auth_credentials_configured(),
+    })
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_auth_login():
+    if not _auth_credentials_configured():
+        return jsonify({
+            "authenticated": False,
+            "error": "Login is not configured. Set SCANNER_USERS in Railway.",
+        }), 503
+
+    payload = request.get_json(silent=True) or {}
+    username = str(payload.get("username", ""))
+    password = str(payload.get("password", ""))
+    users = _configured_users()
+    expected_hash = users.get(username)
+
+    if expected_hash and _verify_password(password, expected_hash):
+        session.clear()
+        session["authenticated"] = True
+        session["username"] = username
+        return jsonify({"authenticated": True})
+
+    return jsonify({"authenticated": False, "error": "Invalid username or password"}), 401
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_auth_logout():
+    session.clear()
+    return jsonify({"authenticated": False})
 
 @app.route("/api/results")
 def api_results():
@@ -200,6 +331,58 @@ def api_rescan():
     _state["scanning"] = True
     threading.Thread(target=_do_scan, daemon=True).start()
     return jsonify({"status": "started"})
+
+
+@app.route("/api/debug/scan", methods=["POST"])
+def api_debug_scan():
+    global _fyers, _symbols
+
+    payload = request.get_json(silent=True) or {}
+    date_value = str(payload.get("date", "")).strip()
+    try:
+        target_date = datetime.date.fromisoformat(date_value)
+    except ValueError:
+        return jsonify({"error": "Enter a valid date in YYYY-MM-DD format."}), 400
+
+    today_ist = datetime.datetime.now(_IST).date()
+    if target_date > today_ist:
+        return jsonify({"error": "Debug scans cannot run for a future date."}), 400
+
+    try:
+        if _symbols is None:
+            _symbols = fetch_nifty500()
+        if _fyers is None:
+            _fyers = reconnect_fyers()
+
+        result = run_historical_scan(_fyers, _symbols, target_date)
+        scan_time = datetime.datetime.now(_IST).strftime("%d %b %Y %H:%M:%S")
+        requested = datetime.date.fromisoformat(result["requested_date"]).strftime("%d %b %Y")
+        resolved = (
+            datetime.date.fromisoformat(result["resolved_date"]).strftime("%d %b %Y")
+            if result.get("resolved_date") else None
+        )
+        label = f"Debug scan — requested {requested}"
+        if resolved and resolved != requested:
+            label += f", resolved {resolved}"
+
+        report = result["report"]
+        return jsonify({
+            "scanning": False,
+            "scan_time": f"{label} · ran {scan_time}",
+            "total_scanned": report.get("evaluated", report.get("valid", 0)),
+            "total_attempted": report.get("attempted", 0),
+            "signals": result["signals"],
+            "watchlist_items": result["watchlist_items"],
+            "error": None,
+            "debug": {
+                "requested_date": result.get("requested_date"),
+                "resolved_date": result.get("resolved_date"),
+                "window_start": result.get("window_start"),
+                "runtime_seconds": report.get("runtime_seconds"),
+            },
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 def _format_ist(dt: datetime.datetime | None) -> str | None:
