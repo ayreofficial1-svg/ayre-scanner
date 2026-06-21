@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "build": "cd frontend && npm ci && npm run build",
+    "start": "python main.py --port $PORT"
+  },
+  "engines": {
+    "node": "20.x"
+  }
+}
