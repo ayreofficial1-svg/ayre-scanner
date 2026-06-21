@@ -24,6 +24,7 @@ import argparse
 import hmac
 import threading
 import time
+import uuid
 import webbrowser
 import requests
 
@@ -177,6 +178,9 @@ _quotes_lock  = threading.Lock()
 _quotes_cache : dict[str, float | None] = {}
 _quotes_updated_at: str | None = None
 
+_backtest_lock = threading.Lock()
+_backtest_jobs: dict[str, dict] = {}
+
 
 # ── Session authentication ───────────────────────────────────────────────────
 _AUTH_PUBLIC_API = {
@@ -315,8 +319,6 @@ def api_rescan():
 @app.route("/api/backtest/scan", methods=["POST"])
 @app.route("/api/debug/scan", methods=["POST"])
 def api_backtest_scan():
-    global _fyers, _symbols
-
     payload = request.get_json(silent=True) or {}
     date_value = str(payload.get("date", "")).strip()
     try:
@@ -327,6 +329,74 @@ def api_backtest_scan():
     today_ist = datetime.datetime.now(_IST).date()
     if target_date > today_ist:
         return jsonify({"error": "Backtests cannot run for a future date."}), 400
+
+    job_id = uuid.uuid4().hex
+    with _backtest_lock:
+        _backtest_jobs[job_id] = {
+            "job_id": job_id,
+            "status": "running",
+            "date": target_date.isoformat(),
+            "created_at": datetime.datetime.now(_IST).isoformat(),
+            "result": None,
+            "error": None,
+        }
+
+    threading.Thread(
+        target=_run_backtest_job,
+        args=(job_id, target_date),
+        daemon=True,
+        name=f"backtest-{job_id[:8]}",
+    ).start()
+
+    print(f"🧪  Backtest job queued: id={job_id} date={target_date.isoformat()}")
+    return jsonify({
+        "job_id": job_id,
+        "status": "running",
+        "scanning": True,
+        "scan_time": f"Backtest queued for {target_date.strftime('%d %b %Y')}",
+        "total_scanned": 0,
+        "total_attempted": 0,
+        "signals": [],
+        "watchlist_items": [],
+        "error": None,
+    }), 202
+
+
+@app.route("/api/backtest/status/<job_id>")
+def api_backtest_status(job_id: str):
+    with _backtest_lock:
+        job = _backtest_jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Backtest job not found"}), 404
+        if job["status"] == "done":
+            return jsonify(job["result"])
+        if job["status"] == "error":
+            return jsonify({
+                "job_id": job_id,
+                "status": "error",
+                "scanning": False,
+                "scan_time": None,
+                "total_scanned": 0,
+                "total_attempted": 0,
+                "signals": [],
+                "watchlist_items": [],
+                "error": job["error"],
+            }), 500
+        return jsonify({
+            "job_id": job_id,
+            "status": "running",
+            "scanning": True,
+            "scan_time": f"Backtest running for {job['date']}",
+            "total_scanned": 0,
+            "total_attempted": 0,
+            "signals": [],
+            "watchlist_items": [],
+            "error": None,
+        })
+
+
+def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
+    global _fyers, _symbols
 
     try:
         print(f"🧪  Backtest API request: date={target_date.isoformat()}")
@@ -355,7 +425,9 @@ def api_backtest_scan():
             f"watchlist={len(result['watchlist_items'])} "
             f"status_counts={report.get('status_counts', {})}"
         )
-        return jsonify({
+        payload = {
+            "job_id": job_id,
+            "status": "done",
             "scanning": False,
             "scan_time": f"{label} · ran {scan_time}",
             "total_scanned": report.get("evaluated", report.get("valid", 0)),
@@ -371,9 +443,17 @@ def api_backtest_scan():
                 "status_counts": report.get("status_counts", {}),
                 "stage_counts": report.get("stage_counts", {}),
             },
-        })
+        }
+        with _backtest_lock:
+            if job_id in _backtest_jobs:
+                _backtest_jobs[job_id]["status"] = "done"
+                _backtest_jobs[job_id]["result"] = payload
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"🧪  Backtest job failed: id={job_id} error={e}")
+        with _backtest_lock:
+            if job_id in _backtest_jobs:
+                _backtest_jobs[job_id]["status"] = "error"
+                _backtest_jobs[job_id]["error"] = str(e)
 
 
 def _format_ist(dt: datetime.datetime | None) -> str | None:

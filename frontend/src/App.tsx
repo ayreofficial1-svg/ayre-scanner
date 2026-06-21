@@ -20,6 +20,18 @@ const DEFAULT_STATE: ScanState = {
 
 const todayIso = () => new Date().toISOString().slice(0, 10)
 
+async function readJsonResponse(res: Response) {
+  const text = await res.text()
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(text.slice(0, 240) || `HTTP ${res.status}`)
+  }
+}
+
+const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
+
 export default function App() {
   const [theme, setTheme] = useState<string>(() => localStorage.getItem('theme') ?? 'dark')
   const [auth, setAuth] = useState<AuthState>('checking')
@@ -89,8 +101,13 @@ export default function App() {
         setAuth('login')
         return
       }
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Backtest failed')
+      const data = await readJsonResponse(res)
+      if (!res.ok) throw new Error(data?.error || 'Backtest failed')
+      if (data?.job_id && data?.status === 'running') {
+        setBacktestState(data as ScanState)
+        await pollBacktestJob(data.job_id)
+        return
+      }
       console.info('Backtest response', {
         total_scanned: data.total_scanned,
         signals: Array.isArray(data.signals) ? data.signals.length : 'missing',
@@ -99,9 +116,36 @@ export default function App() {
       })
       setBacktestState(data as ScanState)
     } catch (error) {
-      setBacktestState({ ...DEFAULT_STATE, error: error instanceof Error ? error.message : 'Backtest failed' })
+      setBacktestState(s => ({
+        ...s,
+        scanning: false,
+        error: error instanceof Error ? error.message : 'Backtest failed',
+      }))
     } finally {
       setBacktestLoading(false)
+    }
+  }
+
+  const pollBacktestJob = async (jobId: string) => {
+    while (true) {
+      await wait(2_000)
+      const res = await fetch(`/api/backtest/status/${jobId}`)
+      if (res.status === 401) {
+        setAuth('login')
+        return
+      }
+      const data = await readJsonResponse(res)
+      if (!res.ok) throw new Error(data?.error || 'Backtest failed')
+      setBacktestState(data as ScanState)
+      if (!data?.scanning && data?.status !== 'running') {
+        console.info('Backtest response', {
+          total_scanned: data.total_scanned,
+          signals: Array.isArray(data.signals) ? data.signals.length : 'missing',
+          watchlist_items: Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
+          debug: data.debug,
+        })
+        return
+      }
     }
   }
 
