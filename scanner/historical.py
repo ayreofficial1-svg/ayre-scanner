@@ -3,7 +3,6 @@ from __future__ import annotations
 import datetime
 import time
 from collections import Counter
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -20,7 +19,6 @@ from scanner.debug_evaluate import (
     evaluate_debug,
     save_debug_csv,
     save_debug_json,
-    save_html_report,
     summary_table_detailed,
 )
 from scanner.engine import _check_weekly_sma_rising
@@ -193,31 +191,17 @@ def _evaluate_all(
 
 def _save_debug_outputs(
     results: dict[str, dict],
-    target_date: datetime.date,
-    resolved_date: datetime.date | None,
-    html_output: str | None,
     csv_output: str | None,
     json_output: str | None,
 ) -> dict[str, str]:
     outputs: dict[str, str] = {}
-    requested_date = _format_date_ordinal(target_date)
-    actual_date = _format_date_ordinal(resolved_date) if resolved_date else None
 
-    if html_output:
-        save_html_report(
-            results,
-            html_output,
-            mode="historical",
-            requested_date=requested_date,
-            actual_date=actual_date,
-        )
-        outputs["html"] = str(Path(html_output))
     if csv_output:
         save_debug_csv(results, csv_output)
-        outputs["csv"] = str(Path(csv_output))
+        outputs["csv"] = csv_output
     if json_output:
         save_debug_json(results, json_output)
-        outputs["json"] = str(Path(json_output))
+        outputs["json"] = json_output
     return outputs
 
 
@@ -226,7 +210,6 @@ def run_historical_scan(
     symbols: list[str],
     target_date: datetime.date,
     *,
-    html_output: str | None = "debug_report.html",
     csv_output: str | None = None,
     json_output: str | None = None,
     quiet_mode: bool = True,
@@ -344,15 +327,12 @@ def run_historical_scan(
 
     if quiet_mode:
         print("\n" + "=" * 70)
-        print("SCAN RESULTS (Summary Only — see HTML report for details)")
+        print("SCAN RESULTS (Summary Only — details returned to website)")
         print("=" * 70)
         summary_table_detailed(results)
 
     outputs = _save_debug_outputs(
         results,
-        target_date,
-        resolved_date,
-        html_output,
         csv_output,
         json_output,
     )

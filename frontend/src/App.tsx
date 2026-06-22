@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
-import type { ScanState } from './types'
+import type { BacktestDebugResult, DebugStatus, ScanState } from './types'
 import Clock from './components/Clock'
 import ScanRing from './components/ScanRing'
 import SignalCard from './components/SignalCard'
@@ -8,6 +8,7 @@ import WatchlistTable from './components/WatchlistTable'
 
 type View = 'scanner' | 'backtest'
 type AuthState = 'checking' | 'authenticated' | 'login'
+type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none'
 
 const DEFAULT_STATE: ScanState = {
   scanning:        false,
@@ -39,6 +40,7 @@ export default function App() {
   const [state, setState] = useState<ScanState>(DEFAULT_STATE)
   const [backtestState, setBacktestState] = useState<ScanState>(DEFAULT_STATE)
   const [backtestDate, setBacktestDate] = useState(todayIso)
+  const [backtestFilter, setBacktestFilter] = useState<BacktestFilter>('all')
   const [backtestLoading, setBacktestLoading] = useState(false)
   const [loginError, setLoginError] = useState<string | null>(null)
   const [authConfigured, setAuthConfigured] = useState(true)
@@ -277,14 +279,36 @@ export default function App() {
           </div>
         )}
 
-        <Results state={activeState} />
+        <Results state={activeState} view={view} backtestFilter={backtestFilter} onBacktestFilter={setBacktestFilter} />
       </div>
     </Frame>
   )
 }
 
-function Results({ state }: { state: ScanState }) {
+function Results({
+  state,
+  view,
+  backtestFilter,
+  onBacktestFilter,
+}: {
+  state: ScanState
+  view: View
+  backtestFilter: BacktestFilter
+  onBacktestFilter: (filter: BacktestFilter) => void
+}) {
   const { scanning, signals, watchlist_items } = state
+  const backtestResults = state.backtest_results ?? []
+
+  if (view === 'backtest' && (scanning || backtestResults.length > 0)) {
+    return (
+      <BacktestResults
+        scanning={scanning}
+        results={backtestResults}
+        filter={backtestFilter}
+        onFilter={onBacktestFilter}
+      />
+    )
+  }
 
   return (
     <>
@@ -313,6 +337,164 @@ function Results({ state }: { state: ScanState }) {
       </div>
     </>
   )
+}
+
+function BacktestResults({
+  scanning,
+  results,
+  filter,
+  onFilter,
+}: {
+  scanning: boolean
+  results: BacktestDebugResult[]
+  filter: BacktestFilter
+  onFilter: (filter: BacktestFilter) => void
+}) {
+  const counts = useMemo(() => ({
+    all: results.length,
+    signal: results.filter(r => r.status === 'signal').length,
+    watchlist: results.filter(r => r.status === 'watchlist').length,
+    none: results.filter(r => r.status === 'none').length,
+  }), [results])
+
+  const visible = useMemo(() => {
+    const filtered = filter === 'all' ? results : results.filter(r => r.status === filter)
+    return [...filtered].sort((a, b) => {
+      const order = { signal: 0, watchlist: 1, none: 2 }
+      const aOrder = order[a.status as keyof typeof order] ?? 3
+      const bOrder = order[b.status as keyof typeof order] ?? 3
+      if (aOrder !== bOrder) return aOrder - bOrder
+      return a.symbol.localeCompare(b.symbol)
+    })
+  }, [filter, results])
+
+  return (
+    <div className="section">
+      <div className="section-header">
+        <span className="section-title">Backtest Results</span>
+        <span className="section-sub">{scanning ? '...' : `${visible.length} of ${results.length} stocks`}</span>
+      </div>
+
+      {scanning ? (
+        <ScanRing />
+      ) : results.length > 0 ? (
+        <>
+          <div className="result-filters" role="tablist" aria-label="Backtest result filters">
+            <FilterButton label="All" value="all" active={filter} count={counts.all} onFilter={onFilter} />
+            <FilterButton label="Trade Ready" value="signal" active={filter} count={counts.signal} onFilter={onFilter} />
+            <FilterButton label="Watchlist" value="watchlist" active={filter} count={counts.watchlist} onFilter={onFilter} />
+            <FilterButton label="Rejected" value="none" active={filter} count={counts.none} onFilter={onFilter} />
+          </div>
+          <div className="backtest-results-list">
+            {visible.map(result => <BacktestResultRow key={result.symbol} result={result} />)}
+          </div>
+        </>
+      ) : (
+        <div className="empty-state">No backtest results.</div>
+      )}
+    </div>
+  )
+}
+
+function FilterButton({
+  label,
+  value,
+  active,
+  count,
+  onFilter,
+}: {
+  label: string
+  value: BacktestFilter
+  active: BacktestFilter
+  count: number
+  onFilter: (filter: BacktestFilter) => void
+}) {
+  return (
+    <button
+      type="button"
+      className={active === value ? 'active' : ''}
+      onClick={() => onFilter(value)}
+    >
+      <span>{label}</span>
+      <strong>{count}</strong>
+    </button>
+  )
+}
+
+function BacktestResultRow({ result }: { result: BacktestDebugResult }) {
+  const values = result.values ?? {}
+  const nse = `https://www.nseindia.com/get-quotes/equity?symbol=${result.symbol}`
+  const close = formatValue(values.close, 2)
+  const sma44 = formatValue(values.sma44 ?? values.sma44_today, 2)
+  const macd = formatValue(values.macd ?? values.macd_cur, 4)
+  const signal = formatValue(values.macd_signal ?? values.signal_cur, 4)
+  const slope = formatPercent(values.pct_slope)
+
+  return (
+    <article className={`backtest-result ${statusClass(result.status)}`}>
+      <div className="backtest-result-main">
+        <a href={nse} target="_blank" rel="noreferrer">{result.symbol}</a>
+        <span className={`result-badge ${statusClass(result.status)}`}>{statusLabel(result.status)}</span>
+        <span className="result-stage">{formatStage(result.stage)}</span>
+      </div>
+      <p>{result.reason}</p>
+      <div className="result-metrics">
+        <Metric label="Close" value={close} />
+        <Metric label="SMA44" value={sma44} />
+        <Metric label="Pct slope" value={slope} />
+        <Metric label="MACD" value={macd} />
+        <Metric label="Signal" value={signal} />
+        <Metric label="Weekly" value={formatBool(values.weekly_rising)} />
+      </div>
+    </article>
+  )
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <span>
+      <small>{label}</small>
+      <strong>{value}</strong>
+    </span>
+  )
+}
+
+function statusClass(status: DebugStatus) {
+  if (status === 'signal') return 'signal'
+  if (status === 'watchlist') return 'watchlist'
+  if (status === 'none') return 'none'
+  return 'error'
+}
+
+function statusLabel(status: DebugStatus) {
+  if (status === 'signal') return 'Trade Ready'
+  if (status === 'watchlist') return 'Watchlist'
+  if (status === 'none') return 'Rejected'
+  return 'Error'
+}
+
+function formatStage(stage: string) {
+  return stage.replace(/_/g, ' ')
+}
+
+function formatValue(value: unknown, decimals: number) {
+  if (value === null || value === undefined || value === '') return '-'
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue)) return String(value)
+  return numberValue.toFixed(decimals)
+}
+
+function formatPercent(value: unknown) {
+  if (value === null || value === undefined || value === '') return '-'
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue)) return String(value)
+  return `${numberValue.toFixed(2)}%`
+}
+
+function formatBool(value: unknown) {
+  if (value === true) return 'Yes'
+  if (value === false) return 'No'
+  return '-'
 }
 
 function Frame({ children }: { children: ReactNode }) {

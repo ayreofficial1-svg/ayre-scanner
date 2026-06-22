@@ -37,6 +37,16 @@ export interface Signal {
   is_imminent_crossover?: boolean
 }
 
+export type DebugStatus = 'signal' | 'watchlist' | 'none' | 'error' | string
+
+export interface BacktestDebugResult {
+  symbol: string
+  status: DebugStatus
+  stage: string
+  reason: string
+  values: Record<string, unknown> & Partial<Signal>
+}
+
 export interface ScanState {
   scanning: boolean
   scan_time: string | null
@@ -44,6 +54,7 @@ export interface ScanState {
   total_attempted?: number
   signals: Signal[]
   watchlist_items: Signal[]
+  backtest_results?: BacktestDebugResult[]
   error: string | null
   debug?: {
     requested_date?: string

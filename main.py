@@ -434,6 +434,7 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
             "total_attempted": report.get("attempted", 0),
             "signals": result["signals"],
             "watchlist_items": result["watchlist_items"],
+            "backtest_results": list(result.get("results", {}).values()),
             "error": result.get("error"),
             "debug": {
                 "requested_date": result.get("requested_date"),
