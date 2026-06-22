@@ -260,7 +260,7 @@ export default function App() {
         <main className="login-shell">
           <form className="login-panel" onSubmit={login}>
             <div>
-              <h1>Swing Scanner.</h1>
+              <h1>Ayre.</h1>
               <p className="login-copy">Sign in to continue.</p>
             </div>
             {!authConfigured && (
@@ -292,7 +292,7 @@ export default function App() {
       <div className="wrap">
         <header>
           <div className="header-top">
-            <h1>Swing Scanner.</h1>
+            <h1>Ayre.</h1>
             <div className="header-right">
               <Clock />
               <button className="theme-btn" onClick={toggleTheme}>{theme === 'dark' ? 'Light' : 'Dark'}</button>
