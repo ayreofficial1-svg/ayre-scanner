@@ -22,6 +22,7 @@ import sys
 import datetime
 import argparse
 import hmac
+import math
 import threading
 import time
 import uuid
@@ -32,6 +33,31 @@ import requests
 # Railway (and most cloud hosts) run UTC; this ensures all market-hour
 # comparisons use IST wall-clock time regardless of the host timezone.
 _IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _json_safe(value):
+    """
+    Convert scanner/debug payloads to strict browser-parseable JSON values.
+
+    debug_run.py can render Python/NumPy values directly into files, but API
+    responses must not contain NaN/Infinity or NumPy scalar objects.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    return str(value)
 
 from auth.fyers_auth import reconnect_fyers
 from config.settings import ACTIVE_CHECK_HOURS, ACTIVE_CHECK_MINUTE, PASSIVE_CHECK_INTERVAL
@@ -425,7 +451,7 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
             f"watchlist={len(result['watchlist_items'])} "
             f"status_counts={report.get('status_counts', {})}"
         )
-        payload = {
+        payload = _json_safe({
             "job_id": job_id,
             "status": "done",
             "scanning": False,
@@ -458,7 +484,13 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
                 "evaluation_errors": report.get("evaluation_errors", []),
                 "debug_outputs": report.get("debug_outputs", {}),
             },
-        }
+        })
+        print(
+            "🧪  Backtest API payload ready: "
+            f"signals={len(payload.get('signals', []))} "
+            f"watchlist={len(payload.get('watchlist_items', []))} "
+            f"results={len(payload.get('backtest_results', []))}"
+        )
         with _backtest_lock:
             if job_id in _backtest_jobs:
                 _backtest_jobs[job_id]["status"] = "done"

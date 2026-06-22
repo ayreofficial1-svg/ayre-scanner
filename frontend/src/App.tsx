@@ -114,6 +114,7 @@ export default function App() {
         total_scanned: data.total_scanned,
         signals: Array.isArray(data.signals) ? data.signals.length : 'missing',
         watchlist_items: Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
+        backtest_results: Array.isArray(data.backtest_results) ? data.backtest_results.length : 'missing',
         debug: data.debug,
       })
       setBacktestState(data as ScanState)
@@ -144,6 +145,7 @@ export default function App() {
           total_scanned: data.total_scanned,
           signals: Array.isArray(data.signals) ? data.signals.length : 'missing',
           watchlist_items: Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
+          backtest_results: Array.isArray(data.backtest_results) ? data.backtest_results.length : 'missing',
           debug: data.debug,
         })
         return
