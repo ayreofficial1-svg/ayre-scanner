@@ -19,6 +19,22 @@ const DEFAULT_STATE: ScanState = {
   error:           null,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Separate type for backtest-specific UI state.
+// Keeps backtest lifecycle fields from bleeding into ScanState.
+// ─────────────────────────────────────────────────────────────────────────────
+interface BacktestUIState {
+  loading: boolean          // true while job is queued or polling
+  jobId:   string | null    // current async job id
+  state:   ScanState        // the scan payload (same shape as live scanner)
+}
+
+const DEFAULT_BACKTEST_UI: BacktestUIState = {
+  loading: false,
+  jobId:   null,
+  state:   DEFAULT_STATE,
+}
+
 const todayIso = () => new Date().toISOString().slice(0, 10)
 
 async function readJsonResponse(res: Response) {
@@ -34,16 +50,21 @@ async function readJsonResponse(res: Response) {
 const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
 
 export default function App() {
-  const [theme, setTheme] = useState<string>(() => localStorage.getItem('theme') ?? 'dark')
-  const [auth, setAuth] = useState<AuthState>('checking')
-  const [view, setView] = useState<View>('scanner')
-  const [state, setState] = useState<ScanState>(DEFAULT_STATE)
-  const [backtestState, setBacktestState] = useState<ScanState>(DEFAULT_STATE)
+  const [theme, setTheme]           = useState<string>(() => localStorage.getItem('theme') ?? 'dark')
+  const [auth, setAuth]             = useState<AuthState>('checking')
+  const [view, setView]             = useState<View>('scanner')
+  const [state, setState]           = useState<ScanState>(DEFAULT_STATE)
   const [backtestDate, setBacktestDate] = useState(todayIso)
-  const [backtestFilter, setBacktestFilter] = useState<BacktestFilter>('all')
-  const [backtestLoading, setBacktestLoading] = useState(false)
   const [loginError, setLoginError] = useState<string | null>(null)
   const [authConfigured, setAuthConfigured] = useState(true)
+
+  // ── Backtest state is now managed in one object so partial updates never
+  //    clobber the completed result. ─────────────────────────────────────────
+  const [backtest, setBacktest] = useState<BacktestUIState>(DEFAULT_BACKTEST_UI)
+
+  // ── Backtest filter lives outside the backtest state so changing it doesn't
+  //    reset results. ────────────────────────────────────────────────────────
+  const [backtestFilter, setBacktestFilter] = useState<BacktestFilter>('all')
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -54,7 +75,7 @@ export default function App() {
 
   const checkAuth = useCallback(async () => {
     try {
-      const res = await fetch('/api/auth/session')
+      const res  = await fetch('/api/auth/session')
       const data = await res.json() as { authenticated: boolean; configured: boolean }
       setAuthConfigured(data.configured)
       setAuth(data.authenticated ? 'authenticated' : 'login')
@@ -69,10 +90,7 @@ export default function App() {
     if (auth !== 'authenticated') return
     try {
       const res = await fetch('/api/results')
-      if (res.status === 401) {
-        setAuth('login')
-        return
-      }
+      if (res.status === 401) { setAuth('login'); return }
       const data = await res.json() as ScanState
       setState(data)
     } catch { /* keep last state */ }
@@ -89,81 +107,134 @@ export default function App() {
     poll()
   }
 
-  const submitBacktest = async (event: FormEvent) => {
-    event.preventDefault()
-    setBacktestLoading(true)
-    setBacktestState(s => ({ ...s, scanning: true, error: null }))
-    try {
-      const res = await fetch('/api/backtest/scan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ date: backtestDate }),
-      })
-      if (res.status === 401) {
-        setAuth('login')
-        return
-      }
-      const data = await readJsonResponse(res)
-      if (!res.ok) throw new Error(data?.error || 'Backtest failed')
-      if (data?.job_id && data?.status === 'running') {
-        setBacktestState(data as ScanState)
-        await pollBacktestJob(data.job_id)
-        return
-      }
-      console.info('Backtest response', {
-        total_scanned: data.total_scanned,
-        signals: Array.isArray(data.signals) ? data.signals.length : 'missing',
-        watchlist_items: Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
-        backtest_results: Array.isArray(data.backtest_results) ? data.backtest_results.length : 'missing',
-        debug: data.debug,
-      })
-      setBacktestState(data as ScanState)
-    } catch (error) {
-      setBacktestState(s => ({
-        ...s,
-        scanning: false,
-        error: error instanceof Error ? error.message : 'Backtest failed',
-      }))
-    } finally {
-      setBacktestLoading(false)
-    }
+  // ── Merge a partial scan-state update into the backtest ui state.
+  //    This ensures intermediate poll responses never wipe completed results. ─
+  const mergeBacktestState = (patch: Partial<ScanState>) => {
+    setBacktest(prev => ({
+      ...prev,
+      state: { ...prev.state, ...patch },
+    }))
   }
 
-  const pollBacktestJob = async (jobId: string) => {
+  // ─────────────────────────────────────────────────────────────────────────
+  // Core polling loop for async backtest jobs.
+  // Accepts a stable setState setter so it can be called from submitBacktest.
+  // Returns the final ScanState payload so the caller can apply it in one shot.
+  // ─────────────────────────────────────────────────────────────────────────
+  const pollBacktestJob = async (jobId: string): Promise<ScanState> => {
     while (true) {
       await wait(2_000)
       const res = await fetch(`/api/backtest/status/${jobId}`)
       if (res.status === 401) {
         setAuth('login')
-        return
+        throw new Error('Session expired')
       }
       const data = await readJsonResponse(res)
-      if (!res.ok) throw new Error(data?.error || 'Backtest failed')
-      setBacktestState(data as ScanState)
-      if (!data?.scanning && data?.status !== 'running') {
-        console.info('Backtest response', {
-          total_scanned: data.total_scanned,
-          signals: Array.isArray(data.signals) ? data.signals.length : 'missing',
-          watchlist_items: Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
-          backtest_results: Array.isArray(data.backtest_results) ? data.backtest_results.length : 'missing',
-          debug: data.debug,
+      if (!res.ok) throw new Error(data?.error ?? 'Backtest status check failed')
+
+      const isRunning = data?.scanning === true || data?.status === 'running'
+      if (!isRunning) {
+        // Job finished — return the final payload so submitBacktest can apply
+        // it in a single setState call, avoiding a partial-state flash.
+        return data as ScanState
+      }
+
+      // Still running — update only the progress fields; don't clobber results.
+      mergeBacktestState({
+        scanning:  true,
+        scan_time: data.scan_time ?? null,
+        error:     null,
+      })
+    }
+  }
+
+  const submitBacktest = async (event: FormEvent) => {
+    event.preventDefault()
+
+    // Reset to loading state, keeping the date label visible.
+    setBacktest({
+      loading: true,
+      jobId:   null,
+      state: {
+        ...DEFAULT_STATE,
+        scanning:  true,
+        scan_time: `Running backtest for ${backtestDate}…`,
+        error:     null,
+      },
+    })
+    setBacktestFilter('all')
+
+    try {
+      const res = await fetch('/api/backtest/scan', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ date: backtestDate }),
+      })
+      if (res.status === 401) { setAuth('login'); return }
+
+      const data = await readJsonResponse(res)
+      if (!res.ok) throw new Error(data?.error ?? 'Backtest failed')
+
+      // Backend acknowledged and queued an async job.
+      if (data?.job_id && (data?.status === 'running' || data?.scanning === true)) {
+        setBacktest(prev => ({
+          ...prev,
+          jobId: data.job_id,
+          state: { ...prev.state, scan_time: data.scan_time ?? prev.state.scan_time },
+        }))
+
+        // Block here until the job completes; get the final result in one shot.
+        const finalResult = await pollBacktestJob(data.job_id)
+
+        // Apply the complete result atomically — no partial-state flash.
+        setBacktest({
+          loading: false,
+          jobId:   data.job_id,
+          state:   finalResult as ScanState,
+        })
+
+        console.info('Backtest complete', {
+          total_scanned:    finalResult.total_scanned,
+          signals:          Array.isArray(finalResult.signals)         ? finalResult.signals.length         : 'missing',
+          watchlist_items:  Array.isArray(finalResult.watchlist_items) ? finalResult.watchlist_items.length : 'missing',
+          backtest_results: Array.isArray(finalResult.backtest_results)? finalResult.backtest_results.length: 'missing',
+          debug:            finalResult.debug,
         })
         return
       }
+
+      // Synchronous (legacy) response path — backend returned results directly.
+      setBacktest({ loading: false, jobId: null, state: data as ScanState })
+      console.info('Backtest complete (sync)', {
+        total_scanned:    data.total_scanned,
+        signals:          Array.isArray(data.signals)         ? data.signals.length         : 'missing',
+        watchlist_items:  Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
+        backtest_results: Array.isArray(data.backtest_results)? data.backtest_results.length: 'missing',
+      })
+    } catch (error) {
+      setBacktest(prev => ({
+        ...prev,
+        loading: false,
+        state: {
+          ...prev.state,
+          scanning: false,
+          error: error instanceof Error ? error.message : 'Backtest failed',
+        },
+      }))
     }
   }
 
   const login = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setLoginError(null)
-    const form = new FormData(event.currentTarget)
+    const form     = new FormData(event.currentTarget)
     const username = String(form.get('username') ?? '')
     const password = String(form.get('password') ?? '')
     try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
+      const res  = await fetch('/api/auth/login', {
+        method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        body:    JSON.stringify({ username, password }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error || 'Login failed')
@@ -211,8 +282,10 @@ export default function App() {
     )
   }
 
-  const activeState = view === 'backtest' ? backtestState : state
+  // ── Derive the active state for the current view. ─────────────────────────
+  const activeState = view === 'backtest' ? backtest.state : state
   const { scanning, scan_time, total_scanned, signals, watchlist_items, error } = activeState
+  const backtestLoading = backtest.loading
 
   return (
     <Frame>
@@ -233,7 +306,7 @@ export default function App() {
           </div>
 
           <nav className="nav-tabs" aria-label="Primary">
-            <button className={view === 'scanner' ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
+            <button className={view === 'scanner'  ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
             <button className={view === 'backtest' ? 'active' : ''} onClick={() => setView('backtest')}>Backtest</button>
           </nav>
 
@@ -247,7 +320,13 @@ export default function App() {
           <form className="debug-form" onSubmit={submitBacktest}>
             <label className="field inline-field">
               <span>Date</span>
-              <input type="date" value={backtestDate} max={todayIso()} onChange={e => setBacktestDate(e.target.value)} required />
+              <input
+                type="date"
+                value={backtestDate}
+                max={todayIso()}
+                onChange={e => setBacktestDate(e.target.value)}
+                required
+              />
             </label>
             <button className="rescan-btn" type="submit" disabled={backtestLoading}>
               {backtestLoading ? 'Running...' : 'Run Backtest'}
@@ -272,21 +351,44 @@ export default function App() {
 
         {error && <div className="error-bar">{error}</div>}
 
-        {view === 'backtest' && activeState.debug && (
+        {/* ── Backtest summary bar: show once results are available. ─────── */}
+        {view === 'backtest' && (activeState.backtest_results?.length ?? 0) > 0 && activeState.debug && (
           <div className="backtest-summary">
             <span>{activeState.total_scanned || 0} evaluated</span>
             <span>{signals.length} trade ready</span>
             <span>{watchlist_items.length} watchlist</span>
             <span>{activeState.debug.status_counts?.none ?? 0} rejected</span>
+            {activeState.debug.resolved_date && activeState.debug.requested_date !== activeState.debug.resolved_date && (
+              <span className="resolved-note">
+                Resolved to {formatDisplayDate(activeState.debug.resolved_date)}
+              </span>
+            )}
           </div>
         )}
 
-        <Results state={activeState} view={view} backtestFilter={backtestFilter} onBacktestFilter={setBacktestFilter} />
+        <Results
+          state={activeState}
+          view={view}
+          backtestFilter={backtestFilter}
+          onBacktestFilter={setBacktestFilter}
+        />
       </div>
     </Frame>
   )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Results
+//
+// In scanner mode: always shows Trade Ready cards + Watchlist table.
+// In backtest mode: if a job has run (backtest_results exists and non-empty),
+//   shows the filterable debug table — which mirrors debug_run.py's output.
+//   Otherwise falls back to an empty/loading state.
+//
+// KEY FIX: the Scanner-style fallthrough is removed from backtest mode.
+//   Backtest always renders BacktestResults (which handles its own loading
+//   state via the `scanning` prop). There is no ambiguous branching.
+// ─────────────────────────────────────────────────────────────────────────────
 function Results({
   state,
   view,
@@ -299,25 +401,29 @@ function Results({
   onBacktestFilter: (filter: BacktestFilter) => void
 }) {
   const { scanning, signals, watchlist_items } = state
-  const backtestResults = state.backtest_results ?? []
 
-  if (view === 'backtest' && (scanning || backtestResults.length > 0)) {
+  if (view === 'backtest') {
+    // Always render the BacktestResults component in backtest mode.
+    // It handles the scanning / empty / populated states internally.
     return (
       <BacktestResults
         scanning={scanning}
-        results={backtestResults}
+        results={state.backtest_results ?? []}
         filter={backtestFilter}
         onFilter={onBacktestFilter}
       />
     )
   }
 
+  // ── Scanner mode ───────────────────────────────────────────────────────────
   return (
     <>
       <div className="section">
         <div className="section-header">
           <span className="section-title">Trade Ready</span>
-          <span className="section-sub">{scanning ? '...' : `${signals.length} setup${signals.length !== 1 ? 's' : ''}`}</span>
+          <span className="section-sub">
+            {scanning ? '...' : `${signals.length} setup${signals.length !== 1 ? 's' : ''}`}
+          </span>
         </div>
         {scanning ? (
           <ScanRing />
@@ -326,14 +432,18 @@ function Results({
             {signals.map(s => <SignalCard key={s.symbol} signal={s} />)}
           </div>
         ) : (
-          <div className="empty-state">No trade-ready setups. Watchlist stocks move here when MACD confirms.</div>
+          <div className="empty-state">
+            No trade-ready setups. Watchlist stocks move here when MACD confirms.
+          </div>
         )}
       </div>
 
       <div className="section">
         <div className="section-header">
           <span className="section-title">Watchlist</span>
-          <span className="section-sub">{scanning ? '...' : `${watchlist_items.length} stock${watchlist_items.length !== 1 ? 's' : ''} awaiting MACD`}</span>
+          <span className="section-sub">
+            {scanning ? '...' : `${watchlist_items.length} stock${watchlist_items.length !== 1 ? 's' : ''} awaiting MACD`}
+          </span>
         </div>
         {!scanning && <WatchlistTable items={watchlist_items} />}
       </div>
@@ -341,6 +451,17 @@ function Results({
   )
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BacktestResults
+//
+// Mirrors debug_run.py terminal output: every evaluated stock with its status,
+// stage, reason, and key metric values. Filterable by status.
+//
+// States:
+//   scanning=true, results=[]  → shows spinner (job in progress)
+//   scanning=false, results=[] → shows "Run a backtest" prompt
+//   scanning=false, results>0  → shows filterable table
+// ─────────────────────────────────────────────────────────────────────────────
 function BacktestResults({
   scanning,
   results,
@@ -353,19 +474,23 @@ function BacktestResults({
   onFilter: (filter: BacktestFilter) => void
 }) {
   const counts = useMemo(() => ({
-    all: results.length,
-    signal: results.filter(r => r.status === 'signal').length,
-    watchlist: results.filter(r => r.status === 'watchlist').length,
-    none: results.filter(r => r.status === 'none').length,
+    all:      results.length,
+    signal:   results.filter(r => r.status === 'signal').length,
+    watchlist:results.filter(r => r.status === 'watchlist').length,
+    none:     results.filter(r => r.status === 'none').length,
   }), [results])
 
   const visible = useMemo(() => {
     const filtered = filter === 'all' ? results : results.filter(r => r.status === filter)
     return [...filtered].sort((a, b) => {
       const order = { signal: 0, watchlist: 1, none: 2 }
-      const aOrder = order[a.status as keyof typeof order] ?? 3
-      const bOrder = order[b.status as keyof typeof order] ?? 3
-      if (aOrder !== bOrder) return aOrder - bOrder
+      const ao = order[a.status as keyof typeof order] ?? 3
+      const bo = order[b.status as keyof typeof order] ?? 3
+      if (ao !== bo) return ao - bo
+      // Within the same status, sort by change_pct desc (mirrors debug_run.py)
+      const aChg = (a.values?.change_pct as number) ?? 0
+      const bChg = (b.values?.change_pct as number) ?? 0
+      if (bChg !== aChg) return bChg - aChg
       return a.symbol.localeCompare(b.symbol)
     })
   }, [filter, results])
@@ -374,36 +499,42 @@ function BacktestResults({
     <div className="section">
       <div className="section-header">
         <span className="section-title">Backtest Results</span>
-        <span className="section-sub">{scanning ? '...' : `${visible.length} of ${results.length} stocks`}</span>
+        <span className="section-sub">
+          {scanning
+            ? 'Running…'
+            : results.length > 0
+              ? `${visible.length} of ${results.length} stocks`
+              : 'No results yet'}
+        </span>
       </div>
 
       {scanning ? (
         <ScanRing />
-      ) : results.length > 0 ? (
+      ) : results.length === 0 ? (
+        <div className="empty-state">
+          Select a date and click Run Backtest to see results.
+        </div>
+      ) : (
         <>
           <div className="result-filters" role="tablist" aria-label="Backtest result filters">
-            <FilterButton label="All" value="all" active={filter} count={counts.all} onFilter={onFilter} />
-            <FilterButton label="Trade Ready" value="signal" active={filter} count={counts.signal} onFilter={onFilter} />
-            <FilterButton label="Watchlist" value="watchlist" active={filter} count={counts.watchlist} onFilter={onFilter} />
-            <FilterButton label="Rejected" value="none" active={filter} count={counts.none} onFilter={onFilter} />
+            <FilterButton label="All"         value="all"       active={filter} count={counts.all}       onFilter={onFilter} />
+            <FilterButton label="Trade Ready" value="signal"    active={filter} count={counts.signal}    onFilter={onFilter} />
+            <FilterButton label="Watchlist"   value="watchlist" active={filter} count={counts.watchlist} onFilter={onFilter} />
+            <FilterButton label="Rejected"    value="none"      active={filter} count={counts.none}      onFilter={onFilter} />
           </div>
           <div className="backtest-results-list">
-            {visible.map(result => <BacktestResultRow key={result.symbol} result={result} />)}
+            {visible.map(result => (
+              <BacktestResultRow key={result.symbol} result={result} />
+            ))}
           </div>
         </>
-      ) : (
-        <div className="empty-state">No backtest results.</div>
       )}
     </div>
   )
 }
 
 function FilterButton({
-  label,
-  value,
-  active,
-  count,
-  onFilter,
+  label, value, active, count, onFilter,
 }: {
   label: string
   value: BacktestFilter
@@ -425,28 +556,40 @@ function FilterButton({
 
 function BacktestResultRow({ result }: { result: BacktestDebugResult }) {
   const values = result.values ?? {}
-  const nse = `https://www.nseindia.com/get-quotes/equity?symbol=${result.symbol}`
-  const close = formatValue(values.close, 2)
-  const sma44 = formatValue(values.sma44 ?? values.sma44_today, 2)
-  const macd = formatValue(values.macd ?? values.macd_cur, 4)
-  const signal = formatValue(values.macd_signal ?? values.signal_cur, 4)
-  const slope = formatPercent(values.pct_slope)
+  const nse    = `https://www.nseindia.com/get-quotes/equity?symbol=${result.symbol}`
+
+  // Field names match what evaluate_debug returns in the values dict.
+  const close  = formatValue(values.close,                                2)
+  const sma44  = formatValue(values.sma44 ?? values.sma44_today,         2)
+  const macd   = formatValue(values.macd  ?? values.macd_cur,            4)
+  const signal = formatValue(values.macd_signal ?? values.signal_cur,    4)
+  const hist   = formatValue(values.macd_histogram ?? values.histogram,  4)
+  const slope  = formatPercent(values.pct_slope)
+  const chgPct = values.change_pct != null ? formatPercent(values.change_pct) : null
 
   return (
     <article className={`backtest-result ${statusClass(result.status)}`}>
       <div className="backtest-result-main">
         <a href={nse} target="_blank" rel="noreferrer">{result.symbol}</a>
-        <span className={`result-badge ${statusClass(result.status)}`}>{statusLabel(result.status)}</span>
+        <span className={`result-badge ${statusClass(result.status)}`}>
+          {statusLabel(result.status)}
+        </span>
         <span className="result-stage">{formatStage(result.stage)}</span>
+        {chgPct && (
+          <span className={`result-chg ${(values.change_pct as number) >= 0 ? 'g' : 'r'}`}>
+            {chgPct}
+          </span>
+        )}
       </div>
-      <p>{result.reason}</p>
+      <p className="result-reason">{result.reason}</p>
       <div className="result-metrics">
-        <Metric label="Close" value={close} />
-        <Metric label="SMA44" value={sma44} />
-        <Metric label="Pct slope" value={slope} />
-        <Metric label="MACD" value={macd} />
-        <Metric label="Signal" value={signal} />
-        <Metric label="Weekly" value={formatBool(values.weekly_rising)} />
+        <Metric label="Close"     value={close}  />
+        <Metric label="SMA44"     value={sma44}  />
+        <Metric label="Pct slope" value={slope}  />
+        <Metric label="MACD"      value={macd}   />
+        <Metric label="Signal"    value={signal} />
+        <Metric label="Histogram" value={hist}   />
+        <Metric label="Weekly ↑"  value={formatBool(values.weekly_rising)} />
       </div>
     </article>
   )
@@ -461,17 +604,19 @@ function Metric({ label, value }: { label: string; value: string }) {
   )
 }
 
+// ─── Formatting helpers ───────────────────────────────────────────────────────
+
 function statusClass(status: DebugStatus) {
-  if (status === 'signal') return 'signal'
+  if (status === 'signal')    return 'signal'
   if (status === 'watchlist') return 'watchlist'
-  if (status === 'none') return 'none'
+  if (status === 'none')      return 'none'
   return 'error'
 }
 
 function statusLabel(status: DebugStatus) {
-  if (status === 'signal') return 'Trade Ready'
+  if (status === 'signal')    return 'Trade Ready'
   if (status === 'watchlist') return 'Watchlist'
-  if (status === 'none') return 'Rejected'
+  if (status === 'none')      return 'Rejected'
   return 'Error'
 }
 
@@ -479,24 +624,34 @@ function formatStage(stage: string) {
   return stage.replace(/_/g, ' ')
 }
 
-function formatValue(value: unknown, decimals: number) {
+function formatValue(value: unknown, decimals: number): string {
   if (value === null || value === undefined || value === '') return '-'
-  const numberValue = Number(value)
-  if (!Number.isFinite(numberValue)) return String(value)
-  return numberValue.toFixed(decimals)
+  const n = Number(value)
+  if (!Number.isFinite(n)) return String(value)
+  return n.toFixed(decimals)
 }
 
-function formatPercent(value: unknown) {
+function formatPercent(value: unknown): string {
   if (value === null || value === undefined || value === '') return '-'
-  const numberValue = Number(value)
-  if (!Number.isFinite(numberValue)) return String(value)
-  return `${numberValue.toFixed(2)}%`
+  const n = Number(value)
+  if (!Number.isFinite(n)) return String(value)
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
 }
 
-function formatBool(value: unknown) {
-  if (value === true) return 'Yes'
+function formatBool(value: unknown): string {
+  if (value === true)  return 'Yes'
   if (value === false) return 'No'
   return '-'
+}
+
+function formatDisplayDate(iso: string): string {
+  try {
+    return new Date(iso + 'T00:00:00').toLocaleDateString('en-IN', {
+      day: 'numeric', month: 'short', year: 'numeric',
+    })
+  } catch {
+    return iso
+  }
 }
 
 function Frame({ children }: { children: ReactNode }) {

@@ -395,7 +395,10 @@ def api_backtest_status(job_id: str):
         if not job:
             return jsonify({"error": "Backtest job not found"}), 404
         if job["status"] == "done":
-            return jsonify(job["result"])
+            result = job["result"]
+            n_bt = len(result.get("backtest_results") or [])
+            print(f"Backtest status served: id={job_id} status=done backtest_results={n_bt}")
+            return jsonify(result)
         if job["status"] == "error":
             return jsonify({
                 "job_id": job_id,
@@ -406,6 +409,7 @@ def api_backtest_status(job_id: str):
                 "total_attempted": 0,
                 "signals": [],
                 "watchlist_items": [],
+                "backtest_results": [],
                 "error": job["error"],
             }), 500
         return jsonify({
@@ -417,6 +421,7 @@ def api_backtest_status(job_id: str):
             "total_attempted": 0,
             "signals": [],
             "watchlist_items": [],
+            "backtest_results": [],
             "error": None,
         })
 
@@ -485,16 +490,26 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
                 "debug_outputs": report.get("debug_outputs", {}),
             },
         })
+        n_signals  = len(payload.get("signals", []))
+        n_watchlist = len(payload.get("watchlist_items", []))
+        n_results  = len(payload.get("backtest_results", []))
         print(
             "🧪  Backtest API payload ready: "
-            f"signals={len(payload.get('signals', []))} "
-            f"watchlist={len(payload.get('watchlist_items', []))} "
-            f"results={len(payload.get('backtest_results', []))}"
+            f"signals={n_signals} "
+            f"watchlist={n_watchlist} "
+            f"backtest_results={n_results}"
         )
+        # Defensive: ensure backtest_results is always a list, never None or missing.
+        # The frontend gates its results table on this key being a non-empty list.
+        if not isinstance(payload.get("backtest_results"), list):
+            payload["backtest_results"] = []
+            print("🧪  WARNING: backtest_results was not a list — reset to []")
+
         with _backtest_lock:
             if job_id in _backtest_jobs:
                 _backtest_jobs[job_id]["status"] = "done"
                 _backtest_jobs[job_id]["result"] = payload
+                print(f"🧪  Backtest job stored: id={job_id} backtest_results={n_results}")
     except Exception as e:
         print(f"🧪  Backtest job failed: id={job_id} error={e}")
         with _backtest_lock:
