@@ -241,6 +241,28 @@ def fetch_candles(fyers: fyersModel.FyersModel, symbol: str) -> pd.DataFrame | N
     return None
 
 
+def _fetch_at_date_with_alternates(
+    fyers: fyersModel.FyersModel,
+    symbol: str,
+    range_to: datetime.date,
+) -> pd.DataFrame | None:
+    """
+    Fetch daily candles ending at range_to, using the same suffix fallback
+    contract as live fetch_candles().
+    """
+    df = _fetch_windows(fyers, symbol, range_to)
+    if df is not None:
+        return df
+
+    base = symbol.replace("-EQ", "")
+    for suffix in _ALT_SUFFIXES:
+        df = _fetch_windows(fyers, base + suffix, range_to)
+        if df is not None:
+            return df
+
+    return None
+
+
 def _request_history_window_weekly(
     fyers: fyersModel.FyersModel,
     symbol: str,
@@ -809,7 +831,7 @@ def fetch_candles_bulk_at_date(
 
     # ── Pass 1 ────────────────────────────────────────────────────────────────
     for i, sym in enumerate(symbols, 1):
-        df = _fetch_windows(fyers, sym, range_to)
+        df = _fetch_at_date_with_alternates(fyers, sym, range_to)
         if df is not None:
             results[sym] = df
         else:
@@ -832,7 +854,7 @@ def fetch_candles_bulk_at_date(
         time.sleep(_RETRY_PAUSE)
 
         for sym in to_retry:
-            df = _fetch_windows(fyers, sym, range_to)
+            df = _fetch_at_date_with_alternates(fyers, sym, range_to)
             if df is not None:
                 results[sym] = df
                 recovered_count += 1
@@ -898,7 +920,7 @@ def fetch_candles_bulk_at_date(
         still_failed_after = []
 
         for sym in failed_symbols:
-            df = _fetch_windows(fyers, sym, range_to)
+            df = _fetch_at_date_with_alternates(fyers, sym, range_to)
             if df is not None:
                 results[sym] = df
                 newly_recovered.append(sym)

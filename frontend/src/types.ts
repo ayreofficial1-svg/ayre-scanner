@@ -52,5 +52,19 @@ export interface ScanState {
     runtime_seconds?: number
     status_counts?: Record<string, number>
     stage_counts?: Record<string, number>
+    daily_valid?: number
+    prepared?: number
+    dropped_short?: number
+    quality_filtered?: number
+    weekly_valid?: number
+    weekly_no_data?: number
+    weekly_filtered?: number
+    failed?: number
+    no_data?: number
+    recovered?: number
+    persistent_recovered?: number
+    persistent_retries?: number
+    evaluation_errors?: Array<{ symbol: string; error: string }>
+    debug_outputs?: Record<string, string>
   }
 }
