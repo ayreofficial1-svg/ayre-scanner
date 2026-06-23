@@ -331,11 +331,15 @@ def api_results():
 def api_rescan():
     if _state["scanning"]:
         return jsonify({"status": "already_running"})
-    if not _fyers_market_data_allowed():
+    # Force a live market-status check so a stale "closed" cache from before
+    # market open (TTL up to PASSIVE_CHECK_INTERVAL = 3600s) never silently
+    # blocks a manual rescan during trading hours.
+    fresh_status = _free_market_status(force=True)
+    if not (_is_market_open() and fresh_status.get("status") == "open"):
         return jsonify({
             "status": "market_closed",
             "message": "Manual scans are allowed only while free sources confirm the market is open.",
-            "market_status": _free_market_status(),
+            "market_status": fresh_status,
         }), 409
     _state["scanning"] = True
     threading.Thread(target=_do_scan, daemon=True).start()
@@ -762,6 +766,11 @@ def _seconds_until_next_active_slot() -> float | None:
     """
     Seconds until the next fixed Active Check slot (HH:30, IST).
     Returns None when all slots for today have passed (after 15:30).
+
+    Guard is >= 0 (not > 5.0) so the current slot is not silently skipped
+    in the last few seconds before it fires.  The caller does
+    time.sleep(sleep_secs) which degenerates to a no-op for near-zero values,
+    then immediately checks _free_sources_confirm_market_open before scanning.
     """
     now = datetime.datetime.now(_IST)
     for h in ACTIVE_CHECK_HOURS:
@@ -769,7 +778,7 @@ def _seconds_until_next_active_slot() -> float | None:
             hour=h, minute=ACTIVE_CHECK_MINUTE, second=0, microsecond=0
         )
         diff = (target - now).total_seconds()
-        if diff > 5.0:
+        if diff >= 0:
             return diff
     return None
 
@@ -1100,12 +1109,17 @@ def _scan_loop() -> None:
 
         sleep_secs = _seconds_until_next_active_slot()
         if sleep_secs is None:
-            h, rem = divmod(int(_seconds_until_next_scan_slot()), 3600)
+            secs_to_next = _seconds_until_next_scan_slot()
+            h, rem = divmod(int(secs_to_next), 3600)
             m, s = divmod(rem, 60)
             print(
                 f"\n🔴  Active scan slots exhausted. "
                 f"Next first scan slot in {h}h {m}m {s}s."
             )
+            # Sleep until tomorrow's first slot so we don't spin.
+            # _seconds_until_next_scan_slot() already wraps to tomorrow
+            # when all today's slots have passed.
+            time.sleep(secs_to_next)
             continue
 
         next_dt = datetime.datetime.now(_IST) + datetime.timedelta(seconds=sleep_secs)

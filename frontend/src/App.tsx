@@ -103,7 +103,16 @@ export default function App() {
   }, [poll])
 
   const triggerRescan = async () => {
-    await fetch('/api/rescan', { method: 'POST' })
+    const res = await fetch('/api/rescan', { method: 'POST' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({})) as { message?: string; status?: string }
+      // Surface the rejection reason (e.g. market closed) in the error bar.
+      setState(prev => ({
+        ...prev,
+        error: data.message ?? `Rescan rejected (${res.status})`,
+      }))
+      return
+    }
     poll()
   }
 
