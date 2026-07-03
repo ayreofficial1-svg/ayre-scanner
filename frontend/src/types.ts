@@ -37,6 +37,33 @@ export interface Signal {
   is_imminent_crossover?: boolean
 }
 
+export interface SignalPick {
+  id: string
+  symbol: string
+  rationale: string
+  date_added: string
+  added_by?: string | null
+  active?: boolean
+  last_price?: number | null
+  change_pct?: number | null
+}
+
+export interface SentimentData {
+  sentiment: number | null
+  updated_at: string | null
+  note?: string | null
+}
+
+export interface LearnArticle {
+  id: string
+  title: string
+  body: string
+  category?: string | null
+  published: boolean
+  created_at: string
+  updated_at: string
+}
+
 export type DebugStatus = 'signal' | 'watchlist' | 'none' | 'error' | string
 
 export interface BacktestDebugResult {

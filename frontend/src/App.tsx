@@ -5,8 +5,11 @@ import Clock from './components/Clock'
 import ScanRing from './components/ScanRing'
 import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
+import SignalsPanel from './components/SignalsPanel'
+import SentimentPanel from './components/SentimentPanel'
+import LearnPanel from './components/LearnPanel'
 
-type View = 'scanner' | 'backtest'
+type View = 'scanner' | 'backtest' | 'signals' | 'sentiment' | 'learn'
 type AuthState = 'checking' | 'authenticated' | 'login'
 type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none'
 
@@ -315,15 +318,24 @@ export default function App() {
           </div>
 
           <nav className="nav-tabs" aria-label="Primary">
-            <button className={view === 'scanner'  ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
-            <button className={view === 'backtest' ? 'active' : ''} onClick={() => setView('backtest')}>Backtest</button>
+            <button className={view === 'scanner'   ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
+            <button className={view === 'backtest'  ? 'active' : ''} onClick={() => setView('backtest')}>Backtest</button>
+            <button className={view === 'signals'   ? 'active' : ''} onClick={() => setView('signals')}>Signals</button>
+            <button className={view === 'sentiment' ? 'active' : ''} onClick={() => setView('sentiment')}>Sentiment</button>
+            <button className={view === 'learn'     ? 'active' : ''} onClick={() => setView('learn')}>Learn</button>
           </nav>
 
-          <div className="header-meta">
-            <span className="scan-label">{scan_time ? `Last scan - ${scan_time}` : 'Awaiting scan...'}</span>
-            <span className="scan-label">Nifty 500 · Daily candles · 3-10 day holds</span>
-          </div>
+          {(view === 'scanner' || view === 'backtest') && (
+            <div className="header-meta">
+              <span className="scan-label">{scan_time ? `Last scan - ${scan_time}` : 'Awaiting scan...'}</span>
+              <span className="scan-label">Nifty 500 · Daily candles · 3-10 day holds</span>
+            </div>
+          )}
         </header>
+
+        {view === 'signals' && <SignalsPanel />}
+        {view === 'sentiment' && <SentimentPanel />}
+        {view === 'learn' && <LearnPanel />}
 
         {view === 'backtest' && (
           <form className="debug-form" onSubmit={submitBacktest}>
@@ -343,44 +355,48 @@ export default function App() {
           </form>
         )}
 
-        <div className="stats-row">
-          <div className="stat-cell">
-            <div className="stat-num">{scanning ? '-' : total_scanned || '-'}</div>
-            <div className="stat-lbl">Scanned</div>
-          </div>
-          <div className="stat-cell">
-            <div className="stat-num g">{scanning ? '-' : signals.length}</div>
-            <div className="stat-lbl">Trade Ready</div>
-          </div>
-          <div className="stat-cell">
-            <div className="stat-num gold">{scanning ? '-' : watchlist_items.length}</div>
-            <div className="stat-lbl">Watchlist</div>
-          </div>
-        </div>
+        {(view === 'scanner' || view === 'backtest') && (
+          <>
+            <div className="stats-row">
+              <div className="stat-cell">
+                <div className="stat-num">{scanning ? '-' : total_scanned || '-'}</div>
+                <div className="stat-lbl">Scanned</div>
+              </div>
+              <div className="stat-cell">
+                <div className="stat-num g">{scanning ? '-' : signals.length}</div>
+                <div className="stat-lbl">Trade Ready</div>
+              </div>
+              <div className="stat-cell">
+                <div className="stat-num gold">{scanning ? '-' : watchlist_items.length}</div>
+                <div className="stat-lbl">Watchlist</div>
+              </div>
+            </div>
 
-        {error && <div className="error-bar">{error}</div>}
+            {error && <div className="error-bar">{error}</div>}
 
-        {/* ── Backtest summary bar: show once results are available. ─────── */}
-        {view === 'backtest' && (activeState.backtest_results?.length ?? 0) > 0 && activeState.debug && (
-          <div className="backtest-summary">
-            <span>{activeState.total_scanned || 0} evaluated</span>
-            <span>{signals.length} trade ready</span>
-            <span>{watchlist_items.length} watchlist</span>
-            <span>{activeState.debug.status_counts?.none ?? 0} rejected</span>
-            {activeState.debug.resolved_date && activeState.debug.requested_date !== activeState.debug.resolved_date && (
-              <span className="resolved-note">
-                Resolved to {formatDisplayDate(activeState.debug.resolved_date)}
-              </span>
+            {/* ── Backtest summary bar: show once results are available. ─────── */}
+            {view === 'backtest' && (activeState.backtest_results?.length ?? 0) > 0 && activeState.debug && (
+              <div className="backtest-summary">
+                <span>{activeState.total_scanned || 0} evaluated</span>
+                <span>{signals.length} trade ready</span>
+                <span>{watchlist_items.length} watchlist</span>
+                <span>{activeState.debug.status_counts?.none ?? 0} rejected</span>
+                {activeState.debug.resolved_date && activeState.debug.requested_date !== activeState.debug.resolved_date && (
+                  <span className="resolved-note">
+                    Resolved to {formatDisplayDate(activeState.debug.resolved_date)}
+                  </span>
+                )}
+              </div>
             )}
-          </div>
-        )}
 
-        <Results
-          state={activeState}
-          view={view}
-          backtestFilter={backtestFilter}
-          onBacktestFilter={setBacktestFilter}
-        />
+            <Results
+              state={activeState}
+              view={view}
+              backtestFilter={backtestFilter}
+              onBacktestFilter={setBacktestFilter}
+            />
+          </>
+        )}
       </div>
     </Frame>
   )

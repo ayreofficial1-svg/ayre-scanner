@@ -698,6 +698,24 @@ tbody tr:hover td {
   background: var(--bg-surface);
 }
 
+.field textarea {
+  min-width: 220px;
+  background: var(--bg-base);
+  border: 1px solid var(--text-muted);
+  color: var(--text-main);
+  padding: 0.65rem 0.75rem;
+  font-family: var(--font);
+  font-size: 0.9rem;
+  outline: none;
+  resize: vertical;
+  transition: var(--tr);
+}
+
+.field textarea:focus {
+  border-color: var(--text-main);
+  background: var(--bg-surface);
+}
+
 .inline-field input {
   min-width: 180px;
 }
