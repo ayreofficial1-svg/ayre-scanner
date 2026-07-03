@@ -70,6 +70,9 @@ from scanner.engine import run_scan
 from scanner.historical import run_historical_scan
 from utils.logger import get_log_summary
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk
+from data.app_signals import load_signals, add_signal, delete_signal
+from data.app_learn import load_articles, add_article, update_article
+from data.app_sentiment import load_sentiment
 
 try:
     from flask import Flask, jsonify, request, send_from_directory, session
@@ -255,6 +258,32 @@ def _is_authenticated() -> bool:
     return bool(session.get("authenticated"))
 
 
+def _display_name() -> str:
+    """Human-friendly name for the Home tab greeting. Falls back to username."""
+    username = str(session.get("username") or "")
+    return username[:1].upper() + username[1:] if username else "there"
+
+
+def _configured_admin_users() -> set[str]:
+    raw = os.environ.get("SCANNER_ADMIN_USERS", "")
+    return {u.strip() for u in raw.split(",") if u.strip()}
+
+
+def _is_admin() -> bool:
+    """
+    Gate for the website-only write endpoints (POST/DELETE on /api/signals,
+    POST on /api/learn). If SCANNER_ADMIN_USERS is unset, any authenticated
+    session may write — matching today's single-tier auth. Set it to restrict
+    writes to specific usernames once the website has its own admin login.
+    """
+    if not _is_authenticated():
+        return False
+    admins = _configured_admin_users()
+    if not admins:
+        return True
+    return session.get("username") in admins
+
+
 def _is_static_asset(path: str) -> bool:
     return bool(path and os.path.isfile(os.path.join(STATIC_DIR, path)))
 
@@ -280,10 +309,14 @@ def _require_authentication():
 
 @app.route("/api/auth/session")
 def api_auth_session():
-    return jsonify({
+    payload = {
         "authenticated": _is_authenticated(),
         "configured": _auth_credentials_configured(),
-    })
+    }
+    if _is_authenticated():
+        payload["username"] = session.get("username")
+        payload["display_name"] = _display_name()
+    return jsonify(payload)
 
 
 @app.route("/api/auth/login", methods=["POST"])
@@ -691,6 +724,156 @@ def api_quotes():
             "quotes"    : dict(_quotes_cache),
             "updated_at": _quotes_updated_at,
         })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer app: Signals tab (admin-curated stock picks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/signals", methods=["GET"])
+def api_signals_list():
+    """
+    List of admin-picked stocks with live price/% change attached.
+
+    Response shape
+    ──────────────
+    {
+        "signals": [
+            {
+                "id"         : "b3f1...",
+                "symbol"     : "RELIANCE",
+                "rationale"  : "Breakout above SMA44 with rising volume.",
+                "date_added" : "2026-07-03",
+                "added_by"   : "raghav",
+                "last_price" : 2850.45,
+                "change_pct" : 1.23
+            },
+            ...
+        ],
+        "updated_at": "<ISO timestamp>"
+    }
+    """
+    global _fyers
+    signals = load_signals()
+
+    quotes: dict[str, dict] = {}
+    symbols = [s["symbol"] for s in signals if s.get("symbol")]
+    if symbols and _fyers is not None and _fyers_market_data_allowed():
+        quotes = fetch_constituents_quotes_bulk(_fyers, symbols)
+
+    enriched = []
+    for s in signals:
+        q = quotes.get(str(s.get("symbol", "")).upper(), {})
+        enriched.append({
+            **s,
+            "last_price": q.get("last_price"),
+            "change_pct": q.get("change_pct"),
+        })
+
+    return jsonify({
+        "signals"   : enriched,
+        "updated_at": datetime.datetime.now(_IST).isoformat(),
+    })
+
+
+@app.route("/api/signals", methods=["POST"])
+def api_signals_add():
+    """Website-only. Body: {"symbol": "RELIANCE", "rationale": "..."}"""
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    symbol    = str(payload.get("symbol", "")).strip()
+    rationale = str(payload.get("rationale", "")).strip()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+
+    entry = add_signal(symbol=symbol, rationale=rationale, added_by=session.get("username"))
+    return jsonify({"signal": entry}), 201
+
+
+@app.route("/api/signals/<string:signal_id>", methods=["DELETE"])
+def api_signals_delete(signal_id: str):
+    """Website-only."""
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    removed = delete_signal(signal_id)
+    if not removed:
+        return jsonify({"error": "Signal not found"}), 404
+    return jsonify({"deleted": True, "id": signal_id})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer app: Insights tab (sentiment gauge placeholder)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/sentiment", methods=["GET"])
+def api_sentiment():
+    """
+    Placeholder sentiment value on a 0-100 scale.
+
+    Response shape
+    ──────────────
+    { "sentiment": 65, "updated_at": "<ISO timestamp>" | null }
+
+    The app only renders this number on a gauge — no classification logic
+    lives on the client. The real formula (advance/decline, VIX, etc.) can
+    replace load_sentiment()'s source later without an app update.
+    """
+    return jsonify(load_sentiment())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer app: Learn tab (educational articles)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/learn", methods=["GET"])
+def api_learn_list():
+    """
+    Flat list of learn articles, newest first.
+
+    Response shape
+    ──────────────
+    {
+        "articles": [
+            { "id": "a1c2...", "title": "...", "body": "...",
+              "category": null, "date_added": "2026-07-03" },
+            ...
+        ]
+    }
+    """
+    return jsonify({"articles": load_articles()})
+
+
+@app.route("/api/learn", methods=["POST"])
+def api_learn_add():
+    """
+    Website-only. Body: {"title": "...", "body": "...", "category": "..."}
+    Pass "id" in the body to edit an existing article instead of creating one.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    article_id = payload.get("id")
+    title      = payload.get("title")
+    body       = payload.get("body")
+    category   = payload.get("category")
+
+    if article_id:
+        updated = update_article(str(article_id), title, body, category)
+        if updated is None:
+            return jsonify({"error": "Article not found"}), 404
+        return jsonify({"article": updated})
+
+    title = str(title or "").strip()
+    body  = str(body or "").strip()
+    if not title or not body:
+        return jsonify({"error": "title and body are required"}), 400
+
+    entry = add_article(title=title, body=body, category=category)
+    return jsonify({"article": entry}), 201
 
 
 # ── React catch-all (serves index.html for all non-API routes) ───────────────

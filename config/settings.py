@@ -152,6 +152,17 @@ WATCHLIST_FILE = "watchlist.json"
 ALERT_LOG_FILE = "alert_log.json"
 SIGNAL_LOG_DIR = "logs"
 
+# ── Consumer app: admin-curated signals, learn content, sentiment ────────────
+APP_SIGNALS_FILE   = "app_signals.json"
+APP_LEARN_FILE     = "app_learn.json"
+APP_SENTIMENT_FILE = "app_sentiment.json"
+APP_SENTIMENT_DEFAULT = 65  # 0-100 placeholder until a real formula is defined
+
+# Optional: restrict POST/DELETE on /api/signals and /api/learn to a subset of
+# SCANNER_USERS. Comma-separated usernames, e.g. "raghav,admin".
+# If unset, any authenticated session may write (matches today's single-tier auth).
+APP_ADMIN_USERS_ENV = "SCANNER_ADMIN_USERS"
+
 # ── Double Bottom Pattern Detection ℹ ──────────────────────────────────────────
 DOUBLE_BOTTOM_LOOKBACK = 20    # bars to search for a prior SMA44 support touch (double-bottom pattern)
 
