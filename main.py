@@ -71,8 +71,8 @@ from scanner.historical import run_historical_scan
 from utils.logger import get_log_summary
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk
 from data.app_signals import load_signals, add_signal, delete_signal
-from data.app_learn import load_articles, add_article, update_article
-from data.app_sentiment import load_sentiment
+from data.app_learn import load_articles, add_article, update_article, get_article
+from data.app_sentiment import load_sentiment, save_sentiment
 
 try:
     from flask import Flask, jsonify, request, send_from_directory, session
@@ -754,7 +754,7 @@ def api_signals_list():
     }
     """
     global _fyers
-    signals = load_signals()
+    signals = load_signals(active_only=True)
 
     quotes: dict[str, dict] = {}
     symbols = [s["symbol"] for s in signals if s.get("symbol")]
@@ -794,13 +794,17 @@ def api_signals_add():
 
 @app.route("/api/signals/<string:signal_id>", methods=["DELETE"])
 def api_signals_delete(signal_id: str):
-    """Website-only."""
+    """
+    Website-only. Deactivates the signal (sets active=False) rather than
+    deleting the record — GET /api/signals only returns active signals, so
+    the effect on the app is the same, but history is preserved.
+    """
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
 
     removed = delete_signal(signal_id)
     if not removed:
-        return jsonify({"error": "Signal not found"}), 404
+        return jsonify({"error": "Signal not found (or already inactive)"}), 404
     return jsonify({"deleted": True, "id": signal_id})
 
 
@@ -815,13 +819,37 @@ def api_sentiment():
 
     Response shape
     ──────────────
-    { "sentiment": 65, "updated_at": "<ISO timestamp>" | null }
+    { "sentiment": 65, "updated_at": "<ISO timestamp>" | null, "note": "..." | null }
 
     The app only renders this number on a gauge — no classification logic
     lives on the client. The real formula (advance/decline, VIX, etc.) can
     replace load_sentiment()'s source later without an app update.
     """
     return jsonify(load_sentiment())
+
+
+@app.route("/api/sentiment", methods=["POST"])
+def api_sentiment_set():
+    """
+    Website-only. Manually set the sentiment value.
+    Body: {"value": 65, "note": "optional short note"}
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    raw_value = payload.get("value")
+    note = payload.get("note")
+
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return jsonify({"error": "value must be an integer between 0 and 100"}), 400
+    if not (0 <= value <= 100):
+        return jsonify({"error": "value must be an integer between 0 and 100"}), 400
+
+    data = save_sentiment(value, note=note)
+    return jsonify(data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -831,26 +859,45 @@ def api_sentiment():
 @app.route("/api/learn", methods=["GET"])
 def api_learn_list():
     """
-    Flat list of learn articles, newest first.
+    Flat list of published learn articles, newest first. Drafts
+    (published=false) are excluded — this is what the consumer app reads.
 
     Response shape
     ──────────────
     {
         "articles": [
             { "id": "a1c2...", "title": "...", "body": "...",
-              "category": null, "date_added": "2026-07-03" },
+              "category": null, "published": true,
+              "created_at": "...", "updated_at": "..." },
             ...
         ]
     }
     """
-    return jsonify({"articles": load_articles()})
+    return jsonify({"articles": load_articles(published_only=True)})
+
+
+@app.route("/api/learn/<string:article_id>", methods=["GET"])
+def api_learn_get(article_id: str):
+    """
+    Full body of a single published article. 404s for unknown ids and for
+    drafts (published=false) — same visibility rule as the list endpoint.
+
+    Response shape
+    ──────────────
+    { "article": { "id": "...", "title": "...", "body": "...", ... } }
+    """
+    article = get_article(article_id, published_only=True)
+    if article is None:
+        return jsonify({"error": "Article not found"}), 404
+    return jsonify({"article": article})
 
 
 @app.route("/api/learn", methods=["POST"])
 def api_learn_add():
     """
-    Website-only. Body: {"title": "...", "body": "...", "category": "..."}
-    Pass "id" in the body to edit an existing article instead of creating one.
+    Website-only. Body: {"title": "...", "body": "...", "category": "...",
+    "published": true}. "published" defaults to true if omitted. Pass "id"
+    in the body to edit an existing article instead of creating one.
     """
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
@@ -860,9 +907,10 @@ def api_learn_add():
     title      = payload.get("title")
     body       = payload.get("body")
     category   = payload.get("category")
+    published  = payload.get("published")
 
     if article_id:
-        updated = update_article(str(article_id), title, body, category)
+        updated = update_article(str(article_id), title, body, category, published)
         if updated is None:
             return jsonify({"error": "Article not found"}), 404
         return jsonify({"article": updated})
@@ -872,7 +920,12 @@ def api_learn_add():
     if not title or not body:
         return jsonify({"error": "title and body are required"}), 400
 
-    entry = add_article(title=title, body=body, category=category)
+    entry = add_article(
+        title=title,
+        body=body,
+        category=category,
+        published=True if published is None else bool(published),
+    )
     return jsonify({"article": entry}), 201
 
 

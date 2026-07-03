@@ -4,6 +4,9 @@ logs/
 *.log
 watchlist.json
 alert_log.json
+app_signals.json
+app_learn.json
+app_sentiment.json
 debug_out.csv
 debug_out.json
 debug_report.html
@@ -36,3 +39,4 @@ desktop.ini
 fyersRequests.log
 fyersApi.log
 flutter_app/    
+ayre_scanner/

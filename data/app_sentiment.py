@@ -29,14 +29,16 @@ def load_sentiment() -> dict:
     return {
         "sentiment" : APP_SENTIMENT_DEFAULT,
         "updated_at": None,
+        "note"      : None,
     }
 
 
-def save_sentiment(value: int) -> dict:
+def save_sentiment(value: int, note: str | None = None) -> dict:
     value = max(0, min(100, int(value)))
     data = {
         "sentiment" : value,
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "note"      : (note or "").strip() or None,
     }
     with open(APP_SENTIMENT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
