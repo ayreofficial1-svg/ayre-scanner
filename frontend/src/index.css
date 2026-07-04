@@ -127,36 +127,6 @@ h1 {
   background: rgba(255, 255, 255, 0.02);
 }
 
-.app-admin-header {
-  margin-bottom: 1.5rem;
-}
-
-.app-panel-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-}
-
-.app-panel-tabs button {
-  background: transparent;
-  border: 1px solid var(--border-hover);
-  color: var(--text-muted);
-  padding: 0.5rem 0.85rem;
-  font-family: var(--mono);
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  cursor: pointer;
-  transition: var(--tr);
-}
-
-.app-panel-tabs button:hover,
-.app-panel-tabs button.active {
-  color: var(--text-main);
-  border-color: var(--text-muted);
-  background: var(--bg-surface);
-}
-
 .header-meta {
   display: flex; justify-content: space-between; align-items: center;
   padding-top: 1.5rem; flex-wrap: wrap; gap: 0.75rem;

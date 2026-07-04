@@ -2,7 +2,22 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { LearnArticle } from '../types'
 
-const EMPTY_FORM = { id: '', title: '', body: '', category: '', published: true }
+const EMPTY_FORM = {
+  id: '',
+  title: '',
+  body: '',
+  category: '',
+  published: true,
+  featured: false,
+  pinned: false,
+  display_order: 0,
+  image_url: '',
+  icon: 'auto_graph',
+  tone: 'orange',
+  start_at: '',
+  end_at: '',
+  tags: '',
+}
 
 export default function LearnPanel() {
   const [articles, setArticles] = useState<LearnArticle[]>([])
@@ -14,7 +29,7 @@ export default function LearnPanel() {
   const load = async () => {
     setLoading(true)
     try {
-      const res  = await fetch('/api/learn')
+      const res  = await fetch('/api/learn?all=1')
       const data = await res.json() as { articles: LearnArticle[] }
       setArticles(data.articles)
       setError(null)
@@ -28,7 +43,22 @@ export default function LearnPanel() {
   useEffect(() => { load() }, [])
 
   const edit = (a: LearnArticle) => {
-    setForm({ id: a.id, title: a.title, body: a.body, category: a.category ?? '', published: a.published })
+    setForm({
+      id: a.id,
+      title: a.title,
+      body: a.body,
+      category: a.category ?? '',
+      published: a.enabled ?? a.published,
+      featured: a.featured ?? false,
+      pinned: a.pinned ?? false,
+      display_order: a.display_order ?? 0,
+      image_url: a.image_url ?? '',
+      icon: a.icon ?? 'auto_graph',
+      tone: a.tone ?? 'orange',
+      start_at: a.start_at ?? '',
+      end_at: a.end_at ?? '',
+      tags: (a.tags ?? []).join(', '),
+    })
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
@@ -46,6 +76,16 @@ export default function LearnPanel() {
           body: form.body.trim(),
           category: form.category.trim() || null,
           published: form.published,
+          enabled: form.published,
+          featured: form.featured,
+          pinned: form.pinned,
+          display_order: form.display_order,
+          image_url: form.image_url.trim() || null,
+          icon: form.icon,
+          tone: form.tone,
+          start_at: form.start_at || null,
+          end_at: form.end_at || null,
+          tags: form.tags.split(',').map(t => t.trim()).filter(Boolean),
         }),
       })
       const data = await res.json().catch(() => ({})) as { error?: string }
@@ -56,6 +96,31 @@ export default function LearnPanel() {
       setError(err instanceof Error ? err.message : 'Failed to save article')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const uploadAsset = async (file: File | null) => {
+    if (!file) return
+    const body = new FormData()
+    body.append('file', file)
+    try {
+      const res = await fetch('/api/uploads', { method: 'POST', body })
+      const data = await res.json().catch(() => ({})) as { url?: string; error?: string }
+      if (!res.ok || !data.url) throw new Error(data.error || 'Upload failed')
+      setForm(f => ({ ...f, image_url: data.url! }))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed')
+    }
+  }
+
+  const remove = async (id: string) => {
+    try {
+      const res = await fetch(`/api/learn/${id}`, { method: 'DELETE' })
+      const data = await res.json().catch(() => ({})) as { error?: string }
+      if (!res.ok) throw new Error(data.error || 'Failed to hide article')
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to hide article')
     }
   }
 
@@ -77,6 +142,52 @@ export default function LearnPanel() {
           <span>Category (optional)</span>
           <input value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))} placeholder="Basics" />
         </label>
+        <div className="debug-form">
+          <label className="field inline-field">
+            <span>Order</span>
+            <input type="number" value={form.display_order} onChange={e => setForm(f => ({ ...f, display_order: Number(e.target.value) || 0 }))} />
+          </label>
+          <label className="field inline-field">
+            <span>Icon</span>
+            <select value={form.icon} onChange={e => setForm(f => ({ ...f, icon: e.target.value }))}>
+              <option value="auto_graph">Chart</option>
+              <option value="shield">Shield</option>
+              <option value="speed">Speed</option>
+              <option value="school">School</option>
+              <option value="psychology">Psychology</option>
+            </select>
+          </label>
+          <label className="field inline-field">
+            <span>Tone</span>
+            <select value={form.tone} onChange={e => setForm(f => ({ ...f, tone: e.target.value }))}>
+              <option value="orange">Orange</option>
+              <option value="mint">Mint</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+        </div>
+        <label className="field">
+          <span>Image URL</span>
+          <input value={form.image_url} onChange={e => setForm(f => ({ ...f, image_url: e.target.value }))} placeholder="/uploads/example.webp" />
+        </label>
+        <label className="field">
+          <span>Upload Image</span>
+          <input type="file" accept="image/*" onChange={e => uploadAsset(e.target.files?.[0] ?? null)} />
+        </label>
+        <label className="field">
+          <span>Tags</span>
+          <input value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} placeholder="risk, basics" />
+        </label>
+        <div className="debug-form">
+          <label className="field inline-field">
+            <span>Start</span>
+            <input type="datetime-local" value={form.start_at} onChange={e => setForm(f => ({ ...f, start_at: e.target.value }))} />
+          </label>
+          <label className="field inline-field">
+            <span>End</span>
+            <input type="datetime-local" value={form.end_at} onChange={e => setForm(f => ({ ...f, end_at: e.target.value }))} />
+          </label>
+        </div>
         <label className="field">
           <span>Body</span>
           <textarea
@@ -94,6 +205,14 @@ export default function LearnPanel() {
             onChange={e => setForm(f => ({ ...f, published: e.target.checked }))}
           />
           <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>Published</span>
+        </label>
+        <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.6rem' }}>
+          <input type="checkbox" style={{ width: 'auto' }} checked={form.featured} onChange={e => setForm(f => ({ ...f, featured: e.target.checked }))} />
+          <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>Featured</span>
+        </label>
+        <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.6rem' }}>
+          <input type="checkbox" style={{ width: 'auto' }} checked={form.pinned} onChange={e => setForm(f => ({ ...f, pinned: e.target.checked }))} />
+          <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>Pinned</span>
         </label>
         <div style={{ display: 'flex', gap: '0.75rem' }}>
           <button className="rescan-btn" type="submit" disabled={saving}>
@@ -119,6 +238,7 @@ export default function LearnPanel() {
                 <span className="card-sym">{a.title}</span>
                 <span className="card-val dim">{a.category || '—'}</span>
                 <button className="theme-btn" onClick={() => edit(a)}>Edit</button>
+                <button className="theme-btn" onClick={() => remove(a.id)}>Hide</button>
               </div>
               <div className="card-date">Updated {new Date(a.updated_at).toLocaleString('en-IN')}</div>
             </div>

@@ -44,6 +44,15 @@ export interface SignalPick {
   date_added: string
   added_by?: string | null
   active?: boolean
+  enabled?: boolean
+  featured?: boolean
+  pinned?: boolean
+  display_order?: number
+  category?: string | null
+  image_url?: string | null
+  start_at?: string | null
+  end_at?: string | null
+  tags?: string[]
   last_price?: number | null
   change_pct?: number | null
 }
@@ -60,6 +69,35 @@ export interface LearnArticle {
   body: string
   category?: string | null
   published: boolean
+  enabled?: boolean
+  featured?: boolean
+  pinned?: boolean
+  display_order?: number
+  image_url?: string | null
+  icon?: string | null
+  tone?: string | null
+  start_at?: string | null
+  end_at?: string | null
+  tags?: string[]
+  created_at: string
+  updated_at: string
+}
+
+export interface InsightContent {
+  id: string
+  title: string
+  body: string
+  category?: string | null
+  enabled: boolean
+  featured?: boolean
+  pinned?: boolean
+  display_order?: number
+  image_url?: string | null
+  icon?: string | null
+  tone?: string | null
+  start_at?: string | null
+  end_at?: string | null
+  tags?: string[]
   created_at: string
   updated_at: string
 }

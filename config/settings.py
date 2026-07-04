@@ -155,7 +155,9 @@ SIGNAL_LOG_DIR = "logs"
 # ── Consumer app: admin-curated signals, learn content, sentiment ────────────
 APP_SIGNALS_FILE   = "app_signals.json"
 APP_LEARN_FILE     = "app_learn.json"
+APP_INSIGHTS_FILE  = "app_insights.json"
 APP_SENTIMENT_FILE = "app_sentiment.json"
+APP_ASSET_DIR      = "static/uploads"
 APP_SENTIMENT_DEFAULT = 65  # 0-100 placeholder until a real formula is defined
 
 # Optional: restrict POST/DELETE on /api/signals and /api/learn to a subset of

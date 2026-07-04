@@ -42,6 +42,38 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _is_visible(entry: dict, now: datetime.datetime | None = None) -> bool:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if not entry.get("enabled", entry.get("published", True)):
+        return False
+    start = str(entry.get("start_at") or "").strip()
+    end = str(entry.get("end_at") or "").strip()
+    try:
+        start_at = datetime.datetime.fromisoformat(start) if start else None
+        if start_at and start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=datetime.timezone.utc)
+        if start_at and start_at > now:
+            return False
+    except ValueError:
+        pass
+    try:
+        end_at = datetime.datetime.fromisoformat(end) if end else None
+        if end_at and end_at.tzinfo is None:
+            end_at = end_at.replace(tzinfo=datetime.timezone.utc)
+        if end_at and end_at <= now:
+            return False
+    except ValueError:
+        pass
+    return True
+
+
+def _sort_key(entry: dict) -> tuple[int, int, str]:
+    pinned = 0 if entry.get("pinned") else 1
+    order = int(entry.get("display_order") or 0)
+    updated = str(entry.get("updated_at") or entry.get("created_at") or "")
+    return (pinned, order, updated)
+
+
 def load_articles(published_only: bool = False) -> list[dict]:
     """
     Load all articles. Pass published_only=True to filter out drafts
@@ -57,11 +89,10 @@ def load_articles(published_only: bool = False) -> list[dict]:
         except Exception:
             pass
 
+    normalized = [_normalize_article(a) for a in articles if isinstance(a, dict)]
     if published_only:
-        # Entries written before the "published" field existed are treated
-        # as published, so existing content doesn't silently disappear.
-        articles = [a for a in articles if a.get("published", True)]
-    return articles
+        normalized = [a for a in normalized if _is_visible(a)]
+    return sorted(normalized, key=_sort_key)
 
 
 def get_article(article_id: str, published_only: bool = False) -> dict | None:
@@ -69,7 +100,8 @@ def get_article(article_id: str, published_only: bool = False) -> dict | None:
     published_only=True, if it exists but is an unpublished draft)."""
     for a in load_articles():
         if a.get("id") == article_id:
-            if published_only and not a.get("published", True):
+            a = _normalize_article(a)
+            if published_only and not _is_visible(a):
                 return None
             return a
     return None
@@ -80,17 +112,45 @@ def save_articles(articles: list[dict]) -> None:
         json.dump(articles, f, indent=2)
 
 
-def add_article(title: str, body: str, category: str | None = None, published: bool = True) -> dict:
+def _normalize_article(entry: dict) -> dict:
+    published = bool(entry.get("published", entry.get("enabled", True)))
+    normalized = {
+        **entry,
+        "category": (entry.get("category") or "").strip() or None,
+        "published": published,
+        "enabled": bool(entry.get("enabled", published)),
+        "featured": bool(entry.get("featured", False)),
+        "pinned": bool(entry.get("pinned", False)),
+        "display_order": int(entry.get("display_order") or 0),
+        "image_url": (entry.get("image_url") or "").strip() or None,
+        "icon": (entry.get("icon") or "").strip() or None,
+        "tone": (entry.get("tone") or "").strip() or "orange",
+        "start_at": (entry.get("start_at") or "").strip() or None,
+        "end_at": (entry.get("end_at") or "").strip() or None,
+        "tags": entry.get("tags") if isinstance(entry.get("tags"), list) else [],
+    }
+    return normalized
+
+
+def add_article(
+    title: str,
+    body: str,
+    category: str | None = None,
+    published: bool = True,
+    **fields,
+) -> dict:
     now = _now_iso()
-    entry = {
+    entry = _normalize_article({
         "id"        : uuid.uuid4().hex,
         "title"     : title.strip(),
         "body"      : body.strip(),
         "category"  : (category or "").strip() or None,
         "published" : bool(published),
+        "enabled"   : bool(fields.get("enabled", published)),
         "created_at": now,
         "updated_at": now,
-    }
+        **fields,
+    })
     articles = load_articles()
     articles.insert(0, entry)
     save_articles(articles)
@@ -103,10 +163,11 @@ def update_article(
     body: str | None,
     category: str | None,
     published: bool | None = None,
+    **fields,
 ) -> dict | None:
     """Edit an existing article in place. Returns the updated entry, or None if not found."""
     articles = load_articles()
-    for a in articles:
+    for idx, a in enumerate(articles):
         if a.get("id") == article_id:
             if title is not None:
                 a["title"] = title.strip()
@@ -116,8 +177,29 @@ def update_article(
                 a["category"] = category.strip() or None
             if published is not None:
                 a["published"] = bool(published)
+                a["enabled"] = bool(fields.get("enabled", published))
+            for key in (
+                "enabled",
+                "featured",
+                "pinned",
+                "display_order",
+                "image_url",
+                "icon",
+                "tone",
+                "start_at",
+                "end_at",
+                "tags",
+            ):
+                if key in fields:
+                    a[key] = fields[key]
             a["updated_at"] = _now_iso()
             a.setdefault("created_at", a["updated_at"])
+            a = _normalize_article(a)
+            articles[idx] = a
             save_articles(articles)
             return a
     return None
+
+
+def delete_article(article_id: str) -> bool:
+    return update_article(article_id, None, None, None, False, enabled=False) is not None

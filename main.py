@@ -70,14 +70,21 @@ from scanner.engine import run_scan
 from scanner.historical import run_historical_scan
 from utils.logger import get_log_summary
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk
-from data.app_signals import load_signals, add_signal, delete_signal
-from data.app_learn import load_articles, add_article, update_article, get_article
+from data.app_signals import load_signals, add_signal, update_signal, delete_signal
+from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
+from data.app_insights import load_insights, add_insight, update_insight, delete_insight
 from data.app_sentiment import load_sentiment, save_sentiment
+from config.settings import APP_ASSET_DIR
 
 try:
     from flask import Flask, jsonify, request, send_from_directory, session
 except ImportError:
     sys.exit("❌  Flask not installed. Run: pip install flask")
+
+try:
+    from werkzeug.utils import secure_filename
+except ImportError:
+    secure_filename = None
 
 try:
     from flask_cors import CORS
@@ -104,7 +111,7 @@ else:
     def _add_cors_headers(response):
         response.headers["Access-Control-Allow-Origin"]  = "*"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
         return response
 
 # ── NSE session — reused across all NSE fetches ───────────────────────────────
@@ -726,6 +733,55 @@ def api_quotes():
         })
 
 
+def _content_fields(payload: dict) -> dict:
+    fields = {}
+    for key in (
+        "enabled",
+        "featured",
+        "pinned",
+        "display_order",
+        "category",
+        "image_url",
+        "icon",
+        "tone",
+        "start_at",
+        "end_at",
+        "tags",
+    ):
+        if key in payload:
+            fields[key] = payload.get(key)
+    if "published" in payload and "enabled" not in fields:
+        fields["enabled"] = bool(payload.get("published"))
+    if "display_order" in fields:
+        try:
+            fields["display_order"] = int(fields["display_order"] or 0)
+        except (TypeError, ValueError):
+            fields["display_order"] = 0
+    if "tags" in fields and isinstance(fields["tags"], str):
+        fields["tags"] = [t.strip() for t in fields["tags"].split(",") if t.strip()]
+    return fields
+
+
+@app.route("/api/uploads", methods=["POST"])
+def api_upload_asset():
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    if "file" not in request.files:
+        return jsonify({"error": "file is required"}), 400
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "filename is required"}), 400
+    filename = secure_filename(file.filename) if secure_filename else os.path.basename(file.filename)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"}:
+        return jsonify({"error": "Unsupported asset type"}), 400
+    os.makedirs(APP_ASSET_DIR, exist_ok=True)
+    stored = f"{uuid.uuid4().hex}{ext}"
+    path = os.path.join(APP_ASSET_DIR, stored)
+    file.save(path)
+    return jsonify({"url": f"/uploads/{stored}"})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Consumer app: Signals tab (admin-curated stock picks)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,7 +810,8 @@ def api_signals_list():
     }
     """
     global _fyers
-    signals = load_signals(active_only=True)
+    include_hidden = request.args.get("all") == "1" and _is_admin()
+    signals = load_signals(active_only=not include_hidden)
 
     quotes: dict[str, dict] = {}
     symbols = [s["symbol"] for s in signals if s.get("symbol")]
@@ -778,17 +835,30 @@ def api_signals_list():
 
 @app.route("/api/signals", methods=["POST"])
 def api_signals_add():
-    """Website-only. Body: {"symbol": "RELIANCE", "rationale": "..."}"""
+    """Website-only. Creates or updates an admin-curated stock recommendation."""
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
 
     payload = request.get_json(silent=True) or {}
+    signal_id = payload.get("id")
     symbol    = str(payload.get("symbol", "")).strip()
     rationale = str(payload.get("rationale", "")).strip()
     if not symbol:
         return jsonify({"error": "symbol is required"}), 400
 
-    entry = add_signal(symbol=symbol, rationale=rationale, added_by=session.get("username"))
+    fields = _content_fields(payload)
+    if signal_id:
+        entry = update_signal(str(signal_id), symbol=symbol, rationale=rationale, **fields)
+        if entry is None:
+            return jsonify({"error": "Signal not found"}), 404
+        return jsonify({"signal": entry})
+
+    entry = add_signal(
+        symbol=symbol,
+        rationale=rationale,
+        added_by=session.get("username"),
+        **fields,
+    )
     return jsonify({"signal": entry}), 201
 
 
@@ -852,6 +922,41 @@ def api_sentiment_set():
     return jsonify(data)
 
 
+@app.route("/api/insights", methods=["GET"])
+def api_insights_list():
+    include_hidden = request.args.get("all") == "1" and _is_admin()
+    return jsonify({"insights": load_insights(visible_only=not include_hidden)})
+
+
+@app.route("/api/insights", methods=["POST"])
+def api_insights_save():
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    payload = request.get_json(silent=True) or {}
+    insight_id = payload.get("id")
+    title = str(payload.get("title") or "").strip()
+    body = str(payload.get("body") or "").strip()
+    if not title or not body:
+        return jsonify({"error": "title and body are required"}), 400
+    fields = {"title": title, "body": body, **_content_fields(payload)}
+    if insight_id:
+        entry = update_insight(str(insight_id), **fields)
+        if entry is None:
+            return jsonify({"error": "Insight not found"}), 404
+        return jsonify({"insight": entry})
+    return jsonify({"insight": add_insight(**fields)}), 201
+
+
+@app.route("/api/insights/<string:insight_id>", methods=["DELETE"])
+def api_insights_delete(insight_id: str):
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    removed = delete_insight(insight_id)
+    if not removed:
+        return jsonify({"error": "Insight not found"}), 404
+    return jsonify({"deleted": True, "id": insight_id})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Consumer app: Learn tab (educational articles)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -873,7 +978,8 @@ def api_learn_list():
         ]
     }
     """
-    return jsonify({"articles": load_articles(published_only=True)})
+    include_hidden = request.args.get("all") == "1" and _is_admin()
+    return jsonify({"articles": load_articles(published_only=not include_hidden)})
 
 
 @app.route("/api/learn/<string:article_id>", methods=["GET"])
@@ -910,7 +1016,14 @@ def api_learn_add():
     published  = payload.get("published")
 
     if article_id:
-        updated = update_article(str(article_id), title, body, category, published)
+        updated = update_article(
+            str(article_id),
+            title,
+            body,
+            category,
+            published,
+            **_content_fields(payload),
+        )
         if updated is None:
             return jsonify({"error": "Article not found"}), 404
         return jsonify({"article": updated})
@@ -925,8 +1038,19 @@ def api_learn_add():
         body=body,
         category=category,
         published=True if published is None else bool(published),
+        **_content_fields(payload),
     )
     return jsonify({"article": entry}), 201
+
+
+@app.route("/api/learn/<string:article_id>", methods=["DELETE"])
+def api_learn_delete(article_id: str):
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    removed = delete_article(article_id)
+    if not removed:
+        return jsonify({"error": "Article not found"}), 404
+    return jsonify({"deleted": True, "id": article_id})
 
 
 # ── React catch-all (serves index.html for all non-API routes) ───────────────

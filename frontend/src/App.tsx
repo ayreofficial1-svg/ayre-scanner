@@ -9,8 +9,7 @@ import SignalsPanel from './components/SignalsPanel'
 import SentimentPanel from './components/SentimentPanel'
 import LearnPanel from './components/LearnPanel'
 
-type View = 'scanner' | 'backtest' | 'app'
-type AppSection = 'signals' | 'insights' | 'learn'
+type View = 'scanner' | 'backtest' | 'signals' | 'sentiment' | 'learn'
 type AuthState = 'checking' | 'authenticated' | 'login'
 type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none'
 
@@ -321,7 +320,9 @@ export default function App() {
           <nav className="nav-tabs" aria-label="Primary">
             <button className={view === 'scanner'   ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
             <button className={view === 'backtest'  ? 'active' : ''} onClick={() => setView('backtest')}>Backtest</button>
-            <button className={view === 'app'       ? 'active' : ''} onClick={() => setView('app')}>App</button>
+            <button className={view === 'signals'   ? 'active' : ''} onClick={() => setView('signals')}>Signals</button>
+            <button className={view === 'sentiment' ? 'active' : ''} onClick={() => setView('sentiment')}>Sentiment</button>
+            <button className={view === 'learn'     ? 'active' : ''} onClick={() => setView('learn')}>Learn</button>
           </nav>
 
           {(view === 'scanner' || view === 'backtest') && (
@@ -332,7 +333,9 @@ export default function App() {
           )}
         </header>
 
-        {view === 'app' && <AppContentPanel />}
+        {view === 'signals' && <SignalsPanel />}
+        {view === 'sentiment' && <SentimentPanel />}
+        {view === 'learn' && <LearnPanel />}
 
         {view === 'backtest' && (
           <form className="debug-form" onSubmit={submitBacktest}>
@@ -396,54 +399,6 @@ export default function App() {
         )}
       </div>
     </Frame>
-  )
-}
-
-function AppContentPanel() {
-  const [section, setSection] = useState<AppSection>('signals')
-
-  return (
-    <>
-      <div className="section app-admin-header">
-        <div className="section-header">
-          <div>
-            <div className="section-title">App</div>
-            <div className="section-sub">Manage the consumer app content</div>
-          </div>
-        </div>
-        <div className="app-panel-tabs" role="tablist" aria-label="Consumer app content">
-          <AppSectionButton label="Signals" value="signals" active={section} onSelect={setSection} />
-          <AppSectionButton label="Insights" value="insights" active={section} onSelect={setSection} />
-          <AppSectionButton label="Learn" value="learn" active={section} onSelect={setSection} />
-        </div>
-      </div>
-
-      {section === 'signals' && <SignalsPanel />}
-      {section === 'insights' && <SentimentPanel />}
-      {section === 'learn' && <LearnPanel />}
-    </>
-  )
-}
-
-function AppSectionButton({
-  label,
-  value,
-  active,
-  onSelect,
-}: {
-  label: string
-  value: AppSection
-  active: AppSection
-  onSelect: (section: AppSection) => void
-}) {
-  return (
-    <button
-      type="button"
-      className={active === value ? 'active' : ''}
-      onClick={() => onSelect(value)}
-    >
-      {label}
-    </button>
   )
 }
 
