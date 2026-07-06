@@ -31,8 +31,10 @@ from fyers_apiv3 import fyersModel
 
 from config.settings import (
     QUALITY_STOCK_WHITELIST,
+    WEEKLY_C1A_LOOKBACK,
+    WEEKLY_RISING_FILTER,
 )
-from data.candles import fetch_candles_bulk_persistent
+from data.candles import fetch_candles_bulk_persistent, weekly_candles_from_daily
 from indicators.technical import compute_indicators
 from scanner.conditions import evaluate
 from scanner.watchlist import (
@@ -46,6 +48,33 @@ from scanner.watchlist import (
 from alerts.notify import fire_alert
 from utils.logger import log_signal
 
+
+# ── Weekly pre-filter helper ─────────────────────────────────────────────────
+def _check_weekly_sma_rising(
+    weekly_df: pd.DataFrame | None,
+    lookback: int = WEEKLY_C1A_LOOKBACK,
+) -> bool | None:
+    """
+    Check if weekly SMA44 is rising (point check: SMA44[today] > SMA44[lookback bars ago]).
+    Returns None when weekly data is unavailable or insufficient.
+    """
+    # SMA44 warmup requires 44 bars; then we need lookback + 1 bars for comparison
+    if weekly_df is None or len(weekly_df) < 44 + lookback + 1:
+        return None
+
+    try:
+        df_ind = compute_indicators(weekly_df.copy())
+        df_clean = df_ind.dropna(subset=["SMA44"]).copy()
+
+        if len(df_clean) < lookback + 1:
+            return None
+
+        sma_today = float(df_clean["SMA44"].iloc[-1])
+        sma_lookback_ago = float(df_clean["SMA44"].iloc[-1 - lookback])
+
+        return bool(sma_today > sma_lookback_ago)
+    except Exception:
+        return None
 
 def _cleanup_broken_structures(
     watchlist   : dict,
@@ -117,10 +146,17 @@ def run_scan(
 
     # ── Step 1: Fetch daily candles once ─────────────────────────────────────
     print(f"\n⚙️   Fetching daily data for {len(symbols)} stocks …")
+    if WEEKLY_RISING_FILTER:
+        print("⚙️   Weekly bars will be derived from daily data (0 extra API calls) …\n")
+
+    weekly_data: dict = {}
+    weekly_report: dict = {"valid": 0, "no_data": 0, "failed": 0, "attempted": 0}
 
     candle_data, fetch_report = fetch_candles_bulk_persistent(
         fyers, symbols, interval, verbose
     )
+    if WEEKLY_RISING_FILTER:
+        weekly_data, weekly_report = weekly_candles_from_daily(candle_data)
 
     # ── Apply quality stock whitelist filter ──────────────────────────────────
     quality_filtered = 0
@@ -130,6 +166,35 @@ def run_scan(
         quality_filtered = original_count - len(candle_data)
         if quality_filtered > 0:
             print(f"   🔍  Applied quality whitelist filter: skipped {quality_filtered} symbols\n")
+
+    # ── Step 1b: Apply weekly pre-filter results (data already fetched above) ─
+    weekly_status: dict[str, bool | None] = {}
+    weekly_filtered = 0
+    symbols_to_evaluate = list(candle_data.keys())
+    if WEEKLY_RISING_FILTER:
+        print(
+            f"   📊  Weekly data: {weekly_report['valid']} valid | "
+            f"{weekly_report['no_data']} skipped\n"
+        )
+
+        # Filter symbols: only keep those where weekly SMA44 is rising
+        filtered_count = 0
+        symbols_to_evaluate_filtered = []
+        for sym in symbols_to_evaluate:
+            weekly_df = weekly_data.get(sym)
+            weekly_rising = _check_weekly_sma_rising(weekly_df)
+            weekly_status[sym] = weekly_rising
+            if weekly_rising is not False:
+                symbols_to_evaluate_filtered.append(sym)
+            else:
+                filtered_count += 1
+
+        if filtered_count > 0:
+            print(f"   📉  Weekly rising filter: {filtered_count} symbols excluded (weekly SMA44 not rising)\n")
+
+        symbols_to_evaluate = symbols_to_evaluate_filtered
+        candle_data = {k: v for k, v in candle_data.items() if k in symbols_to_evaluate}
+        weekly_filtered = filtered_count
 
     # ── Completeness assertion ────────────────────────────────────────────────
     # Every symbol must land in exactly one of: valid, no_data, failed.
@@ -145,7 +210,7 @@ def run_scan(
     )
     fetch_report["daily_valid"] = fetch_report["valid"]
     fetch_report["quality_filtered"] = quality_filtered
-    fetch_report["weekly_filtered"] = 0
+    fetch_report["weekly_filtered"] = weekly_filtered
     fetch_report["evaluated"] = len(candle_data)
 
     if accounted != attempted:
@@ -177,7 +242,7 @@ def run_scan(
 
     for symbol, raw in candle_data.items():
         try:
-            result = evaluate(symbol, raw)
+            result = evaluate(symbol, raw, weekly_rising=weekly_status.get(symbol))
 
             if result["status"] == "signal":
                 d       = result["data"]

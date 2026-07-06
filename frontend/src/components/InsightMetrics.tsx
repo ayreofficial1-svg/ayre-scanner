@@ -54,6 +54,12 @@ export default function InsightMetrics({ signal: s }: Props) {
             tone={s.is_double_bottom ? 'positive' : 'neutral'}
             hint="Prior SMA44 support touch inside lookback"
           />
+          <Metric
+            label="Weekly SMA44"
+            value={s.weekly_rising == null ? 'Unavailable' : s.weekly_rising ? 'Rising' : 'Not Rising'}
+            tone={s.weekly_rising == null ? 'neutral' : s.weekly_rising ? 'positive' : 'negative'}
+            hint="Optional higher-timeframe filter"
+          />
         </div>
       </div>
 

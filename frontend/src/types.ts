@@ -18,6 +18,7 @@ export interface Signal {
   ma_type?: MaType
   is_double_bottom?: boolean
   price_interaction_type?: PriceInteractionType
+  weekly_rising?: boolean | null
   promoted?: boolean
   watchlist_since?: string
   is_new_alert?: boolean
@@ -131,6 +132,9 @@ export interface ScanState {
     prepared?: number
     dropped_short?: number
     quality_filtered?: number
+    weekly_valid?: number
+    weekly_no_data?: number
+    weekly_filtered?: number
     failed?: number
     no_data?: number
     recovered?: number
