@@ -7,13 +7,12 @@ from typing import Any
 
 import pandas as pd
 
-from config.settings import QUALITY_STOCK_WHITELIST, WEEKLY_RISING_FILTER
+from config.settings import QUALITY_STOCK_WHITELIST
 from data.candles import (
     _MIN_BARS,
     _NUM_WINDOWS,
     _WINDOW_DAYS,
     fetch_candles_bulk_at_date,
-    weekly_candles_from_daily,
 )
 from scanner.debug_evaluate import (
     evaluate_debug,
@@ -21,7 +20,6 @@ from scanner.debug_evaluate import (
     save_debug_json,
     summary_table_detailed,
 )
-from scanner.engine import _check_weekly_sma_rising
 
 _LOOKBACK_DAYS = _NUM_WINDOWS * _WINDOW_DAYS
 
@@ -111,33 +109,6 @@ def _apply_quality_filter(
         return candle_data, 0
     filtered = {k: v for k, v in candle_data.items() if k in QUALITY_STOCK_WHITELIST}
     return filtered, len(candle_data) - len(filtered)
-
-
-def _apply_weekly_filter(
-    candle_data: dict[str, pd.DataFrame],
-) -> tuple[dict[str, pd.DataFrame], dict[str, bool | None], dict[str, Any]]:
-    weekly_status: dict[str, bool | None] = {}
-    if not WEEKLY_RISING_FILTER or not candle_data:
-        return candle_data, weekly_status, {
-            "attempted": 0,
-            "valid": 0,
-            "no_data": 0,
-            "failed": 0,
-            "source": "disabled",
-            "api_calls": 0,
-            "filtered": 0,
-        }
-
-    weekly_data, weekly_report = weekly_candles_from_daily(candle_data)
-    filtered: dict[str, pd.DataFrame] = {}
-    for symbol, df in candle_data.items():
-        weekly_rising = _check_weekly_sma_rising(weekly_data.get(symbol))
-        weekly_status[symbol] = weekly_rising
-        if weekly_rising is not False:
-            filtered[symbol] = df
-
-    weekly_report["filtered"] = len(candle_data) - len(filtered)
-    return filtered, weekly_status, weekly_report
 
 
 def _evaluate_all(
@@ -273,7 +244,6 @@ def run_historical_scan(
             "No symbols remain after quality whitelist filtering.",
         )
 
-    weekly_status: dict[str, bool | None] = {}
     weekly_report: dict[str, Any] = {
         "attempted": 0,
         "valid": 0,
@@ -283,26 +253,6 @@ def run_historical_scan(
         "source": "disabled",
         "api_calls": 0,
     }
-    if WEEKLY_RISING_FILTER:
-        print("\n📥  Deriving weekly candle data from daily bars …")
-        prepared, weekly_status, weekly_report = _apply_weekly_filter(prepared)
-        print(
-            f"    Weekly data: {weekly_report['valid']} valid | "
-            f"{weekly_report['no_data']} unavailable | 0 extra API calls"
-        )
-        if weekly_report.get("filtered", 0):
-            print(f"    Weekly rising filter: excluded {weekly_report['filtered']} symbol(s)")
-        if not prepared:
-            fetch_report["dropped_short"] = dropped_short
-            fetch_report["quality_filtered"] = quality_filtered
-            fetch_report["weekly_valid"] = weekly_report.get("valid", 0)
-            fetch_report["weekly_filtered"] = weekly_report.get("filtered", 0)
-            return _empty_result(
-                target_date,
-                fetch_report,
-                started,
-                "No symbols remain after weekly rising filter.",
-            )
 
     resolved_date = anchor
     window_start = resolved_date - datetime.timedelta(days=_LOOKBACK_DAYS - 1) if resolved_date else None
@@ -323,7 +273,7 @@ def run_historical_scan(
         status_counts,
         stage_counts,
         evaluation_errors,
-    ) = _evaluate_all(prepared, weekly_status)
+    ) = _evaluate_all(prepared, {})
 
     if quiet_mode:
         print("\n" + "=" * 70)

@@ -614,7 +614,6 @@ function BacktestResultRow({ result }: { result: BacktestDebugResult }) {
         <Metric label="MACD"      value={macd}   />
         <Metric label="Signal"    value={signal} />
         <Metric label="Histogram" value={hist}   />
-        <Metric label="Weekly ↑"  value={formatBool(values.weekly_rising)} />
       </div>
     </article>
   )
