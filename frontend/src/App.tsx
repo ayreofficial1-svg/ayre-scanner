@@ -208,11 +208,15 @@ export default function App() {
   useEffect(() => {
     setTradeReadyTimes(prev => {
       const next: TradeReadyTimes = {}
-      const scanTimestamp = normalizeTimestamp(state.scan_time)
 
+      // Only ever use an explicit, backend-supplied Trade Ready timestamp
+      // (or a previously-seen explicit value cached across polls). Never
+      // fall back to the current scan time — that's the time the scanner
+      // happened to run, not the time the stock actually became Trade
+      // Ready, and showing it would be misleading.
       for (const signal of state.signals) {
         const explicitTimestamp = normalizeTimestamp(explicitReadyTimestamp(signal))
-        next[signal.symbol] = explicitTimestamp ?? prev[signal.symbol] ?? scanTimestamp ?? ''
+        next[signal.symbol] = explicitTimestamp ?? prev[signal.symbol] ?? ''
       }
 
       saveTradeReadyTimes(next)

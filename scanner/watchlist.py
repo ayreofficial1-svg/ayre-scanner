@@ -24,17 +24,23 @@ Alert log schema (JSON)
 ────────────────────────
   {
     "RELIANCE": {
-      "date"     : "2026-04-04",       # IST date first alerted (Trade Ready)
-      "time"     : "10:32:15",         # IST time first alerted (Trade Ready)
-      "close_price": 1240.00
+      "date"          : "2026-04-04",   # IST date first alerted (bookkeeping,
+      "time"          : "10:32:15",     # used only for same-day TTL cleanup —
+                                         # this is when the SCAN detected it,
+                                         # not necessarily when it became true.
+      "close_price"   : 1240.00,
+      "trade_ready_at": "2026-04-04T10:24:00+05:30"   # optional; see below
     }
   }
 
-  The "date"/"time" pair here is the source of truth for a signal's
-  Trade Ready timestamp: it is written once, the first time a symbol
-  is newly alerted on a given trading day, and left untouched by later
-  scans that same day even if the symbol keeps qualifying as a signal.
-  See scanner/engine.py, which reads it back as `trade_ready_at`.
+  "trade_ready_at" is the actual Trade Ready timestamp shown to the user:
+  the real minute, reconstructed from intraday market data, at which the
+  stock first satisfied all conditions — independent of when the scanner
+  happened to detect it. It is written once, the first time a symbol is
+  newly alerted on a given trading day (see
+  scanner/engine.py::_reconstruct_trade_ready_time), and left untouched by
+  later scans that same day. It is OMITTED (not faked) when intraday data
+  isn't available to determine it.
 """
 
 import os
@@ -148,10 +154,18 @@ def is_already_alerted(symbol: str, log: dict) -> bool:
     return symbol in log
 
 
-def mark_alerted(symbol: str, log: dict, close_price: float) -> None:
+def mark_alerted(
+    symbol         : str,
+    log            : dict,
+    close_price    : float,
+    trade_ready_at : str | None = None,
+) -> None:
     now_ist = datetime.datetime.now(_IST)
-    log[symbol] = {
+    entry = {
         "date"       : str(now_ist.date()),
         "time"       : now_ist.strftime("%H:%M:%S"),
         "close_price": close_price,
     }
+    if trade_ready_at:
+        entry["trade_ready_at"] = trade_ready_at
+    log[symbol] = entry

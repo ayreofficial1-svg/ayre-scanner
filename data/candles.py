@@ -212,6 +212,77 @@ def _fetch_windows(
     return combined if len(combined) >= _MIN_BARS else None
 
 
+def fetch_intraday_candles(
+    fyers: fyersModel.FyersModel,
+    symbol: str,
+    target_date: datetime.date,
+    resolution: str = "1",
+) -> pd.DataFrame | None:
+    """
+    Fetch intraday candles for one symbol on a single calendar day.
+
+    Used only to reconstruct the exact IST time a stock became Trade Ready
+    (see scanner/engine.py::_reconstruct_trade_ready_time) — NOT used by the
+    main daily scan, which stays entirely on "D" resolution as before.
+
+    resolution="1" (1-minute bars) so the reconstructed timestamp can be
+    accurate to the minute, per the requirement.
+
+    Returns a DataFrame indexed by naive IST wall-clock timestamps (matching
+    the app's fixed +5:30 offset convention — no pytz/zoneinfo dependency),
+    or None if no intraday data is available (e.g. request made before the
+    exchange has produced any bars, or a transient/invalid-symbol failure).
+    """
+    for attempt in range(_RATE_LIMIT_RETRIES + 1):
+        try:
+            resp = fyers.history(
+                data={
+                    "symbol": symbol,
+                    "resolution": resolution,
+                    "date_format": "1",
+                    "range_from": target_date.strftime("%Y-%m-%d"),
+                    "range_to": target_date.strftime("%Y-%m-%d"),
+                    "cont_flag": "1",
+                }
+            )
+        except Exception:
+            resp = None
+
+        time.sleep(_SLEEP)
+
+        if resp and resp.get("s") == "ok":
+            candles = resp.get("candles", [])
+            if not candles:
+                return None
+
+            df = pd.DataFrame(
+                candles,
+                columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
+            )
+            # Fyers intraday timestamps are Unix epoch seconds (UTC).
+            # Convert to naive IST wall-clock time via the fixed +5:30
+            # offset, same convention used throughout the rest of the app.
+            df["Timestamp"] = (
+                pd.to_datetime(df["Timestamp"], unit="s", utc=True)
+                + pd.Timedelta(hours=5, minutes=30)
+            ).dt.tz_localize(None)
+            df.set_index("Timestamp", inplace=True)
+            df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
+            df.sort_index(inplace=True)
+            return df
+
+        code = _response_code(resp)
+        if code == _INVALID_SYMBOL_CODE:
+            return None
+        if code == _RATE_LIMIT_CODE and attempt < _RATE_LIMIT_RETRIES:
+            time.sleep(_RATE_LIMIT_PAUSE * (attempt + 1))
+            continue
+
+        return None
+
+    return None
+
+
 def _fetch_one(fyers: fyersModel.FyersModel, symbol: str) -> pd.DataFrame | None:
     """
     Fetch daily candles for one symbol ending today (live mode).
