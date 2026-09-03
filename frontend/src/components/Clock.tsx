@@ -6,10 +6,15 @@ export default function Clock() {
   useEffect(() => {
     const tick = () => {
       const n = new Date()
+      // Always show IST (Asia/Kolkata), regardless of the viewer's own
+      // device/browser timezone.
       setTime(
-        [n.getHours(), n.getMinutes(), n.getSeconds()]
-          .map(x => String(x).padStart(2, '0'))
-          .join(':')
+        n.toLocaleTimeString('en-GB', {
+          timeZone: 'Asia/Kolkata',
+          hour:   '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        })
       )
     }
     tick()

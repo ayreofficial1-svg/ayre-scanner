@@ -15,7 +15,11 @@ Return value
 ────────────
   (signals, watchlist_items, fetch_report)
 
-  signals        — stocks where all conditions are met (C1–C3)
+  signals        — stocks where all conditions are met (C1–C3). Each dict
+                   includes "trade_ready_at" (ISO 8601, IST offset): the
+                   date/time this symbol first became Trade Ready today,
+                   sourced from the persistent alert log — not the time
+                   of the current scan.
   watchlist_items— stocks where C1+C2 pass and crossover is pending
   fetch_report   — completeness report from fetch_candles_bulk:
                    {attempted, valid, no_data, failed, recovered, missing}
@@ -253,8 +257,6 @@ def run_scan(
                 d["watchlist_since"] = watchlist.get(display, {}).get("added", "")
                 d["is_new_alert"]    = not is_already_alerted(display, alert_log)
 
-                signals.append(d)
-
                 if is_promoted:
                     promoted.append(display)
                     remove_from_watchlist(watchlist, display)
@@ -273,6 +275,18 @@ def run_scan(
                     mark_alerted(display, alert_log, d["close"])
                     save_alert_log(alert_log)
                     log_signal(d)
+
+                # Trade Ready timestamp — the date/time this symbol FIRST
+                # satisfied all conditions today, not the current scan time.
+                # alert_log entries persist across same-day scans and are
+                # only written once (above, on the first alert of the day),
+                # so this stays fixed even while the symbol keeps qualifying
+                # on later scans that same day.
+                alert_entry = alert_log.get(display, {})
+                if alert_entry.get("date") and alert_entry.get("time"):
+                    d["trade_ready_at"] = f"{alert_entry['date']}T{alert_entry['time']}+05:30"
+
+                signals.append(d)
 
             elif result["status"] == "watchlist":
                 d = result["data"]

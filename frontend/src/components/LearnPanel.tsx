@@ -240,7 +240,7 @@ export default function LearnPanel() {
                 <button className="theme-btn" onClick={() => edit(a)}>Edit</button>
                 <button className="theme-btn" onClick={() => remove(a.id)}>Hide</button>
               </div>
-              <div className="card-date">Updated {new Date(a.updated_at).toLocaleString('en-IN')}</div>
+              <div className="card-date">Updated {new Date(a.updated_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</div>
             </div>
           ))}
         </div>

@@ -24,17 +24,29 @@ Alert log schema (JSON)
 ────────────────────────
   {
     "RELIANCE": {
-      "date"     : "2026-04-04",
-      "time"     : "10:32:15",
+      "date"     : "2026-04-04",       # IST date first alerted (Trade Ready)
+      "time"     : "10:32:15",         # IST time first alerted (Trade Ready)
       "close_price": 1240.00
     }
   }
+
+  The "date"/"time" pair here is the source of truth for a signal's
+  Trade Ready timestamp: it is written once, the first time a symbol
+  is newly alerted on a given trading day, and left untouched by later
+  scans that same day even if the symbol keeps qualifying as a signal.
+  See scanner/engine.py, which reads it back as `trade_ready_at`.
 """
 
 import os
 import json
 import datetime
 from config.settings import WATCHLIST_FILE, ALERT_LOG_FILE, WATCHLIST_TTL_DAYS
+
+# Fixed UTC+5:30 offset — no pytz/zoneinfo dependency.
+# Mirrors main.py's _IST: ensures watchlist/alert-log dates and the
+# Trade Ready timestamp are always IST wall-clock, regardless of the
+# host timezone (e.g. Railway, which runs UTC).
+_IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 
 # ── Watchlist I/O ─────────────────────────────────────────────────────────────
@@ -61,7 +73,7 @@ def clean_watchlist(watchlist: dict) -> dict:
     Remove entries older than WATCHLIST_TTL_DAYS.
     Uses the 'added' date for TTL calculation.
     """
-    today  = datetime.date.today()
+    today  = datetime.datetime.now(_IST).date()
     cutoff = today - datetime.timedelta(days=WATCHLIST_TTL_DAYS)
     cleaned = {}
     for sym, data in watchlist.items():
@@ -90,7 +102,7 @@ def add_to_watchlist(
         return   # already tracked; do not reset TTL
 
     watchlist[symbol] = {
-        "added": str(datetime.date.today()),
+        "added": str(datetime.datetime.now(_IST).date()),
         "close": round(close, 2),
         "sma44": round(sma44, 2),
     }
@@ -128,7 +140,7 @@ def save_alert_log(log: dict) -> None:
 
 def clean_alert_log(log: dict) -> dict:
     """Remove entries from previous trading days."""
-    today = str(datetime.date.today())
+    today = str(datetime.datetime.now(_IST).date())
     return {k: v for k, v in log.items() if v.get("date") == today}
 
 
@@ -137,8 +149,9 @@ def is_already_alerted(symbol: str, log: dict) -> bool:
 
 
 def mark_alerted(symbol: str, log: dict, close_price: float) -> None:
+    now_ist = datetime.datetime.now(_IST)
     log[symbol] = {
-        "date"       : str(datetime.date.today()),
-        "time"       : datetime.datetime.now().strftime("%H:%M:%S"),
+        "date"       : str(now_ist.date()),
+        "time"       : now_ist.strftime("%H:%M:%S"),
         "close_price": close_price,
     }

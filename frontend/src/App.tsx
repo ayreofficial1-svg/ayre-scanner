@@ -133,12 +133,16 @@ function formatTradeReadyTimestamp(value: string | null | undefined): string | n
   const parsed = parseTimestamp(value)
   if (!parsed) return null
 
+  // Always render in IST (Asia/Kolkata), regardless of the viewer's own
+  // device/browser timezone.
   const date = parsed.toLocaleDateString('en-IN', {
+    timeZone: 'Asia/Kolkata',
     day: '2-digit',
     month: 'short',
     year: 'numeric',
   })
   const time = parsed.toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata',
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,

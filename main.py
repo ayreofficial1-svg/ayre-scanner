@@ -1105,7 +1105,7 @@ def _do_scan():
 
         _state["signals"]         = signals
         _state["watchlist_items"] = watchlist_items
-        _state["scan_time"]       = datetime.datetime.now().strftime("%d %b %Y %H:%M:%S")
+        _state["scan_time"]       = datetime.datetime.now(_IST).strftime("%d %b %Y %H:%M:%S")
         # Use authoritative counts from the fetch completeness report.
         # total_scanned = symbols that reached conditions.py after optional filters.
         # total_attempted = ground truth len(symbols) — never varies.

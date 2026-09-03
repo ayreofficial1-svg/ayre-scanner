@@ -143,7 +143,7 @@ export default function SentimentPanel() {
           </div>
           {data?.updated_at && (
             <div className="card-date" style={{ marginBottom: '1.5rem' }}>
-              Last updated {new Date(data.updated_at).toLocaleString('en-IN')}
+              Last updated {new Date(data.updated_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}
             </div>
           )}
 
