@@ -185,6 +185,13 @@ h1 {
   gap: 1px; background: var(--border);
 }
 
+.trade-ready-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--border);
+}
+
 .card {
   background: var(--bg-base); padding: 1.5rem;
   transition: background 0.35s var(--ease); animation: fadeIn 0.5s var(--ease);
@@ -194,8 +201,9 @@ h1 {
 .card.promoted:hover { background: rgba(74,222,128,0.10); }
 
 .stock-card {
-  min-height: 104px;
-  display: flex; align-items: center;
+  min-height: 64px;
+  display: flex; align-items: center; justify-content: flex-start;
+  gap: 2rem;
 }
 
 .stock-card-link,
@@ -206,11 +214,19 @@ h1 {
 }
 
 .stock-card-link {
-  display: block;
-  width: 100%;
+  display: inline-flex;
+  flex: 0 0 clamp(140px, 24vw, 220px);
   font-size: 1.25rem;
   font-weight: 500;
   letter-spacing: 0;
+}
+
+.stock-card-time {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  letter-spacing: 0;
+  white-space: nowrap;
 }
 
 .stock-card-link:hover,
@@ -801,6 +817,9 @@ tbody tr:hover td {
   .field, .field input, .debug-form .rescan-btn { width: 100%; min-width: 0; }
   .stat-num { font-size: 1.8rem; }
   .cards-grid { grid-template-columns: 1fr; }
+  .stock-card { align-items: flex-start; flex-direction: column; gap: 0.45rem; }
+  .stock-card-link { flex-basis: auto; font-size: 1.08rem; }
+  .stock-card-time { white-space: normal; font-size: 0.75rem; }
   .watchlist-list { grid-template-columns: 1fr; }
   .backtest-result-main { grid-template-columns: 1fr; align-items: flex-start; }
   .result-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -913,6 +932,9 @@ tbody tr:hover td {
 .cards-grid .card {
   animation: cardReveal var(--dur-med) var(--ease-out) both;
   animation-delay: calc(var(--i, 0) * 55ms);
+}
+.trade-ready-list .card {
+  animation: rowReveal var(--dur-std) var(--ease-out) both;
 }
 tbody tr {
   animation: rowReveal var(--dur-std) var(--ease-out) both;

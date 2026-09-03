@@ -12,6 +12,23 @@ import LearnPanel from './components/LearnPanel'
 type View = 'scanner' | 'backtest' | 'signals' | 'sentiment' | 'learn'
 type AuthState = 'checking' | 'authenticated' | 'login'
 type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none'
+type TradeReadyTimes = Record<string, string>
+
+const TRADE_READY_TIMES_KEY = 'ayre.tradeReadyTimes.v1'
+const MONTHS: Record<string, number> = {
+  jan: 0,
+  feb: 1,
+  mar: 2,
+  apr: 3,
+  may: 4,
+  jun: 5,
+  jul: 6,
+  aug: 7,
+  sep: 8,
+  oct: 9,
+  nov: 10,
+  dec: 11,
+}
 
 const DEFAULT_STATE: ScanState = {
   scanning:        false,
@@ -52,11 +69,90 @@ async function readJsonResponse(res: Response) {
 
 const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
 
+function loadTradeReadyTimes(): TradeReadyTimes {
+  try {
+    const raw = localStorage.getItem(TRADE_READY_TIMES_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed as TradeReadyTimes : {}
+  } catch {
+    return {}
+  }
+}
+
+function saveTradeReadyTimes(times: TradeReadyTimes) {
+  localStorage.setItem(TRADE_READY_TIMES_KEY, JSON.stringify(times))
+}
+
+function explicitReadyTimestamp(signal: {
+  trade_ready_at?: string
+  ready_at?: string
+  became_trade_ready_at?: string
+  logged_at?: string
+  alert_time?: string
+}): string | null {
+  return signal.trade_ready_at
+      ?? signal.ready_at
+      ?? signal.became_trade_ready_at
+      ?? signal.logged_at
+      ?? signal.alert_time
+      ?? null
+}
+
+function parseTimestamp(value: string | null | undefined): Date | null {
+  if (!value) return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.includes('Running') || trimmed.includes('queued')) return null
+
+  const scanMatch = trimmed.match(/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/)
+  if (scanMatch) {
+    const [, day, month, year, hour, minute, second] = scanMatch
+    const monthIndex = MONTHS[month.toLowerCase()]
+    if (monthIndex !== undefined) {
+      return new Date(
+        Number(year),
+        monthIndex,
+        Number(day),
+        Number(hour),
+        Number(minute),
+        Number(second ?? 0),
+      )
+    }
+  }
+
+  const parsed = new Date(trimmed)
+  return Number.isNaN(parsed.getTime()) ? null : parsed
+}
+
+function normalizeTimestamp(value: string | null | undefined): string | null {
+  const parsed = parseTimestamp(value)
+  return parsed ? parsed.toISOString() : null
+}
+
+function formatTradeReadyTimestamp(value: string | null | undefined): string | null {
+  const parsed = parseTimestamp(value)
+  if (!parsed) return null
+
+  const date = parsed.toLocaleDateString('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+  })
+  const time = parsed.toLocaleTimeString('en-IN', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).toUpperCase()
+
+  return `${date} — ${time}`
+}
+
 export default function App() {
   const [theme, setTheme]           = useState<string>(() => localStorage.getItem('theme') ?? 'dark')
   const [auth, setAuth]             = useState<AuthState>('checking')
   const [view, setView]             = useState<View>('scanner')
   const [state, setState]           = useState<ScanState>(DEFAULT_STATE)
+  const [tradeReadyTimes, setTradeReadyTimes] = useState<TradeReadyTimes>(loadTradeReadyTimes)
   const [backtestDate, setBacktestDate] = useState(todayIso)
   const [loginError, setLoginError] = useState<string | null>(null)
   const [authConfigured, setAuthConfigured] = useState(true)
@@ -104,6 +200,21 @@ export default function App() {
     const id = setInterval(poll, 10_000)
     return () => clearInterval(id)
   }, [poll])
+
+  useEffect(() => {
+    setTradeReadyTimes(prev => {
+      const next: TradeReadyTimes = {}
+      const scanTimestamp = normalizeTimestamp(state.scan_time)
+
+      for (const signal of state.signals) {
+        const explicitTimestamp = normalizeTimestamp(explicitReadyTimestamp(signal))
+        next[signal.symbol] = explicitTimestamp ?? prev[signal.symbol] ?? scanTimestamp ?? ''
+      }
+
+      saveTradeReadyTimes(next)
+      return next
+    })
+  }, [state.scan_time, state.signals])
 
   const triggerRescan = async () => {
     const res = await fetch('/api/rescan', { method: 'POST' })
@@ -392,6 +503,7 @@ export default function App() {
             <Results
               state={activeState}
               view={view}
+              tradeReadyTimes={tradeReadyTimes}
               backtestFilter={backtestFilter}
               onBacktestFilter={setBacktestFilter}
             />
@@ -417,11 +529,13 @@ export default function App() {
 function Results({
   state,
   view,
+  tradeReadyTimes,
   backtestFilter,
   onBacktestFilter,
 }: {
   state: ScanState
   view: View
+  tradeReadyTimes: TradeReadyTimes
   backtestFilter: BacktestFilter
   onBacktestFilter: (filter: BacktestFilter) => void
 }) {
@@ -453,8 +567,14 @@ function Results({
         {scanning ? (
           <ScanRing />
         ) : signals.length > 0 ? (
-          <div className="cards-grid">
-            {signals.map(s => <SignalCard key={s.symbol} signal={s} />)}
+          <div className="trade-ready-list">
+            {signals.map(s => (
+              <SignalCard
+                key={s.symbol}
+                signal={s}
+                readyAt={formatTradeReadyTimestamp(tradeReadyTimes[s.symbol])}
+              />
+            ))}
           </div>
         ) : (
           <div className="empty-state">

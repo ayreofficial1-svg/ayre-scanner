@@ -22,6 +22,11 @@ export interface Signal {
   promoted?: boolean
   watchlist_since?: string
   is_new_alert?: boolean
+  trade_ready_at?: string
+  ready_at?: string
+  became_trade_ready_at?: string
+  logged_at?: string
+  alert_time?: string
 
   pct_slope?: number
   atr_slope?: number
