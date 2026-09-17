@@ -40,3 +40,4 @@ fyersRequests.log
 fyersApi.log
 flutter_app/    
 ayre_scanner/
+frontend/node_modules
