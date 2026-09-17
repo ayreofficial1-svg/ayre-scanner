@@ -59,9 +59,13 @@ def _json_safe(value):
             pass
     return str(value)
 
-from auth.fyers_auth import reconnect_fyers
-from config.settings import ACTIVE_CHECK_HOURS, ACTIVE_CHECK_MINUTE, PASSIVE_CHECK_INTERVAL
-from data.symbols import fetch_nifty500, plain_constituents_for_market
+from auth.fyers_auth import reconnect_fyers, get_cached_token
+from config.settings import (
+    ACTIVE_CHECK_HOURS, ACTIVE_CHECK_MINUTE, PASSIVE_CHECK_INTERVAL,
+    FYERS_APP_ID_FULL,
+)
+from data.symbols import fetch_nifty500, plain_constituents_for_market, SENSEX30
+from data.fyers_stream import stream as _fyers_stream
 from scanner.watchlist import (
     load_watchlist, clean_watchlist, save_watchlist,
     load_alert_log, clean_alert_log, save_alert_log,
@@ -174,11 +178,18 @@ _CONSTITUENTS_TTL   = 60   # seconds
 #   nextIndex = (currentIndex + 1) % markets.length
 #
 # nse_index_param: exact string for NSE equity-stockIndices ?index=
-#   "NIFTY 50"      → 50 large-cap NSE stocks
-#   "NIFTY NEXT 50" → Best NSE-native proxy for Sensex 50 (BSE constituent
-#                     API requires BSE auth; this gives the equivalent 50
-#                     large-cap stocks via the same free NSE endpoint)
-#   "NIFTY BANK"    → All Bank Nifty constituents (12 banking stocks)
+#   "NIFTY 50"   → 50 large-cap NSE stocks
+#   "NIFTY BANK" → All Bank Nifty constituents (12 banking stocks)
+#   None         → no NSE endpoint is used for this market (see sensex below)
+#
+# §4.1 fix: Sensex previously set nse_index_param to "NIFTY NEXT 50" as a
+# "proxy" — that was a bug, not a real proxy: it silently served Nifty Next
+# 50 stocks under the Sensex tab. BSE has no free constituents endpoint, so
+# Sensex's 30 stocks are now a maintained hardcoded list
+# (data/symbols.py::SENSEX30) instead of borrowed from an unrelated NSE
+# index. nse_index_param is None here on purpose — the constituents builder
+# skips NSE entirely for this market and goes straight to SENSEX30 + live
+# Fyers prices.
 MARKETS = [
     {
         "market_key"        : "nifty",
@@ -193,7 +204,7 @@ MARKETS = [
         "market_key"        : "sensex",
         "display_name"      : "Sensex",
         "nse_allindices_key": "SENSEX",
-        "nse_index_param"   : "NIFTY NEXT 50",
+        "nse_index_param"   : None,
         "fyers_symbol"      : "BSE:SENSEX-INDEX",
         "yahoo_symbol"      : "^BSESN",
         "fyers_key"         : "SENSEX",
@@ -635,9 +646,13 @@ def api_market():
             { "key": "sensex",     "name": "Sensex",     ... },
             { "key": "bank_nifty", "name": "Bank Nifty", ... }
         ],
-        "source"    : "nse" | "fyers" | "yahoo" | "fallback",
+        "source"    : "fyers_ws" | "fyers" | "nse" | "yahoo" | "fallback",
         "updated_at": "<ISO timestamp>"
     }
+
+    "fyers_ws" means this came straight from the live WebSocket feed (the
+    common case during market hours) — "fyers"/"nse"/"yahoo" mean the
+    WebSocket hadn't ticked yet and a one-off REST call filled in instead.
 
     Flutter integration notes
     ──────────────────────────
@@ -648,6 +663,101 @@ def api_market():
     - On tap, pass markets[i].key to GET /api/market/<key>/constituents.
     """
     return jsonify(_get_market_snapshot())
+
+
+# ── Movers — gainers / losers / most-active, straight from Fyers ─────────────
+_MOVERS_CACHE_TTL = 15  # seconds; only matters for the REST-fallback path
+_movers_lock  = threading.Lock()
+_movers_cache = {"data": None, "expires_at": 0.0}
+
+
+def _get_movers_payload() -> dict:
+    """
+    {"gainers": [...], "losers": [...], "most_active": [...], "source": ...}
+
+    Primary source is the live Fyers WebSocket (_fyers_stream.movers()) —
+    ranked across the full deduplicated Nifty 50 + Sensex 30 + Bank Nifty
+    universe, computed from ticks already in memory, no extra API calls.
+
+    Falls back to deriving the same ranking from the (REST/NSE-backed,
+    60s-cached) constituents endpoints when the socket hasn't produced
+    enough ticks yet — e.g. just after startup — cached for 15s so rapid
+    polling never re-derives on every request.
+    """
+    now = time.time()
+    if _fyers_market_data_allowed():
+        try:
+            live = _fyers_stream.movers()
+        except Exception:
+            live = None
+        if live:
+            return {**live, "source": "fyers_ws", "updated_at": datetime.datetime.now().isoformat()}
+
+    with _movers_lock:
+        cached = _movers_cache["data"]
+        if cached is not None and _movers_cache["expires_at"] > now:
+            return cached
+
+    rows: list[dict] = []
+    for market_cfg in MARKETS:
+        payload = _get_constituents(market_cfg)
+        for s in payload.get("stocks", []):
+            if s.get("last_price") is None or s.get("change_pct") is None:
+                continue
+            rows.append(s)
+
+    # De-duplicate by symbol (a stock can appear in more than one index).
+    by_symbol = {s["symbol"]: s for s in rows if s.get("symbol")}
+    rows = list(by_symbol.values())
+
+    gainers = sorted(rows, key=lambda r: r["change_pct"], reverse=True)[:10]
+    losers  = sorted(rows, key=lambda r: r["change_pct"])[:10]
+    active  = sorted(rows, key=lambda r: r.get("volume") or 0, reverse=True)[:10]
+
+    data = {
+        "gainers"    : gainers,
+        "losers"     : losers,
+        "most_active": active,
+        "source"     : "derived",
+        "updated_at" : datetime.datetime.now().isoformat(),
+    }
+    with _movers_lock:
+        _movers_cache["data"]       = data
+        _movers_cache["expires_at"] = now + _MOVERS_CACHE_TTL
+    return data
+
+
+@app.route("/api/market/gainers")
+def api_market_gainers():
+    """Top 10 gainers across Nifty 50 + Sensex 30 + Bank Nifty, deduplicated."""
+    payload = _get_movers_payload()
+    return jsonify({
+        "stocks"     : payload["gainers"],
+        "source"     : payload["source"],
+        "updated_at" : payload["updated_at"],
+    })
+
+
+@app.route("/api/market/losers")
+def api_market_losers():
+    """Top 10 losers across Nifty 50 + Sensex 30 + Bank Nifty, deduplicated."""
+    payload = _get_movers_payload()
+    return jsonify({
+        "stocks"     : payload["losers"],
+        "source"     : payload["source"],
+        "updated_at" : payload["updated_at"],
+    })
+
+
+@app.route("/api/market/most-active")
+def api_market_most_active():
+    """Top 10 stocks by traded volume across Nifty 50 + Sensex 30 + Bank Nifty, deduplicated."""
+    payload = _get_movers_payload()
+    return jsonify({
+        "stocks"     : payload["most_active"],
+        "source"     : payload["source"],
+        "updated_at" : payload["updated_at"],
+    })
 
 
 @app.route("/api/market/<string:market_key>/constituents")
@@ -885,17 +995,35 @@ def api_signals_delete(signal_id: str):
 @app.route("/api/sentiment", methods=["GET"])
 def api_sentiment():
     """
-    Placeholder sentiment value on a 0-100 scale.
+    Sentiment gauge value (0-100, still hand-set — see data/app_sentiment.py)
+    plus, when the live Fyers feed has ticked enough stocks, real
+    advances/declines/unchanged counted across the full tracked universe
+    (Nifty 50 + Sensex 30 + Bank Nifty, deduplicated).
 
     Response shape
     ──────────────
-    { "sentiment": 65, "updated_at": "<ISO timestamp>" | null, "note": "..." | null }
+    {
+        "sentiment" : 65,
+        "updated_at": "<ISO timestamp>" | null,
+        "note"      : "..." | null,
+        "advances"  : 312 | absent,
+        "declines"  : 178 | absent,
+        "unchanged" : 10  | absent
+    }
 
-    The app only renders this number on a gauge — no classification logic
-    lives on the client. The real formula (advance/decline, VIX, etc.) can
-    replace load_sentiment()'s source later without an app update.
+    advances/declines/unchanged are omitted entirely (not null) until the
+    live WebSocket has enough data — the Flutter app already falls back to
+    its own locally-computed breadth in that case, so omitting rather than
+    sending nulls/zeros avoids it briefly showing "0 advances".
     """
-    return jsonify(load_sentiment())
+    data = load_sentiment()
+    try:
+        live_breadth = _fyers_stream.breadth()
+    except Exception:
+        live_breadth = None
+    if live_breadth:
+        data = {**data, **live_breadth}
+    return jsonify(data)
 
 
 @app.route("/api/sentiment", methods=["POST"])
@@ -1395,6 +1523,58 @@ def _fyers_market_data_allowed() -> bool:
     return _free_sources_confirm_market_open(force=False)
 
 
+# ── Live market WebSocket (real-time index board, constituents, breadth) ──────
+def _build_stream_universe() -> dict[str, list[str]]:
+    """
+    Bare NSE symbols to track live, per market: Nifty 50 and Bank Nifty
+    come from the same NSE-sourced lists the scanner already uses (with
+    their existing hardcoded fallbacks); Sensex comes from the maintained
+    SENSEX30 list (§4.1) since there is no NSE endpoint for it.
+    """
+    session = _get_nse_session()
+    try:
+        nifty_syms = plain_constituents_for_market("nifty", session=session)
+    except Exception:
+        nifty_syms = []
+    try:
+        bank_syms = plain_constituents_for_market("bank_nifty", session=session)
+    except Exception:
+        bank_syms = []
+    return {
+        "nifty"     : nifty_syms or [],
+        "sensex"    : list(SENSEX30),
+        "bank_nifty": bank_syms or [],
+    }
+
+
+def _start_market_stream() -> None:
+    """
+    (Re)configure and (re)start the single Fyers Data WebSocket connection
+    for the day. Called once per trading day right after the daily Fyers
+    re-auth, so the socket always uses a freshly validated token.
+    Never raises — a failure here just means index_board()/constituents()/
+    breadth()/movers() keep returning None and main.py's existing
+    NSE/REST-Fyers/Yahoo waterfall keeps serving requests as before.
+    """
+    token = get_cached_token()
+    if not token or _fyers is None:
+        print("   ⚠️  No cached Fyers token — live WebSocket not started this cycle.")
+        return
+    try:
+        _fyers_stream.configure_universe(MARKETS, _build_stream_universe())
+        _fyers_stream.start(f"{FYERS_APP_ID_FULL}:{token}")
+        print("   🔌 Fyers live market WebSocket started.")
+    except Exception as e:
+        print(f"   ⚠️  Failed to start Fyers live WebSocket: {e}")
+
+
+def _stop_market_stream() -> None:
+    try:
+        _fyers_stream.stop()
+    except Exception:
+        pass
+
+
 def _scan_loop() -> None:
     """
     Unified scheduler: Passive Check (closed) -> Active Check (open).
@@ -1416,6 +1596,7 @@ def _scan_loop() -> None:
 
         # ── PASSIVE WINDOW ────────────────────────────────────────────────────
         if not _is_market_open():
+            _stop_market_stream()   # never keep the live socket open outside hours
             next_check = _next_passive_status_check_at_or_after(now_ist)
             _state["next_passive_check_time"] = _format_ist(next_check)
             print(
@@ -1433,6 +1614,7 @@ def _scan_loop() -> None:
 
         market_status = _free_market_status(force=True)
         if market_status.get("status") != "open":
+            _stop_market_stream()
             status = market_status.get("status", "unknown")
             next_check = _next_passive_status_check_at_or_after(now_ist)
             _state["next_passive_check_time"] = _format_ist(next_check)
@@ -1453,6 +1635,7 @@ def _scan_loop() -> None:
                 try:
                     _fyers = reconnect_fyers()
                     _last_auth_date = today
+                    _start_market_stream()
                     break
                 except Exception as e:
                     print(f"   ⚠️  Re-auth attempt {attempt + 1}/3 failed: {e}")
@@ -1571,10 +1754,29 @@ def _get_market_snapshot() -> dict:
         if cached is not None and _market_cache["expires_at"] > now:
             return cached
 
-    # Source waterfall: NSE (free, primary) → Fyers → Yahoo → hardcoded fallback
-    # Fyers is only used after free sources confirm the market is open.
+    # Primary source: the live Fyers WebSocket — zero extra API calls, just
+    # reads whatever the socket has already received. Falls through to the
+    # REST waterfall below if the socket hasn't produced a fresh tick for
+    # all three indices yet (e.g. just after startup or a reconnect).
     if _fyers_market_data_allowed():
-        fetchers = (_fetch_market_from_nse, _fetch_market_from_fyers, _fetch_market_from_yahoo)
+        try:
+            live = _fyers_stream.index_board(MARKETS)
+        except Exception:
+            live = None
+        if live is not None:
+            with _market_lock:
+                _market_cache["data"]       = live
+                _market_cache["expires_at"] = now + 5
+            return live
+
+    # Fallback waterfall — only reached while the WebSocket hasn't produced
+    # a full tick yet (e.g. just after startup/reconnect). Fyers REST is
+    # tried first per-request when allowed, since Fyers is now the primary
+    # source end-to-end; NSE and Yahoo remain as safety nets so the board
+    # never goes blank, and outside market hours NSE/Yahoo are used alone
+    # (Fyers is not called at all when data use isn't allowed).
+    if _fyers_market_data_allowed():
+        fetchers = (_fetch_market_from_fyers, _fetch_market_from_nse, _fetch_market_from_yahoo)
     else:
         fetchers = (_fetch_market_from_nse, _fetch_market_from_yahoo)
     for fetcher in fetchers:
@@ -1764,6 +1966,30 @@ def _get_constituents(market_cfg: dict) -> dict:
         if cached is not None and cached["expires_at"] > now:
             return cached["data"]
 
+    # Primary source: live Fyers WebSocket ticks for this market's tracked
+    # equities — no REST call at all when this hits. Falls through to the
+    # NSE+Fyers-REST waterfall in _build_constituents_payload() otherwise.
+    if _fyers_market_data_allowed():
+        try:
+            live_rows = _fyers_stream.constituents(market_key)
+        except Exception:
+            live_rows = None
+        if live_rows:
+            data = {
+                "market_key" : market_key,
+                "market_name": market_cfg["display_name"],
+                "count"      : len(live_rows),
+                "stocks"     : live_rows,
+                "source"     : "fyers_ws",
+                "updated_at" : datetime.datetime.now().isoformat(),
+            }
+            with _constituents_lock:
+                _constituents_cache[market_key] = {
+                    "data"      : data,
+                    "expires_at": now + _CONSTITUENTS_TTL,
+                }
+            return data
+
     try:
         data = _build_constituents_payload(market_cfg)
     except Exception as e:
@@ -1912,35 +2138,45 @@ def _build_constituents_payload(market_cfg: dict) -> dict:
     use is allowed.
     """
     market_key = market_cfg["market_key"]
-    session    = _get_nse_session()
-    url        = "https://www.nseindia.com/api/equity-stockIndices"
-    params     = {"index": market_cfg["nse_index_param"]}
     raw_stocks : list = []
     nse_table_ok = False
+    stocks        = []
+    used_fallback = False
 
-    try:
-        response = session.get(url, params=params, timeout=12)
-        response.raise_for_status()
-        raw_stocks = response.json().get("data", [])
-        nse_table_ok = True
-    except Exception:
-        global _nse_session
-        with _nse_session_lock:
-            _nse_session = None
+    # §4.1 fix: Sensex has no NSE endpoint (nse_index_param is None) — skip
+    # the NSE call entirely and start from the maintained SENSEX30 list.
+    if market_cfg["nse_index_param"] is None:
+        session = _get_nse_session()
+        stocks = _constituent_dicts_from_plain_symbols(SENSEX30)
+        used_fallback = True
+        min_rows = 1
+    else:
+        session = _get_nse_session()
+        url    = "https://www.nseindia.com/api/equity-stockIndices"
+        params = {"index": market_cfg["nse_index_param"]}
+
         try:
-            session = _get_nse_session()
             response = session.get(url, params=params, timeout=12)
             response.raise_for_status()
             raw_stocks = response.json().get("data", [])
             nse_table_ok = True
         except Exception:
-            raw_stocks = []
+            global _nse_session
+            with _nse_session_lock:
+                _nse_session = None
+            try:
+                session = _get_nse_session()
+                response = session.get(url, params=params, timeout=12)
+                response.raise_for_status()
+                raw_stocks = response.json().get("data", [])
+                nse_table_ok = True
+            except Exception:
+                raw_stocks = []
 
-    stocks        = _parse_equity_stockindices_rows(raw_stocks)
-    used_fallback = False
-    min_rows      = 6 if market_key == "bank_nifty" else 15
+        stocks   = _parse_equity_stockindices_rows(raw_stocks)
+        min_rows = 6 if market_key == "bank_nifty" else 15
 
-    if len(stocks) < min_rows:
+    if not used_fallback and len(stocks) < min_rows:
         # Pass the already-warmed _nse_session so plain_constituents_for_market
         # doesn't create a redundant new session that will hit the same IP block.
         try:
@@ -1956,6 +2192,8 @@ def _build_constituents_payload(market_cfg: dict) -> dict:
 
     if nse_table_ok and not used_fallback:
         base = "nse"
+    elif market_cfg["nse_index_param"] is None:
+        base = "sensex30_static"   # maintained list, not an NSE fallback — §4.1
     elif used_fallback:
         base = "nse_fallback"
     else:

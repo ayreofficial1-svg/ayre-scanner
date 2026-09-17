@@ -363,6 +363,16 @@ def _generate_access_token() -> str:
     return token
 
 
+def get_cached_token() -> str | None:
+    """
+    Return today's cached raw Fyers access token (no "appid:" prefix), if
+    one has been generated/validated this process. Used by main.py to open
+    the Data WebSocket with the same token the REST client is using —
+    without triggering a second login.
+    """
+    return _TOKEN_CACHE.get("token")
+
+
 def connect_fyers() -> fyersModel.FyersModel:
     try:
         _check_credentials()

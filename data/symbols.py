@@ -58,7 +58,9 @@ _NIFTY_BANK_FALLBACK = [
     "BANKBARODA", "FEDERALBNK", "IDFCFIRSTB", "PNB", "AUBANK", "BANDHANBNK",
 ]
 
-# Nifty Next 50 — Sensex tab uses this index on NSE; static fallback if CSV/API fail.
+# Nifty Next 50 — kept only as a generic large-cap NSE basket; NOT used for
+# Sensex any more (see §4.1 fix below). Retained in case another feature
+# wants a Next-50 style universe later.
 _NIFTY_NEXT50_FALLBACK = [
     "ABB", "ADANIGREEN", "ADANITRANS", "AMBUJACEM", "APOLLOHOSP",
     "AUROPHARMA", "BAJAJHLDNG", "BERGEPAINT", "BIOCON", "BOSCHLTD",
@@ -70,6 +72,27 @@ _NIFTY_NEXT50_FALLBACK = [
     "POLYCAB", "RECLTD", "SIEMENS", "SRF", "SUNTV",
     "TORNTPHARM", "TRENT", "TVSMOTOR", "UBL", "VEDL",
     "VOLTAS", "ZEEL", "MPHASIS", "PAGEIND", "DMART",
+]
+
+# ── §4.1 fix ──────────────────────────────────────────────────────────────
+# The real BSE Sensex 30 basket. Previously "sensex" silently reused the
+# NSE "NIFTY NEXT 50" list (main.py's MARKETS table + this file's old spec
+# entry), which is a completely different set of stocks — a copy-paste bug,
+# not a deliberate proxy. Sensex has no free NSE JSON/CSV endpoint (it's a
+# BSE index), so unlike Nifty 50 / Bank Nifty this list has no live
+# "official" source to poll — it is the single source of truth and only
+# needs updating when BSE rebalances the index (typically twice a year).
+# All symbols below are the NSE-listed trading symbol for the same company
+# (every Sensex constituent is dual-listed on NSE), so they work directly
+# with Fyers' "NSE:<SYMBOL>-EQ" format used everywhere else in this file.
+# Verified against BSE Sensex's published constituent weightage, Sep 2026.
+SENSEX30 = [
+    "RELIANCE", "BHARTIARTL", "HDFCBANK", "ICICIBANK", "SBIN",
+    "TCS", "BAJFINANCE", "LT", "HINDUNILVR", "SUNPHARMA",
+    "TITAN", "INFY", "KOTAKBANK", "ADANIPORTS", "AXISBANK",
+    "MARUTI", "M&M", "HCLTECH", "ITC", "NTPC",
+    "ULTRACEMCO", "ETERNAL", "BAJAJFINSV", "BEL", "POWERGRID",
+    "ASIANPAINT", "TATASTEEL", "INDIGO", "TECHM", "TRENT",
 ]
 
 
@@ -122,10 +145,17 @@ def plain_constituents_for_market(
                  session that may be blocked by NSE IP rate-limiting.
                  A new session is created only when none is supplied.
     """
+    # §4.1 fix: "sensex" no longer maps to any NSE index endpoint (it used
+    # to wrongly reuse NIFTY NEXT 50 — see the SENSEX30 comment above).
+    # BSE has no free public JSON/CSV constituents API, so the hardcoded
+    # SENSEX30 list *is* the source of truth for this basket; live prices
+    # for it still come from Fyers, same as every other market.
+    if market_key == "sensex":
+        return list(SENSEX30)[:50]
+
     spec = {
         "nifty"     : (_URL_NIFTY50,     _CSV_NIFTY50,     _NIFTY50_FALLBACK),
         "bank_nifty": (_URL_NIFTY_BANK,  _CSV_NIFTY_BANK,  _NIFTY_BANK_FALLBACK),
-        "sensex"    : (_URL_NIFTY_NEXT50, _CSV_NIFTY_NEXT50, _NIFTY_NEXT50_FALLBACK),
     }
     pack = spec.get(market_key)
     if not pack:
