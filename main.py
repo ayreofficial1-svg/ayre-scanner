@@ -1766,17 +1766,18 @@ def _start_quotes_poller(interval_seconds: int = 15) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_market_snapshot() -> dict:
-    """Returns the cached market snapshot, refreshing it if stale."""
+    """
+    Live Fyers WebSocket ticks are read fresh on every call (see
+    _get_constituents() for why — in-memory reads are free, so caching
+    them only adds needless staleness). The cache below applies only to
+    the NSE/Fyers-REST/Yahoo fallback path, which does cost a real network
+    call and is reached only before the WebSocket has produced a tick for
+    all three indices (e.g. just after startup/reconnect).
+    """
     now = time.time()
-    with _market_lock:
-        cached = _market_cache["data"]
-        if cached is not None and _market_cache["expires_at"] > now:
-            return cached
 
     # Primary source: the live Fyers WebSocket — zero extra API calls, just
-    # reads whatever the socket has already received. Falls through to the
-    # REST waterfall below if the socket hasn't produced a fresh tick for
-    # all three indices yet (e.g. just after startup or a reconnect).
+    # reads whatever the socket has already received, fresh every time.
     if _fyers_market_data_allowed():
         try:
             live = _fyers_stream.index_board(MARKETS)
@@ -1784,9 +1785,14 @@ def _get_market_snapshot() -> dict:
             live = None
         if live is not None:
             with _market_lock:
-                _market_cache["data"]       = live
-                _market_cache["expires_at"] = now + 5
+                _market_cache["data"]       = live  # kept only as an emergency last-resort value
+                _market_cache["expires_at"] = now
             return live
+
+    with _market_lock:
+        cached = _market_cache["data"]
+        if cached is not None and _market_cache["expires_at"] > now:
+            return cached
 
     # Fallback waterfall — only reached while the WebSocket hasn't produced
     # a full tick yet (e.g. just after startup/reconnect). Fyers REST is
@@ -1976,25 +1982,31 @@ def _pick_number(values: dict, *keys: str) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_constituents(market_cfg: dict) -> dict:
-    """Return (cached) constituent list for the market. TTL = 60 s."""
+    """
+    Constituent list for the market.
+
+    Live Fyers WebSocket ticks are read fresh on every single call — no
+    caching layer sits in front of them, because reading them costs
+    nothing (in-memory, no external request) and caching them would
+    reintroduce exactly the staleness the WebSocket exists to remove.
+
+    The 60s cache below applies ONLY to the NSE/REST-Fyers fallback path,
+    which is a real external network call and does need throttling — it
+    is reached only while the WebSocket hasn't produced ticks for this
+    market yet (e.g. just after startup/reconnect).
+    """
     market_key = market_cfg["market_key"]
     now        = time.time()
 
-    with _constituents_lock:
-        cached = _constituents_cache.get(market_key)
-        if cached is not None and cached["expires_at"] > now:
-            return cached["data"]
-
-    # Primary source: live Fyers WebSocket ticks for this market's tracked
-    # equities — no REST call at all when this hits. Falls through to the
-    # NSE+Fyers-REST waterfall in _build_constituents_payload() otherwise.
+    # Primary source: live Fyers WebSocket ticks — always read fresh,
+    # never cached. This is what makes the app show truly live numbers.
     if _fyers_market_data_allowed():
         try:
             live_rows = _fyers_stream.constituents(market_key)
         except Exception:
             live_rows = None
         if live_rows:
-            data = {
+            return {
                 "market_key" : market_key,
                 "market_name": market_cfg["display_name"],
                 "count"      : len(live_rows),
@@ -2002,12 +2014,13 @@ def _get_constituents(market_cfg: dict) -> dict:
                 "source"     : "fyers_ws",
                 "updated_at" : datetime.datetime.now().isoformat(),
             }
-            with _constituents_lock:
-                _constituents_cache[market_key] = {
-                    "data"      : data,
-                    "expires_at": now + _CONSTITUENTS_TTL,
-                }
-            return data
+
+    # Fallback path (NSE / REST-Fyers) — real external calls, so this one
+    # is genuinely cache-worthy. TTL = 60s.
+    with _constituents_lock:
+        cached = _constituents_cache.get(market_key)
+        if cached is not None and cached["expires_at"] > now:
+            return cached["data"]
 
     try:
         data = _build_constituents_payload(market_cfg)
