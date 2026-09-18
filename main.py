@@ -2394,7 +2394,21 @@ def main():
     print(f"    Press Ctrl+C to stop.\n")
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
-    app.run(host="0.0.0.0", port=args.port, debug=False, use_reloader=False)
+    # threaded=True: with the live market-data endpoints now doing a real
+    # (if occasional) synchronous network call on their REST-fallback path
+    # (NSE/Fyers/Yahoo — only reached before the WebSocket has produced a
+    # tick), a single-threaded dev server would serialize *every* request
+    # behind that one slow call — not just other market-data requests, but
+    # scanner/website requests too. Flutter now also fires several market
+    # requests concurrently per screen per refresh tick (Home, Index Detail,
+    # Equity Detail, Insights each polling independently every 4s), so
+    # without this the requests in one tick queue up behind each other even
+    # when every one of them is a fast in-memory read. This is exactly the
+    # kind of load the existing per-cache locks (_market_lock,
+    # _constituents_lock, _movers_lock, and fyers_stream's own lock) were
+    # already written to support concurrently — enabling threading here was
+    # the missing piece, not a new design.
+    app.run(host="0.0.0.0", port=args.port, debug=False, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
