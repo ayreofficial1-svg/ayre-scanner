@@ -1523,7 +1523,13 @@ def _fyers_market_data_allowed() -> bool:
     return _free_sources_confirm_market_open(force=False)
 
 
-# ── Live market WebSocket (real-time index board, constituents, breadth) ──────
+# ── Live market WebSocket (real-time advances/declines, movers, index board) ─
+# Deliberately fully independent of _scan_loop() — the scanner's own
+# schedule, auth retries and scan-slot timing are untouched. This poller
+# only *reads* scanner state (_fyers_market_data_allowed(), the cached
+# Fyers token) the same way the pre-existing _start_market_poller() and
+# _start_quotes_poller() already do; it never calls reconnect_fyers()
+# itself and never assigns to any scanner global.
 def _build_stream_universe() -> dict[str, list[str]]:
     """
     Bare NSE symbols to track live, per market: Nifty 50 and Bank Nifty
@@ -1547,32 +1553,48 @@ def _build_stream_universe() -> dict[str, list[str]]:
     }
 
 
-def _start_market_stream() -> None:
+def _start_fyers_stream_poller(check_interval_seconds: int = 30) -> None:
     """
-    (Re)configure and (re)start the single Fyers Data WebSocket connection
-    for the day. Called once per trading day right after the daily Fyers
-    re-auth, so the socket always uses a freshly validated token.
-    Never raises — a failure here just means index_board()/constituents()/
-    breadth()/movers() keep returning None and main.py's existing
-    NSE/REST-Fyers/Yahoo waterfall keeps serving requests as before.
+    Background thread, independent of _scan_loop(), that opens/closes the
+    single Fyers Data WebSocket connection based on the same conditions the
+    rest of the app already uses (_fyers_market_data_allowed()) and whatever
+    token the scanner's own daily re-auth has already cached
+    (auth.fyers_auth.get_cached_token() — read-only, triggers no login).
+
+    - Market allowed + a token is cached + we haven't started on this exact
+      token yet → (re)configure the symbol universe and start the socket.
+    - Market not allowed (closed / not source-confirmed open) and the
+      socket is currently connected → stop it, so nothing lingers connected
+      to Fyers outside trading hours.
+    Never touches _fyers, _scan_loop's schedule, or any scanner state —
+    only reads it. A failure here only means live market data falls back
+    to the existing NSE/REST-Fyers/Yahoo waterfall; it can't affect scans.
     """
-    token = get_cached_token()
-    if not token or _fyers is None:
-        print("   ⚠️  No cached Fyers token — live WebSocket not started this cycle.")
-        return
-    try:
-        _fyers_stream.configure_universe(MARKETS, _build_stream_universe())
-        _fyers_stream.start(f"{FYERS_APP_ID_FULL}:{token}")
-        print("   🔌 Fyers live market WebSocket started.")
-    except Exception as e:
-        print(f"   ⚠️  Failed to start Fyers live WebSocket: {e}")
+    def _poll():
+        started_for_token: str | None = None
+        print(
+            f"🔌  Fyers live-market-data poller started "
+            f"(checks every {check_interval_seconds}s; independent of the scan loop)"
+        )
+        while True:
+            try:
+                if _fyers_market_data_allowed():
+                    token = get_cached_token()
+                    if token and token != started_for_token:
+                        _fyers_stream.configure_universe(MARKETS, _build_stream_universe())
+                        _fyers_stream.start(f"{FYERS_APP_ID_FULL}:{token}")
+                        started_for_token = token
+                        print("   🔌 Fyers live market WebSocket (re)started.")
+                elif started_for_token is not None:
+                    _fyers_stream.stop()
+                    started_for_token = None
+                    print("   🔌 Fyers live market WebSocket stopped (market data not allowed).")
+            except Exception as e:
+                print(f"   ⚠️  fyers_stream poller error: {e}")
+            time.sleep(check_interval_seconds)
 
-
-def _stop_market_stream() -> None:
-    try:
-        _fyers_stream.stop()
-    except Exception:
-        pass
+    t = threading.Thread(target=_poll, daemon=True, name="fyers-stream-poller")
+    t.start()
 
 
 def _scan_loop() -> None:
@@ -1596,7 +1618,6 @@ def _scan_loop() -> None:
 
         # ── PASSIVE WINDOW ────────────────────────────────────────────────────
         if not _is_market_open():
-            _stop_market_stream()   # never keep the live socket open outside hours
             next_check = _next_passive_status_check_at_or_after(now_ist)
             _state["next_passive_check_time"] = _format_ist(next_check)
             print(
@@ -1614,7 +1635,6 @@ def _scan_loop() -> None:
 
         market_status = _free_market_status(force=True)
         if market_status.get("status") != "open":
-            _stop_market_stream()
             status = market_status.get("status", "unknown")
             next_check = _next_passive_status_check_at_or_after(now_ist)
             _state["next_passive_check_time"] = _format_ist(next_check)
@@ -1635,7 +1655,6 @@ def _scan_loop() -> None:
                 try:
                     _fyers = reconnect_fyers()
                     _last_auth_date = today
-                    _start_market_stream()
                     break
                 except Exception as e:
                     print(f"   ⚠️  Re-auth attempt {attempt + 1}/3 failed: {e}")
@@ -2355,6 +2374,7 @@ def main():
     threading.Thread(target=_scan_loop, daemon=True, name="scan-loop").start()
     _start_market_poller(interval_seconds=60)
     _start_quotes_poller(interval_seconds=15)
+    _start_fyers_stream_poller(check_interval_seconds=30)
 
     url = f"http://localhost:{args.port}"
     print(f"🌐  Opening {url} …")
