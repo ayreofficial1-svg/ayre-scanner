@@ -13,7 +13,7 @@ Execution flow
 
 Return value
 ────────────
-  (signals, watchlist_items, fetch_report)
+  (signals, watchlist_items, fetch_report, universe_stats)
 
   signals        — stocks where all conditions are met (C1–C3). Each dict
                    includes "trade_ready_at" (ISO 8601, IST offset) when
@@ -27,6 +27,13 @@ Return value
                    {attempted, valid, no_data, failed, recovered, missing}
                    main.py writes attempted → total_attempted and
                    valid → total_scanned in _state for /api/results.
+  universe_stats — {bare_symbol: {"atr_pct", "macd_bullish", "volume_surge",
+                   "close"}} for every symbol reaching evaluation this scan
+                   — captured as a free byproduct of the indicators already
+                   computed for `evaluate()` (zero extra Fyers requests; see
+                   spec §2). Powers /api/insights/volatility, /momentum and
+                   /volume-surge. main.py persists this and stores it in
+                   _state["universe_stats"].
 
 Both lists are sorted by change_pct descending.
 """
@@ -205,7 +212,7 @@ def run_scan(
     watchlist : dict,
     alert_log : dict,
     verbose   : bool = False,
-) -> tuple[list[dict], list[dict], dict]:
+) -> tuple[list[dict], list[dict], dict, dict]:
     """
     Execute a full scan across all symbols.
 
@@ -220,14 +227,17 @@ def run_scan(
 
     Returns
     -------
-    (signals, watchlist_items, fetch_report)
+    (signals, watchlist_items, fetch_report, universe_stats)
 
     signals and watchlist_items are sorted by change_pct descending.
     fetch_report is the completeness dict from fetch_candles_bulk.
+    universe_stats is {bare_symbol: {atr_pct, macd_bullish, volume_surge,
+    close}} for every evaluated symbol — see module docstring.
     """
     signals         : list[dict] = []
     watchlist_items : list[dict] = []
     promoted        : list[str]  = []
+    universe_stats  : dict[str, dict] = {}
     t_start = time.time()
 
     # ── Step 1: Fetch daily candles once ─────────────────────────────────────
@@ -328,7 +338,36 @@ def run_scan(
 
     for symbol, raw in candle_data.items():
         try:
-            result = evaluate(symbol, raw, weekly_rising=weekly_status.get(symbol))
+            # NEW — computed once, shared by evaluate() AND the stats
+            # capture below. Pure pandas over ~700 rows; zero Fyers cost.
+            df_ind = compute_indicators(raw.copy())
+
+            # existing evaluate() call — now passes the pre-computed df_ind
+            # so it doesn't redo this work; behavior is otherwise 100%
+            # unchanged (see scanner/conditions.py::evaluate).
+            result = evaluate(
+                symbol, raw, weekly_rising=weekly_status.get(symbol), df_ind=df_ind
+            )
+
+            # NEW — independent read of df_ind's last row, zero Fyers cost.
+            # Never allowed to affect the scan itself.
+            try:
+                last = df_ind.iloc[-1]
+                bare = symbol.replace("NSE:", "").replace("-EQ", "")
+                close = float(last["Close"])
+                atr   = float(last["ATR14"])
+                macd  = float(last["MACD"])
+                sig   = float(last["Signal"])
+                vol      = float(last.get("Volume", 0))
+                vol_ma20 = float(last.get("Vol_MA20", 0))
+                universe_stats[bare] = {
+                    "atr_pct": round(atr / close * 100, 2) if close and atr == atr else None,
+                    "macd_bullish": (macd - sig) > 0 if macd == macd and sig == sig else None,
+                    "volume_surge": round(vol / vol_ma20, 2) if vol_ma20 else None,
+                    "close": round(close, 2) if close == close else None,
+                }
+            except Exception:
+                pass  # never let this affect the scan itself
 
             if result["status"] == "signal":
                 d       = result["data"]
@@ -415,4 +454,5 @@ def run_scan(
         sorted(signals,         key=lambda x: x.get("change_pct", 0), reverse=True),
         sorted(watchlist_items, key=lambda x: x.get("change_pct", 0), reverse=True),
         fetch_report,
+        universe_stats,
     )

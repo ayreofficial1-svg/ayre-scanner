@@ -205,3 +205,21 @@ ACTIVE_CHECK_MINUTE = 30
 # Checks are aligned to fixed clock boundaries, not scheduled relative to the
 # previous check. After market close they run hourly from 16:00 IST onward.
 PASSIVE_CHECK_INTERVAL = 3600
+
+# ── Insights: volatility / momentum / volume-surge ✅ ─────────────────────────
+# Per-symbol stats captured as a free byproduct of run_scan() (see
+# scanner/engine.py). Persisted here so a restart doesn't blank the
+# Insights charts until the next scan.
+APP_UNIVERSE_STATS_FILE = "universe_stats.json"
+
+# ── Full Nifty-500 breadth poller ✅ ───────────────────────────────────────────
+# Fixed hourly slots, offset 15 minutes after each scanner slot (HH:30) so
+# the two schedules are visibly independent. No 15 — market closes 15:30,
+# so there's no 15:45 slot. 6 refreshes/day; see main.py::_breadth_loop.
+BREADTH_CHECK_HOURS  = [9, 10, 11, 12, 13, 14]
+BREADTH_CHECK_MINUTE = 45
+
+# Cached full-universe breadth snapshot, written by _breadth_loop, read by
+# GET /api/breadth/full. Persisted so a restart doesn't blank the Home
+# donut until the next hourly slot.
+BREADTH_FULL_FILE = "breadth_full.json"

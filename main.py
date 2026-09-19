@@ -62,7 +62,7 @@ def _json_safe(value):
 from auth.fyers_auth import reconnect_fyers, get_cached_token
 from config.settings import (
     ACTIVE_CHECK_HOURS, ACTIVE_CHECK_MINUTE, PASSIVE_CHECK_INTERVAL,
-    FYERS_APP_ID_FULL,
+    FYERS_APP_ID_FULL, BREADTH_CHECK_HOURS, BREADTH_CHECK_MINUTE,
 )
 from data.symbols import fetch_nifty500, plain_constituents_for_market, SENSEX30
 from data.fyers_stream import stream as _fyers_stream
@@ -73,11 +73,13 @@ from scanner.watchlist import (
 from scanner.engine import run_scan
 from scanner.historical import run_historical_scan
 from utils.logger import get_log_summary
-from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk
+from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk, fetch_full_market_breadth
 from data.app_signals import load_signals, add_signal, update_signal, delete_signal
 from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
 from data.app_insights import load_insights, add_insight, update_insight, delete_insight
 from data.app_sentiment import load_sentiment, save_sentiment
+from data.universe_stats import load_universe_stats, save_universe_stats
+from data.breadth import load_full_breadth, save_full_breadth
 from config.settings import APP_ASSET_DIR
 
 try:
@@ -135,10 +137,26 @@ _state = {
     "error"           : None,
     "next_scan_time"  : None, # ISO timestamp of next scheduled boundary
     "next_passive_check_time": None,
+    # Insights (spec §2): {bare_symbol: {atr_pct, macd_bullish, volume_surge,
+    # close}}, captured as a free byproduct of run_scan(); loaded from disk
+    # at startup, refreshed every scan.
+    "universe_stats"        : {},
+    "universe_stats_as_of"  : None,
+    # §3: set in _do_scan()'s and _run_backtest_job()'s finally blocks —
+    # timestamp of the last time a scan/rescan/backtest finished, used by
+    # _fyers_busy_for_extras() to keep new extras off Fyers for a short
+    # cooldown after any of the three ends.
+    "last_heavy_fyers_op_at": None,
 }
 _fyers      = None
 _symbols    = None
 _start_time = time.time()   # for /api/status uptime tracking
+
+# Full Nifty-500 breadth snapshot cache (spec §4), populated at startup from
+# disk and refreshed only by _breadth_loop's paced batch — read-only cache
+# for GET /api/breadth/full, never fetched at request time.
+_breadth_full_lock  = threading.Lock()
+_breadth_full_cache : dict | None = None
 
 # Market hours (IST) — scanner runs only within this window.
 # NSE regular session opens at 09:15; scans are intentionally fixed to
@@ -571,6 +589,10 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
             if job_id in _backtest_jobs:
                 _backtest_jobs[job_id]["status"] = "error"
                 _backtest_jobs[job_id]["error"] = str(e)
+    finally:
+        # §3: marks "a heavy Fyers op just finished" for the breadth
+        # poller's busy-guard cooldown — set regardless of success/failure.
+        _state["last_heavy_fyers_op_at"] = time.time()
 
 
 def _format_ist(dt: datetime.datetime | None) -> str | None:
@@ -1050,6 +1072,102 @@ def api_sentiment_set():
     return jsonify(data)
 
 
+@app.route("/api/breadth/full")
+def api_breadth_full():
+    """
+    Full Nifty-500 breadth (spec §4.6) — a pure cache read for the
+    frontend. The 10-call Fyers fetch happens only in the background
+    poller (_breadth_loop), never on request.
+    """
+    with _breadth_full_lock:
+        data = dict(_breadth_full_cache) if _breadth_full_cache else None
+    if not data:
+        return jsonify({
+            "as_of": None,
+            "advances": 0,
+            "declines": 0,
+            "unchanged": 0,
+            "avg_change_pct": 0.0,
+            "coverage": 0,
+        })
+    return jsonify(data)
+
+
+@app.route("/api/insights/volatility")
+def api_insights_volatility():
+    """
+    Histogram buckets of ATR% across all tracked stocks (spec §2.4).
+    Cache-only — reads _state["universe_stats"], no Fyers calls at
+    request time. Refreshes at scan cadence (up to 7×/day).
+    """
+    stats = _state.get("universe_stats") or {}
+    buckets = {"0-1%": 0, "1-2%": 0, "2-3%": 0, "3%+": 0}
+    for row in stats.values():
+        atr_pct = row.get("atr_pct")
+        if atr_pct is None:
+            continue
+        if atr_pct < 1:
+            buckets["0-1%"] += 1
+        elif atr_pct < 2:
+            buckets["1-2%"] += 1
+        elif atr_pct < 3:
+            buckets["2-3%"] += 1
+        else:
+            buckets["3%+"] += 1
+    return jsonify({
+        "buckets": buckets,
+        "as_of": _state.get("universe_stats_as_of"),
+    })
+
+
+@app.route("/api/insights/momentum")
+def api_insights_momentum():
+    """
+    Bullish/bearish MACD tilt across all tracked stocks (spec §2.4).
+    Cache-only, same as /api/insights/volatility.
+    """
+    stats = _state.get("universe_stats") or {}
+    bullish = bearish = 0
+    for row in stats.values():
+        flag = row.get("macd_bullish")
+        if flag is True:
+            bullish += 1
+        elif flag is False:
+            bearish += 1
+    return jsonify({
+        "bullish": bullish,
+        "bearish": bearish,
+        "as_of": _state.get("universe_stats_as_of"),
+    })
+
+
+@app.route("/api/insights/volume-surge")
+def api_insights_volume_surge():
+    """
+    Top N stocks by volume surge (today's volume ÷ 20-day average volume),
+    descending (spec §2.4). Cache-only, same as the other /api/insights/*
+    endpoints. ?limit=N overrides the default of 15 (clamped to 1-50).
+    """
+    stats = _state.get("universe_stats") or {}
+    try:
+        limit = int(request.args.get("limit", 15))
+    except (TypeError, ValueError):
+        limit = 15
+    limit = max(1, min(limit, 50))
+
+    rows = [
+        {"symbol": sym, "volume_surge": row["volume_surge"], "close": row.get("close")}
+        for sym, row in stats.items()
+        if row.get("volume_surge") is not None
+    ]
+    rows.sort(key=lambda r: r["volume_surge"], reverse=True)
+
+    return jsonify({
+        "items": rows[:limit],
+        "as_of": _state.get("universe_stats_as_of"),
+    })
+
+
 @app.route("/api/insights", methods=["GET"])
 def api_insights_list():
     include_hidden = request.args.get("all") == "1" and _is_admin()
@@ -1206,6 +1324,41 @@ def serve_react(path: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# "Fyers busy" guard — shared by everything in the breadth poller (spec §3/§4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BUSY_COOLDOWN_SECONDS = 20   # buffer after a scan/backtest ends, before
+                               # anything new is allowed to fire
+
+
+def _fyers_busy_for_extras() -> bool:
+    """
+    True if a scheduled scan, a manual rescan, or a backtest is running
+    right now, or finished less than _BUSY_COOLDOWN_SECONDS ago.
+
+    A manual rescan calls the exact same _do_scan() function a scheduled
+    scan does, and sets the exact same _state["scanning"] flag — so this
+    never needs to distinguish "manual" from "automatic" scans. The
+    backtest job is the one genuinely separate path, which is why it gets
+    its own check via _backtest_jobs.
+
+    This is a *skip* primitive. _breadth_loop() builds a wait-then-fire
+    primitive on top of it (spec §4.4), which is what actually gives the
+    breadth poller "pause and continue after scanning is done" behavior
+    rather than "skip this cycle and wait an hour."
+    """
+    if _state.get("scanning"):
+        return True
+    with _backtest_lock:
+        if any(j.get("status") == "running" for j in _backtest_jobs.values()):
+            return True
+    last_finished = _state.get("last_heavy_fyers_op_at")
+    if last_finished and (time.time() - last_finished) < _BUSY_COOLDOWN_SECONDS:
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Scan
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1223,7 +1376,7 @@ def _do_scan():
         save_watchlist(watchlist)
         save_alert_log(alert_log)
 
-        signals, watchlist_items, fetch_report = run_scan(
+        signals, watchlist_items, fetch_report, universe_stats = run_scan(
             fyers     = _fyers,
             symbols   = _symbols,
             interval  = "D",
@@ -1240,10 +1393,20 @@ def _do_scan():
         _state["total_scanned"]   = fetch_report.get("evaluated", fetch_report["valid"])
         _state["total_attempted"] = fetch_report["attempted"]
 
+        # Insights (spec §2) — persist so a restart doesn't blank the charts
+        # until the next scan, and update the in-memory copy the
+        # /api/insights/* endpoints read from.
+        _state["universe_stats"] = universe_stats
+        saved_stats = save_universe_stats(universe_stats)
+        _state["universe_stats_as_of"] = saved_stats["as_of"]
+
     except Exception as e:
         _state["error"] = str(e)
     finally:
         _state["scanning"] = False
+        # §3: marks "a heavy Fyers op just finished" for the breadth
+        # poller's busy-guard cooldown — set regardless of success/failure.
+        _state["last_heavy_fyers_op_at"] = time.time()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1302,6 +1465,24 @@ def _next_scan_slot_after(now: datetime.datetime | None = None) -> datetime.date
 def _seconds_until_next_scan_slot() -> float:
     now = datetime.datetime.now(_IST)
     return max(0.0, (_next_scan_slot_after(now) - now).total_seconds())
+
+
+def _next_breadth_slot_after(now: datetime.datetime | None = None) -> datetime.datetime | None:
+    """
+    Next fixed full-breadth poller slot (HH:45 IST, spec §4.3) still to come
+    today. Returns None once today's slots are exhausted — analogous to
+    _seconds_until_next_active_slot's None-when-exhausted contract (not
+    _next_scan_slot_after's always-wraps-to-tomorrow one), so _breadth_loop's
+    "no more slots today" branch has something to detect.
+    """
+    now = now or datetime.datetime.now(_IST)
+    for h in BREADTH_CHECK_HOURS:
+        target = now.replace(
+            hour=h, minute=BREADTH_CHECK_MINUTE, second=0, microsecond=0
+        )
+        if target > now:
+            return target
+    return None
 
 
 def _clock_hour_at_or_after(now: datetime.datetime) -> datetime.datetime:
@@ -1702,6 +1883,104 @@ def _scan_loop() -> None:
 
         print(f"\n🟢  Active check — {datetime.datetime.now(_IST).strftime('%H:%M')} IST")
         _do_scan()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full Nifty-500 breadth poller (spec §4) — independent thread and schedule
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _refresh_full_breadth() -> None:
+    """
+    The paced 10-call Fyers batch (spec §4.2): advances/declines/unchanged +
+    average change % across the full Nifty 500, cached for GET
+    /api/breadth/full. Called only from _breadth_loop, only once the busy
+    guard has cleared and the market is source-confirmed open.
+    """
+    global _breadth_full_cache
+
+    if _fyers is None or not _symbols:
+        return
+
+    try:
+        result = fetch_full_market_breadth(_fyers, _symbols)
+    except Exception as e:
+        print(f"   ⚠️  Breadth poller: fetch error: {e}")
+        return
+
+    if not result:
+        print("   ⚠️  Breadth poller: no usable data returned this cycle.")
+        return
+
+    data = save_full_breadth(
+        advances       = result["advances"],
+        declines       = result["declines"],
+        unchanged      = result["unchanged"],
+        avg_change_pct = result["avg_change_pct"],
+        coverage       = result["coverage"],
+    )
+    with _breadth_full_lock:
+        _breadth_full_cache = data
+
+    print(
+        f"   📊  Full breadth refreshed: {data['advances']} adv / "
+        f"{data['declines']} dec / {data['unchanged']} unch "
+        f"(coverage {data['coverage']}/{len(_symbols)})"
+    )
+
+
+_BREADTH_MAX_WAIT_SECONDS = 15 * 60   # generous bound: scans normally take
+                                        # 2–4 min; backtests can run longer
+
+
+def _breadth_loop() -> None:
+    """
+    Full Nifty-500 breadth poller — fixed hourly slots (spec §4.3), 15
+    minutes offset from the scanner's own schedule.
+
+    Runs on its own daemon thread, started independently in main() — never
+    called from or blocking on _scan_loop / _do_scan. A slow breadth fetch
+    can therefore never delay a scan slot, and a slow scan can never
+    silently swallow a breadth slot: two threads, two schedules, one shared
+    guard (_fyers_busy_for_extras, which only *reads* state) is the whole
+    coordination mechanism.
+    """
+    print(
+        f"📊  Breadth poller started — slots at "
+        f"{', '.join(f'{h:02d}:{BREADTH_CHECK_MINUTE:02d}' for h in BREADTH_CHECK_HOURS)} IST"
+    )
+    while True:
+        now = datetime.datetime.now(_IST)
+
+        if not _is_market_open():
+            time.sleep(300)   # cheap poll while closed; no Fyers calls here
+            continue
+
+        next_slot = _next_breadth_slot_after(now)
+        if next_slot is None:
+            time.sleep(_seconds_until_next_scan_slot())  # reuse existing helper's shape
+            continue
+
+        _sleep_until(next_slot)   # reuse the existing helper as-is
+
+        # ── This slot's fire time has arrived. If a scan/rescan/backtest is
+        #    running right now, WAIT for it to finish rather than skipping —
+        #    this is the "pause, then continue" behavior. ──
+        waited = 0
+        while _fyers_busy_for_extras() and waited < _BREADTH_MAX_WAIT_SECONDS:
+            time.sleep(5)
+            waited += 5
+
+        if _fyers_busy_for_extras():
+            # Still busy after the max wait (an unusually long backtest,
+            # say) — give up on THIS slot rather than firing late into the
+            # next one's territory. The next loop iteration computes the
+            # next fixed slot fresh, so this never double-fires or drifts.
+            continue
+
+        if not _fyers_market_data_allowed():
+            continue   # market status may have changed while we were waiting
+
+        _refresh_full_breadth()   # the paced 10-call batch from §4.2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2356,7 +2635,7 @@ def _start_market_poller(interval_seconds: int = 5) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global _fyers, _symbols
+    global _fyers, _symbols, _breadth_full_cache
 
     parser = argparse.ArgumentParser(description="Nifty 500 Swing Trading Scanner")
     parser.add_argument("--verbose", action="store_true")
@@ -2375,6 +2654,14 @@ def main():
     _symbols = fetch_nifty500()
     print("   Auth will run automatically after Yahoo/NSE confirm a trading day, before the first scan slot.")
 
+    # Restore cached Insights stats and full-breadth snapshot from disk so
+    # neither screen is blank between process restart and the next
+    # scan / breadth slot.
+    loaded_stats = load_universe_stats()
+    _state["universe_stats"]       = loaded_stats["stats"]
+    _state["universe_stats_as_of"] = loaded_stats["as_of"]
+    _breadth_full_cache = load_full_breadth()
+
     summary = get_log_summary()
     print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")
     print(f"    Stocks     : {len(_symbols)}")
@@ -2385,6 +2672,14 @@ def main():
         f"({slot_labels[0]}–{slot_labels[-1]} IST via {', '.join(slot_labels)}) …"
     )
     threading.Thread(target=_scan_loop, daemon=True, name="scan-loop").start()
+
+    breadth_slot_labels = [f"{h:02d}:{BREADTH_CHECK_MINUTE:02d}" for h in BREADTH_CHECK_HOURS]
+    print(
+        f"📊  Starting full Nifty-500 breadth poller "
+        f"({breadth_slot_labels[0]}–{breadth_slot_labels[-1]} IST via {', '.join(breadth_slot_labels)}) …"
+    )
+    threading.Thread(target=_breadth_loop, daemon=True, name="breadth-loop").start()
+
     _start_market_poller(interval_seconds=60)
     _start_quotes_poller(interval_seconds=15)
     _start_fyers_stream_poller(check_interval_seconds=30)

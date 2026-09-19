@@ -214,6 +214,86 @@ def fetch_constituents_quotes_bulk(
     return {k: dict(v) for k, v in merged.items()}
 
 
+def fetch_full_market_breadth(
+    fyers        : fyersModel.FyersModel,
+    fyers_symbols: list[str],
+    batch_pause  : float = 0.3,
+) -> dict | None:
+    """
+    Paced full-universe breadth fetch: advances / declines / unchanged +
+    average change % across every symbol in `fyers_symbols` (intended for
+    the full Nifty 500 list — 10 calls of up to 50 symbols each, spec §4.2).
+
+    Dedicated to the hourly breadth poller (main.py::_breadth_loop). Has
+    its own pacing and holds no cache or rate-limit guard of its own — the
+    poller's fixed hourly slots plus the "Fyers busy" guard (main.py
+    §3/§4.4) are what keep this within Fyers' limits, so this function
+    never needs to dedupe or rate-limit itself the way fetch_ltp_bulk and
+    fetch_constituents_quotes_bulk do for their much more frequent callers.
+
+    Parameters
+    ----------
+    fyers_symbols : full Fyers symbols, e.g. ["NSE:RELIANCE-EQ", ...].
+                    Batched into groups of 50 (Fyers' per-call cap).
+    batch_pause   : seconds to sleep between batches (spec: 0.3s, mirroring
+                    fetch_constituents_quotes_bulk's 0.35s inter-batch pause)
+                    so the calls spread out rather than bursting at once.
+
+    Returns
+    -------
+    {"advances", "declines", "unchanged", "avg_change_pct", "coverage"} or
+    None if no batch returned any usable data. Never raises — a batch that
+    errors or comes back malformed is skipped, not fatal to the others.
+    """
+    if not fyers_symbols:
+        return None
+
+    batches = [fyers_symbols[i : i + 50] for i in range(0, len(fyers_symbols), 50)]
+    advances = declines = unchanged = 0
+    change_pcts: list[float] = []
+
+    for bi, batch in enumerate(batches):
+        if bi:
+            time.sleep(batch_pause)
+        symbols_str = ",".join(batch)
+        try:
+            resp = fyers.quotes(data={"symbols": symbols_str})
+        except Exception as e:
+            log.warning(f"quotes.fetch_full_market_breadth: batch {bi} error: {e}")
+            continue
+
+        if not resp or resp.get("s") != "ok":
+            log.warning(f"quotes.fetch_full_market_breadth: bad batch {bi} response: {resp}")
+            continue
+
+        for item in resp.get("d", []):
+            v = item.get("v") or item
+            if not isinstance(v, dict):
+                continue
+            chp = _pick_num(v, "chp", "change_percent", "change_pct")
+            if chp is None:
+                continue
+            change_pcts.append(chp)
+            if chp > 0:
+                advances += 1
+            elif chp < 0:
+                declines += 1
+            else:
+                unchanged += 1
+
+    coverage = advances + declines + unchanged
+    if coverage == 0:
+        return None
+
+    return {
+        "advances"      : advances,
+        "declines"      : declines,
+        "unchanged"     : unchanged,
+        "avg_change_pct": round(sum(change_pcts) / len(change_pcts), 2) if change_pcts else 0.0,
+        "coverage"      : coverage,
+    }
+
+
 def _fetch_yahoo_quotes(nse_symbols: list[str]) -> dict[str, dict[str, float | None]]:
     """
     Fetch OHLC data from Yahoo Finance for a list of NSE symbols.

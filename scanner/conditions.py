@@ -230,12 +230,27 @@ def _pending_metadata(macd_arr: np.ndarray, signal_arr: np.ndarray) -> dict:
     }
 
 
-def evaluate(symbol: str, df: pd.DataFrame, weekly_rising: bool | None = None) -> dict:
-    """Evaluate one symbol against the scanner conditions."""
+def evaluate(
+    symbol: str,
+    df: pd.DataFrame,
+    weekly_rising: bool | None = None,
+    df_ind: pd.DataFrame | None = None,   # NEW — optional, defaults to None
+) -> dict:
+    """
+    Evaluate one symbol against the scanner conditions.
+
+    `df_ind` lets a caller that has already run `compute_indicators(df)`
+    (e.g. `run_scan()`'s main loop, which needs the indicators for its own
+    universe-stats capture anyway) pass it in and avoid computing it twice.
+    Every other call site omits it, so `df_ind is None` and this function
+    computes it exactly as it always has — behavior for those callers is
+    100% unchanged.
+    """
     if len(df) < MIN_BARS:
         return _NONE
 
-    df_ind = compute_indicators(df.copy())
+    if df_ind is None:
+        df_ind = compute_indicators(df.copy())   # exactly the old behavior
     df_clean = df_ind.dropna(subset=["SMA44", "MACD", "Signal", "ATR14"]).copy()
 
     if len(df_clean) < 2:
