@@ -324,6 +324,18 @@ def _is_static_asset(path: str) -> bool:
     return bool(path and os.path.isfile(os.path.join(STATIC_DIR, path)))
 
 
+def _auth_required() -> bool:
+    """
+    Sign-in is required by default. Set AUTH_REQUIRED=false (also 0/no/off) to
+    let anonymous clients make read-only (GET/HEAD) API calls — used while the
+    mobile app runs without its login gate. Writes and scan-triggering POSTs
+    still require a session regardless of this flag.
+    """
+    return os.environ.get("AUTH_REQUIRED", "true").strip().lower() not in {
+        "0", "false", "no", "off",
+    }
+
+
 @app.before_request
 def _require_authentication():
     if request.method == "OPTIONS":
@@ -331,6 +343,8 @@ def _require_authentication():
     if request.path in _AUTH_PUBLIC_API:
         return None
     if request.path.startswith("/assets/") or _is_static_asset(request.path.lstrip("/")):
+        return None
+    if not _auth_required() and request.method in ("GET", "HEAD"):
         return None
     if _is_authenticated():
         return None
