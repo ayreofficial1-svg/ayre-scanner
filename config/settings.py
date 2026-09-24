@@ -224,6 +224,15 @@ BREADTH_CHECK_MINUTE = 45
 # donut until the next hourly slot.
 BREADTH_FULL_FILE = "breadth_full.json"
 
+# ── End-of-session closing snapshot ✅ ─────────────────────────────────────────
+# The last full reading of the index board, movers, index constituents,
+# advance/decline counts and signal prices. Refreshed once a minute while the
+# market is open and finalised shortly after the 15:30 IST close (see
+# main.py::_close_snapshot_loop), then served untouched until the next session
+# so the app keeps showing the closing values instead of an empty state.
+# Persisted so a restart after the close doesn't lose them.
+MARKET_CLOSE_FILE = "market_close.json"
+
 # ── Push notifications (Firebase Cloud Messaging) ✅ ───────────────────────────
 # Device registry for the mobile app. Same single-JSON-file pattern as the
 # other app_*.json stores.

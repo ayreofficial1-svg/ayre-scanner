@@ -38,6 +38,8 @@ watchlist.json
 alert_log.json
 universe_stats.json
 breadth_full.json
+market_close.json
+market_close.json.tmp
 
 # Consumer-app content (edited from the website, lives on the server)
 app_signals.json

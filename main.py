@@ -87,6 +87,7 @@ from data.app_insights import load_insights, add_insight, update_insight, delete
 from data.app_sentiment import load_sentiment, save_sentiment
 from data.universe_stats import load_universe_stats, save_universe_stats
 from data.breadth import load_full_breadth, save_full_breadth
+from data.market_close import load_close_snapshot, save_close_snapshot
 from config.settings import APP_ASSET_DIR
 
 try:
@@ -171,6 +172,30 @@ _breadth_full_cache : dict | None = None
 _MARKET_OPEN  = datetime.time(9,  15)
 _MARKET_CLOSE = datetime.time(15, 30)
 _POST_CLOSE_PASSIVE_START = datetime.time(16, 0)
+
+# ── End-of-session index close ───────────────────────────────────────────────
+# The Fyers WebSocket is shut down after the close, and every live market
+# endpoint is fed by it — so without a saved copy the app would have nothing to
+# show overnight, at weekends or on holidays. _close_snapshot_loop() keeps one
+# snapshot of the last reading: refreshed every _CLOSE_SNAPSHOT_INTERVAL_SECONDS
+# during the session, then the INDEX values are read again at 15:30:00 IST — the
+# bell — and once more _CLOSE_INDEX_SETTLE_SECONDS later to pick up any final
+# tick that arrives just after it. That is the number users see as the day's
+# close, until the next session.
+#
+# This is a read of ticks the WebSocket has already delivered: no REST call, no
+# extra Fyers request and no scan. Movers, constituents and the Insights charts
+# are NOT re-collected at the close; they keep the last reading they already had
+# (the last minute of the session for the live lists, the last scanner run for
+# the Insights charts). See data/market_close.py for the file shape.
+_CLOSE_SNAPSHOT_INTERVAL_SECONDS = 60
+_CLOSE_INDEX_SETTLE_SECONDS      = 30                     # re-read after the bell (0 = off)
+_CLOSE_CAPTURE_DEADLINE          = datetime.time(15, 45)  # give up + keep last reading
+
+_close_lock: threading.Lock = threading.Lock()
+_close_snapshot: dict | None = None
+_close_index_captured_for: datetime.date | None = None  # bell reading taken for this date
+_close_capture_done_for: datetime.date | None = None    # settle re-read done for this date
 
 # Free-source market-status checks are cached separately from price snapshots.
 # The short active-window TTL lets the app notice market-open transitions without
@@ -670,6 +695,7 @@ def api_status():
         "logs_days"       : summary["days_logged"],
         "next_scan"       : _state.get("next_scan_time"),
         "next_passive_check": _state.get("next_passive_check_time"),
+        "close_snapshot"  : _close_snapshot_summary(),
         "total_scanned"   : _state["total_scanned"],
         "total_attempted" : _state["total_attempted"],
         "memory_mb"       : mem_mb,
@@ -734,6 +760,11 @@ def _get_movers_payload() -> dict:
     polling never re-derives on every request.
     """
     now = time.time()
+    if _market_is_closed_now():
+        closed = _closing_movers_payload()
+        if closed is not None:
+            return closed
+
     if _fyers_market_data_allowed():
         try:
             live = _fyers_stream.movers()
@@ -758,6 +789,13 @@ def _get_movers_payload() -> dict:
     # De-duplicate by symbol (a stock can appear in more than one index).
     by_symbol = {s["symbol"]: s for s in rows if s.get("symbol")}
     rows = list(by_symbol.values())
+
+    if not rows:
+        # No priced stocks from any source — show the last saved reading
+        # rather than three empty lists.
+        closed = _closing_movers_payload()
+        if closed is not None:
+            return closed
 
     gainers = sorted(rows, key=lambda r: r["change_pct"], reverse=True)[:10]
     losers  = sorted(rows, key=lambda r: r["change_pct"])[:10]
@@ -784,6 +822,7 @@ def api_market_gainers():
         "stocks"     : payload["gainers"],
         "source"     : payload["source"],
         "updated_at" : payload["updated_at"],
+        "market_closed": payload.get("market_closed", False),
     })
 
 
@@ -795,6 +834,7 @@ def api_market_losers():
         "stocks"     : payload["losers"],
         "source"     : payload["source"],
         "updated_at" : payload["updated_at"],
+        "market_closed": payload.get("market_closed", False),
     })
 
 
@@ -806,6 +846,7 @@ def api_market_most_active():
         "stocks"     : payload["most_active"],
         "source"     : payload["source"],
         "updated_at" : payload["updated_at"],
+        "market_closed": payload.get("market_closed", False),
     })
 
 
@@ -1199,6 +1240,10 @@ def api_sentiment():
         live_breadth = None
     if live_breadth:
         data = {**data, **live_breadth}
+    elif _market_is_closed_now():
+        closing_breadth = _closing_breadth()
+        if closing_breadth:
+            data = {**data, **closing_breadth}
     return jsonify(data)
 
 
@@ -1920,7 +1965,9 @@ def _start_fyers_stream_poller(check_interval_seconds: int = 30) -> None:
                         _fyers_stream.start(f"{FYERS_APP_ID_FULL}:{token}")
                         started_for_token = token
                         print("   🔌 Fyers live market WebSocket (re)started.")
-                elif started_for_token is not None:
+                elif started_for_token is not None and not _close_window_holds_stream():
+                    # (kept open through the close window so the final ticks
+                    # are received — see _close_window_holds_stream)
                     _fyers_stream.stop()
                     started_for_token = None
                     print("   🔌 Fyers live market WebSocket stopped (market data not allowed).")
@@ -2195,6 +2242,298 @@ def _start_quotes_poller(interval_seconds: int = 15) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# End-of-session closing snapshot
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _market_is_closed_now() -> bool:
+    """
+    True when the exchange is definitely not trading: outside 09:15-15:30 IST,
+    or at the weekend. (A weekday *holiday* inside the window is not detected
+    here — that case keeps using the normal fallbacks, then the last snapshot.)
+    """
+    now = datetime.datetime.now(_IST)
+    return now.weekday() >= 5 or not (_MARKET_OPEN <= now.time() <= _MARKET_CLOSE)
+
+
+def _close_snapshot_get() -> dict | None:
+    with _close_lock:
+        return _close_snapshot
+
+
+def _closing_snapshot_is_for(day: datetime.date) -> bool:
+    snap = _close_snapshot_get()
+    return bool(snap) and snap.get("trade_date") == day.isoformat()
+
+
+def _store_close_snapshot(snapshot: dict) -> None:
+    """
+    Keep `snapshot` in memory and on disk. Never lets an older session, or an
+    intraday reading, replace a finalised close for the same day.
+    """
+    global _close_snapshot
+    snapshot = _json_safe(snapshot)
+    with _close_lock:
+        current = _close_snapshot
+        if current:
+            if snapshot["trade_date"] < current["trade_date"]:
+                return
+            if (
+                snapshot["trade_date"] == current["trade_date"]
+                and current.get("final")
+                and not snapshot.get("final")
+            ):
+                return
+        _close_snapshot = snapshot
+    try:
+        save_close_snapshot(snapshot)
+    except Exception as e:
+        print(f"   ⚠️  Could not save closing snapshot: {e}")
+
+
+def _read_index_board(today: datetime.date) -> list | None:
+    """
+    The three index rows from the live tick cache, or None unless all three
+    have ticked *today* — a stale cache from a previous session (or a holiday)
+    can never be mistaken for today's reading.
+
+    Deliberately ignores _fyers_market_data_allowed(): the tick cache is still
+    in memory just after the close, which is exactly when this runs. It only
+    reads memory — no network call of any kind.
+    """
+    last_tick = _fyers_stream.last_tick_at()
+    if last_tick is None:
+        return None
+    if datetime.datetime.fromtimestamp(last_tick, _IST).date() != today:
+        return None
+    try:
+        board = _fyers_stream.index_board(MARKETS, last_known=True)
+    except Exception:
+        return None
+    return board["markets"] if board else None
+
+
+def _build_close_snapshot(today: datetime.date) -> dict | None:
+    """An intraday reading of everything the live feed holds (memory only)."""
+    markets = _read_index_board(today)
+    if not markets:
+        return None
+
+    try:
+        movers = _fyers_stream.movers()
+    except Exception:
+        movers = None
+
+    constituents: dict[str, list] = {}
+    for market_cfg in MARKETS:
+        try:
+            rows = _fyers_stream.constituents(market_cfg["market_key"])
+        except Exception:
+            rows = None
+        if rows:
+            constituents[market_cfg["market_key"]] = rows
+
+    try:
+        breadth = _fyers_stream.breadth()
+    except Exception:
+        breadth = None
+
+    return {
+        "trade_date" : today.isoformat(),
+        "captured_at": datetime.datetime.now(_IST).isoformat(),
+        "final"      : False,
+        "markets"    : markets,
+        "movers"     : movers,
+        "constituents": constituents,
+        "breadth"    : breadth,
+    }
+
+
+def _capture_index_close(today: datetime.date) -> bool:
+    """
+    Refresh ONLY the index values in today's snapshot from the latest ticks and
+    mark it final. Everything else in the snapshot is left exactly as the last
+    intraday reading had it.
+    """
+    markets = _read_index_board(today)
+    if not markets:
+        return False
+    current = _close_snapshot_get()
+    if not current or current.get("trade_date") != today.isoformat():
+        return False
+    _store_close_snapshot({
+        **current,
+        "markets"    : markets,
+        "captured_at": datetime.datetime.now(_IST).isoformat(),
+        "final"      : True,
+    })
+    return True
+
+
+def _promote_last_reading_to_final(today: datetime.date) -> None:
+    """The live feed gave us nothing after the close — keep the last intraday
+    reading as the close rather than leaving today unfinalised."""
+    current = _close_snapshot_get()
+    if current and current.get("trade_date") == today.isoformat() and not current.get("final"):
+        _store_close_snapshot({**current, "final": True})
+        print("   🏁  No post-close ticks — last intraday reading kept as the close.")
+
+
+def _close_window_holds_stream() -> bool:
+    """
+    True from 15:30 until the index close has been taken, on a day that traded.
+    The Fyers socket is kept open through this brief window so the final index
+    ticks are received instead of being cut off the moment the market stops
+    being "open". Costs nothing: the socket is already connected.
+    """
+    now = datetime.datetime.now(_IST)
+    if now.weekday() >= 5:
+        return False
+    if not (_today_at(now, _MARKET_CLOSE) <= now <= _today_at(now, _CLOSE_CAPTURE_DEADLINE)):
+        return False
+    if _close_capture_done_for == now.date():
+        return False
+    return _closing_snapshot_is_for(now.date())
+
+
+def _close_snapshot_tick() -> float:
+    """One pass of the snapshot loop. Returns how many seconds to sleep."""
+    global _close_index_captured_for, _close_capture_done_for
+    now = datetime.datetime.now(_IST)
+    today = now.date()
+    if now.weekday() >= 5:
+        return 300.0
+    close_dt = _today_at(now, _MARKET_CLOSE)
+
+    # ── In session: keep the "last reading" fresh ───────────────────────────
+    if _is_market_open() and _fyers_market_data_allowed():
+        snapshot = _build_close_snapshot(today)
+        if snapshot is not None:
+            _store_close_snapshot(snapshot)
+        # Wake right at the bell rather than up to a minute after it.
+        to_bell = (close_dt - now).total_seconds()
+        if 0 < to_bell < _CLOSE_SNAPSHOT_INTERVAL_SECONDS:
+            return max(0.05, to_bell)
+        return float(_CLOSE_SNAPSHOT_INTERVAL_SECONDS)
+
+    # ── After the bell: index close, then leave it alone ────────────────────
+    if _close_capture_done_for == today:
+        return 60.0
+    current = _close_snapshot_get()
+    if current and current.get("trade_date") == today.isoformat() and current.get("final"):
+        _close_capture_done_for = today          # e.g. restarted after the close
+        return 60.0
+    if now < close_dt:
+        return 60.0
+    if not _closing_snapshot_is_for(today):
+        # Holiday, or the server only started after the close: nothing to finalise.
+        _close_capture_done_for = today
+        return 60.0
+
+    # (1) The bell reading: the latest index ticks, as close to 15:30:00 as the
+    #     loop can get. Saved at once so users never wait for the re-read below.
+    if _close_index_captured_for != today:
+        if _capture_index_close(today):
+            _close_index_captured_for = today
+            print(f"   🏁  Index close saved for {today.isoformat()} at "
+                  f"{datetime.datetime.now(_IST).strftime('%H:%M:%S')} IST.")
+        elif now >= _today_at(now, _CLOSE_CAPTURE_DEADLINE):
+            _promote_last_reading_to_final(today)
+            _close_capture_done_for = today
+            return 60.0
+        else:
+            return 5.0   # no usable ticks yet — try again shortly
+
+    # (2) One re-read a few seconds on, to pick up a final tick that lands just
+    #     after the bell. Index values only; harmless if it finds nothing new.
+    settle_at = close_dt + datetime.timedelta(seconds=_CLOSE_INDEX_SETTLE_SECONDS)
+    if now < settle_at:
+        return max(0.5, min(5.0, (settle_at - now).total_seconds()))
+    _capture_index_close(today)
+    _close_capture_done_for = today
+    return 60.0
+
+
+def _close_snapshot_loop() -> None:
+    """
+    Independent daemon thread (like the Fyers stream poller): it only reads the
+    in-memory tick cache and writes the snapshot file. It makes no network call
+    and never touches scanner state.
+    """
+    print(
+        f"🏁  Index-close loop started (reading every {_CLOSE_SNAPSHOT_INTERVAL_SECONDS}s "
+        f"in session; index close at {_MARKET_CLOSE.strftime('%H:%M')} IST "
+        f"+ {_CLOSE_INDEX_SETTLE_SECONDS}s re-read)"
+    )
+    while True:
+        sleep_for = 30.0
+        try:
+            sleep_for = _close_snapshot_tick()
+        except Exception as e:
+            print(f"   ⚠️  index-close loop error: {e}")
+        time.sleep(sleep_for)
+
+
+def _closing_board_payload() -> dict | None:
+    snap = _close_snapshot_get()
+    if not snap or not snap.get("markets"):
+        return None
+    return {
+        "markets"      : snap["markets"],
+        "source"       : "market_close",
+        "updated_at"   : snap["captured_at"],
+        "market_closed": _market_is_closed_now(),
+        "trade_date"   : snap["trade_date"],
+    }
+
+
+def _closing_movers_payload() -> dict | None:
+    snap = _close_snapshot_get()
+    movers = (snap or {}).get("movers") or {}
+    if not (movers.get("gainers") or movers.get("losers") or movers.get("most_active")):
+        return None
+    return {
+        "gainers"      : movers.get("gainers", []),
+        "losers"       : movers.get("losers", []),
+        "most_active"  : movers.get("most_active", []),
+        "source"       : "market_close",
+        "updated_at"   : snap["captured_at"],
+        "market_closed": _market_is_closed_now(),
+    }
+
+
+def _closing_constituents_payload(market_cfg: dict) -> dict | None:
+    snap = _close_snapshot_get()
+    rows = ((snap or {}).get("constituents") or {}).get(market_cfg["market_key"])
+    if not rows:
+        return None
+    return {
+        "market_key"   : market_cfg["market_key"],
+        "market_name"  : market_cfg["display_name"],
+        "count"        : len(rows),
+        "stocks"       : rows,
+        "source"       : "market_close",
+        "updated_at"   : snap["captured_at"],
+        "market_closed": _market_is_closed_now(),
+    }
+
+
+def _closing_breadth() -> dict | None:
+    snap = _close_snapshot_get()
+    return (snap or {}).get("breadth") or None
+
+
+def _close_snapshot_summary() -> dict | None:
+    snap = _close_snapshot_get()
+    if not snap:
+        return None
+    return {
+        "trade_date" : snap.get("trade_date"),
+        "captured_at": snap.get("captured_at"),
+        "final"      : bool(snap.get("final")),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Market snapshot — Nifty 50 + Sensex + Bank Nifty
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2208,6 +2547,14 @@ def _get_market_snapshot() -> dict:
     all three indices (e.g. just after startup/reconnect).
     """
     now = time.time()
+
+    # Market closed (evenings, overnight, pre-open, weekends): serve the saved
+    # closing values. They don't change until the next session, so there is
+    # nothing to fetch — and nothing that can fail and leave the board empty.
+    if _market_is_closed_now():
+        closed = _closing_board_payload()
+        if closed is not None:
+            return closed
 
     # Primary source: the live Fyers WebSocket — zero extra API calls, just
     # reads whatever the socket has already received, fresh every time.
@@ -2246,6 +2593,12 @@ def _get_market_snapshot() -> dict:
             return data
         except Exception:
             continue
+
+    # Every live source failed: the last saved reading beats a stale in-memory
+    # value, and far beats the made-up numbers below.
+    closed = _closing_board_payload()
+    if closed is not None:
+        return closed
 
     # Return stale cache before giving up
     with _market_lock:
@@ -2431,6 +2784,13 @@ def _get_constituents(market_cfg: dict) -> dict:
     market_key = market_cfg["market_key"]
     now        = time.time()
 
+    # Market closed: the saved closing rows (the NSE/REST fallback below has
+    # no prices at all once Fyers is switched off — Sensex especially).
+    if _market_is_closed_now():
+        closed = _closing_constituents_payload(market_cfg)
+        if closed is not None:
+            return closed
+
     # Primary source: live Fyers WebSocket ticks — always read fresh,
     # never cached. This is what makes the app show truly live numbers.
     if _fyers_market_data_allowed():
@@ -2471,6 +2831,12 @@ def _get_constituents(market_cfg: dict) -> dict:
             "updated_at" : datetime.datetime.now().isoformat(),
             "error"      : str(e),
         }
+
+    if not any(s.get("last_price") is not None for s in data.get("stocks", [])):
+        # Names but no prices from any source: last saved reading instead.
+        closed = _closing_constituents_payload(market_cfg)
+        if closed is not None:
+            return closed
 
     with _constituents_lock:
         _constituents_cache[market_key] = {
@@ -2789,7 +3155,7 @@ def _start_market_poller(interval_seconds: int = 5) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global _fyers, _symbols, _breadth_full_cache
+    global _fyers, _symbols, _breadth_full_cache, _close_snapshot
 
     parser = argparse.ArgumentParser(description="Nifty 500 Swing Trading Scanner")
     parser.add_argument("--verbose", action="store_true")
@@ -2815,6 +3181,7 @@ def main():
     _state["universe_stats"]       = loaded_stats["stats"]
     _state["universe_stats_as_of"] = loaded_stats["as_of"]
     _breadth_full_cache = load_full_breadth()
+    _close_snapshot     = load_close_snapshot()
 
     summary = get_log_summary()
     print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")
@@ -2843,6 +3210,7 @@ def main():
     _start_market_poller(interval_seconds=60)
     _start_quotes_poller(interval_seconds=15)
     _start_fyers_stream_poller(check_interval_seconds=30)
+    threading.Thread(target=_close_snapshot_loop, daemon=True, name="close-snapshot-loop").start()
 
     url = f"http://localhost:{args.port}"
     print(f"🌐  Opening {url} …")

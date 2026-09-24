@@ -201,15 +201,35 @@ class FyersMarketStream:
             self._last_tick_at = time.time()
 
     # ── read side (Flask request threads) ───────────────────────────────
+    def last_tick_at(self) -> float | None:
+        """
+        Unix time of the most recent tick received, or None if there has
+        never been one. Unlike is_ready() this does not care whether the
+        socket is still connected — the tick cache outlives stop(), which is
+        what lets main.py take the end-of-session snapshot just after the
+        close.
+        """
+        with self._lock:
+            return self._last_tick_at
+
     def index_board(
-        self, markets: list[dict], max_age_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
+        self,
+        markets: list[dict],
+        max_age_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
+        last_known: bool = False,
     ) -> dict | None:
         """
         /api/market payload shape, built entirely from live ticks.
         Returns None if any of the 3 indices hasn't ticked yet (or is
         stale) — caller should fall back to the REST waterfall.
+
+        last_known=True skips the connected-and-fresh check and reads
+        whatever the tick cache last held. Used only for the end-of-session
+        snapshot (main.py::_build_close_snapshot), where "the final tick we
+        received" is exactly what is wanted even though the feed has gone
+        quiet because the market is closed.
         """
-        if not self.is_ready(max_age_seconds):
+        if not last_known and not self.is_ready(max_age_seconds):
             return None
 
         with self._lock:
