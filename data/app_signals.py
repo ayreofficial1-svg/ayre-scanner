@@ -64,6 +64,12 @@ def _is_visible(entry: dict, now: datetime.datetime | None = None) -> bool:
     return True
 
 
+# Public alias — main.py's push logic needs the same visibility rule the
+# consumer feed uses, so there is exactly one definition of "live".
+def is_visible(entry: dict, now: datetime.datetime | None = None) -> bool:
+    return _is_visible(entry, now)
+
+
 def _normalize_signal(entry: dict) -> dict:
     active = bool(entry.get("active", entry.get("enabled", True)))
     return {
@@ -172,3 +178,40 @@ def delete_signal(signal_id: str) -> bool:
         return False
     save_signals(signals)
     return True
+
+
+def set_push_state(
+    signal_id: str,
+    *,
+    sent: bool | None = None,
+    pending: bool | None = None,
+) -> None:
+    """
+    Record push-notification bookkeeping on a signal:
+
+      push_sent_at  — set once the "new signal" push has gone out, so an edit
+                      or re-save can never announce the same pick twice.
+      push_pending  — the signal is enabled but scheduled for later
+                      (start_at in the future); the push loop in main.py
+                      sends it the moment it goes live.
+
+    Deliberately does NOT touch updated_at: this is bookkeeping, not an edit,
+    and bumping it would reorder the feed.
+    """
+    signals = load_signals()
+    for idx, signal in enumerate(signals):
+        if signal.get("id") != signal_id:
+            continue
+        updated = dict(signal)
+        if sent is not None:
+            if sent:
+                updated["push_sent_at"] = _now_iso()
+                updated["push_pending"] = False
+            else:
+                updated.pop("push_sent_at", None)
+        if pending is not None:
+            updated["push_pending"] = bool(pending)
+        signals[idx] = _normalize_signal(updated)
+        save_signals(signals)
+        return
+

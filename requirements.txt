@@ -10,3 +10,4 @@ plyer>=2.1.0
 python-dotenv>=1.0.0
 flask>=3.0.0
 flask-cors>=6.0.2
+firebase-admin>=6.5.0

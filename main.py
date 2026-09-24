@@ -74,7 +74,14 @@ from scanner.engine import run_scan
 from scanner.historical import run_historical_scan
 from utils.logger import get_log_summary
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk, fetch_full_market_breadth
-from data.app_signals import load_signals, add_signal, update_signal, delete_signal
+from data.app_signals import (
+    load_signals, add_signal, update_signal, delete_signal,
+    is_visible as _signal_is_visible, set_push_state,
+)
+from data.app_devices import (
+    register_device, unregister_device, device_count,
+)
+from alerts import push as push_alerts
 from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
 from data.app_insights import load_insights, add_insight, update_insight, delete_insight
 from data.app_sentiment import load_sentiment, save_sentiment
@@ -252,6 +259,12 @@ _AUTH_PUBLIC_API = {
     "/api/auth/login",
     "/api/auth/logout",
     "/api/auth/session",
+    # Push-token registration. Public by necessity: the mobile app currently
+    # runs without its login gate, so a device has no session to present.
+    # All it can do is add/remove its own FCM token (validated and capped in
+    # data/app_devices.py); it cannot read anything or trigger a send.
+    "/api/devices/register",
+    "/api/devices/unregister",
 }
 
 
@@ -994,9 +1007,14 @@ def api_signals_add():
 
     fields = _content_fields(payload)
     if signal_id:
+        previous = next(
+            (s for s in load_signals() if s.get("id") == str(signal_id)), None
+        )
+        was_visible = bool(previous and _signal_is_visible(previous))
         entry = update_signal(str(signal_id), symbol=symbol, rationale=rationale, **fields)
         if entry is None:
             return jsonify({"error": "Signal not found"}), 404
+        _push_signal_if_due(entry, was_visible=was_visible)
         return jsonify({"signal": entry})
 
     entry = add_signal(
@@ -1005,6 +1023,7 @@ def api_signals_add():
         added_by=session.get("username"),
         **fields,
     )
+    _push_signal_if_due(entry, was_visible=False)
     return jsonify({"signal": entry}), 201
 
 
@@ -1022,6 +1041,127 @@ def api_signals_delete(signal_id: str):
     if not removed:
         return jsonify({"error": "Signal not found (or already inactive)"}), 404
     return jsonify({"deleted": True, "id": signal_id})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer app: push notifications (FCM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _push_signal_if_due(entry: dict, was_visible: bool) -> None:
+    """
+    Announce an admin-published signal on the users' phones — exactly once.
+
+    Called after the signal endpoints save a signal. `was_visible` is whether
+    the signal was already live *before* this save (always False for a brand
+    new one), which is what separates "just published" from "an admin fixed a
+    typo in a signal that has been live for weeks".
+
+      • already announced (push_sent_at)      → nothing
+      • live now, and newly so                 → push, then record it
+      • enabled but scheduled (start_at later) → mark pending; the loop below
+                                                 sends it when it goes live
+    """
+    try:
+        signal_id = entry.get("id")
+        if not signal_id or entry.get("push_sent_at"):
+            return
+        if not entry.get("enabled", True):
+            return
+        if not push_alerts.is_configured():
+            return      # nothing was sent, so don't record it as sent
+        if _signal_is_visible(entry):
+            if was_visible and not entry.get("push_pending"):
+                return
+            push_alerts.notify_new_signal(entry)
+            set_push_state(signal_id, sent=True)
+        elif entry.get("start_at"):
+            set_push_state(signal_id, pending=True)
+    except Exception as e:      # a push problem must never fail a publish
+        print(f"   ⚠️   Push: could not process signal — {e}")
+
+
+def _push_pending_loop() -> None:
+    """Send the push for scheduled signals once their start_at passes."""
+    while True:
+        time.sleep(60)
+        try:
+            if not push_alerts.is_configured():
+                continue
+            for signal in load_signals():
+                if (
+                    signal.get("push_pending")
+                    and not signal.get("push_sent_at")
+                    and _signal_is_visible(signal)
+                ):
+                    push_alerts.notify_new_signal(signal)
+                    set_push_state(signal["id"], sent=True)
+        except Exception as e:
+            print(f"   ⚠️   Push: pending-signal check failed — {e}")
+
+
+@app.route("/api/devices/register", methods=["POST"])
+def api_devices_register():
+    """
+    Called by the mobile app whenever it obtains (or refreshes) its FCM token,
+    and again when the user changes a notification preference.
+
+    Body: {"token": "...", "platform": "android"|"ios",
+           "signals": true, "app_version": "2.0.0"}
+    """
+    payload = request.get_json(silent=True) or {}
+    entry = register_device(
+        token=str(payload.get("token") or ""),
+        platform=str(payload.get("platform") or ""),
+        signals=payload.get("signals", True) is not False,
+        app_version=payload.get("app_version"),
+    )
+    if entry is None:
+        return jsonify({"error": "Invalid token, or device limit reached"}), 400
+    return jsonify({"registered": True})
+
+
+@app.route("/api/devices/unregister", methods=["POST"])
+def api_devices_unregister():
+    """Called when the user switches push off in Settings."""
+    payload = request.get_json(silent=True) or {}
+    unregister_device(str(payload.get("token") or ""))
+    return jsonify({"registered": False})
+
+
+@app.route("/api/push/status", methods=["GET"])
+def api_push_status():
+    """Website-only. Is push set up, and how many phones would receive it?"""
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    return jsonify({
+        "configured": push_alerts.is_configured(),
+        "devices"   : device_count(),
+    })
+
+
+@app.route("/api/push/send", methods=["POST"])
+def api_push_send():
+    """
+    Website-only. Send a custom notification to every registered phone — also
+    the quickest way to test the whole chain end to end.
+    Body: {"title": "...", "body": "..."}
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    if not push_alerts.is_configured():
+        return jsonify({
+            "error": "Push is not configured. Set FIREBASE_SERVICE_ACCOUNT_JSON "
+                     "(and install firebase-admin) on the server.",
+        }), 503
+
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title") or "").strip()
+    body  = str(payload.get("body") or "").strip()
+    if not title or not body:
+        return jsonify({"error": "title and body are required"}), 400
+
+    push_alerts.broadcast(title, body)
+    return jsonify({"queued": True, "devices": device_count()}), 202
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2693,6 +2833,12 @@ def main():
         f"({breadth_slot_labels[0]}–{breadth_slot_labels[-1]} IST via {', '.join(breadth_slot_labels)}) …"
     )
     threading.Thread(target=_breadth_loop, daemon=True, name="breadth-loop").start()
+
+    if push_alerts.is_configured():
+        print("🔔  Push notifications enabled (FCM)")
+    else:
+        print("🔕  Push notifications off — set FIREBASE_SERVICE_ACCOUNT_JSON to enable")
+    threading.Thread(target=_push_pending_loop, daemon=True, name="push-pending-loop").start()
 
     _start_market_poller(interval_seconds=60)
     _start_quotes_poller(interval_seconds=15)

@@ -223,3 +223,29 @@ BREADTH_CHECK_MINUTE = 45
 # GET /api/breadth/full. Persisted so a restart doesn't blank the Home
 # donut until the next hourly slot.
 BREADTH_FULL_FILE = "breadth_full.json"
+
+# ── Push notifications (Firebase Cloud Messaging) ✅ ───────────────────────────
+# Device registry for the mobile app. Same single-JSON-file pattern as the
+# other app_*.json stores.
+APP_DEVICES_FILE = "app_devices.json"
+
+# Credentials for the Firebase Admin SDK. Provide ONE of these in the
+# environment (Railway → Variables):
+#   FIREBASE_SERVICE_ACCOUNT_JSON    the service-account key file's full JSON text
+#   FIREBASE_SERVICE_ACCOUNT_BASE64  the same JSON, base64-encoded (use this if
+#                                    your host mangles multi-line values)
+#   GOOGLE_APPLICATION_CREDENTIALS   path to the key file on disk
+# With none of them set, push is simply disabled — every other feature keeps
+# working and signal creation never fails because of it.
+FIREBASE_SERVICE_ACCOUNT_JSON   = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+FIREBASE_SERVICE_ACCOUNT_BASE64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_BASE64", "")
+
+# Android notification channel the app creates at startup (see MainActivity.kt).
+# Must match on both sides or Android silently drops to a low-priority channel.
+PUSH_ANDROID_CHANNEL_ID = "ayre_signals"
+
+# Hard cap on stored device tokens — the registration endpoint is anonymous
+# (the app runs without its login gate), so it must not be able to grow the
+# file without bound.
+PUSH_MAX_DEVICES = 50000
+
