@@ -153,10 +153,11 @@ ALERT_LOG_FILE = "alert_log.json"
 SIGNAL_LOG_DIR = "logs"
 
 # ── Consumer app: admin-curated signals, learn content, insights ─────────────
-APP_SIGNALS_FILE   = "app_signals.json"
-APP_LEARN_FILE     = "app_learn.json"
-APP_INSIGHTS_FILE  = "app_insights.json"
-APP_ASSET_DIR      = "static/uploads"
+APP_SIGNALS_FILE       = "app_signals.json"
+APP_LEARN_FILE         = "app_learn.json"
+APP_INSIGHTS_FILE      = "app_insights.json"
+APP_WEEKLY_REPORT_FILE = "app_weekly_report.json"
+APP_ASSET_DIR          = "static/uploads"
 # Sentiment is computed automatically from Nifty-500 breadth as of Phase 2
 # (see data/app_sentiment.py) — APP_SENTIMENT_FILE/APP_SENTIMENT_DEFAULT (the
 # old hand-set-value file and its placeholder score) are retired; nothing

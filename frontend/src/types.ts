@@ -107,6 +107,28 @@ export interface InsightContent {
   updated_at: string
 }
 
+// Exactly two spellings, matching data/app_weekly_report.py's VALID_OUTCOMES
+// and main.py's POST /api/weekly-report validation — the backend rejects
+// anything else with 400, so this union is the full set, not illustrative.
+export type WeeklyReportOutcome = 'target' | 'stop_loss'
+
+export interface WeeklyReportStock {
+  symbol: string
+  profit_pct: number
+  outcome: WeeklyReportOutcome
+}
+
+export interface WeeklyReport {
+  id: string
+  week_start: string
+  week_end: string
+  stocks: WeeklyReportStock[]
+  enabled?: boolean
+  display_order?: number
+  created_at: string
+  updated_at: string
+}
+
 export type DebugStatus = 'signal' | 'watchlist' | 'none' | 'error' | string
 
 export interface BacktestDebugResult {

@@ -8,9 +8,8 @@ import WatchlistTable from './components/WatchlistTable'
 import SignalsPanel from './components/SignalsPanel'
 import MarketInsightPanel from './components/MarketInsightPanel'
 import LearnPanel from './components/LearnPanel'
+import WeeklyReportPanel from './components/WeeklyReportPanel'
 
-// NOTE: 'weeklyReport' is reserved for Phase 4 (Weekly Report tab) — see
-// IMPLEMENTATION_SPEC_weekly_report_and_sentiment.md. Not wired up yet.
 type View = 'scanner' | 'backtest' | 'signals' | 'insights' | 'learn' | 'weeklyReport'
 type AuthState = 'checking' | 'authenticated' | 'login'
 type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none'
@@ -444,6 +443,7 @@ export default function App() {
             <button className={view === 'signals'   ? 'active' : ''} onClick={() => setView('signals')}>Signals</button>
             <button className={view === 'insights' ? 'active' : ''} onClick={() => setView('insights')}>Market Insight</button>
             <button className={view === 'learn'     ? 'active' : ''} onClick={() => setView('learn')}>Learn</button>
+            <button className={view === 'weeklyReport' ? 'active' : ''} onClick={() => setView('weeklyReport')}>Weekly Report</button>
           </nav>
 
           {(view === 'scanner' || view === 'backtest') && (
@@ -457,7 +457,7 @@ export default function App() {
         {view === 'signals' && <SignalsPanel />}
         {view === 'insights' && <MarketInsightPanel />}
         {view === 'learn' && <LearnPanel />}
-        {/* 'weeklyReport' tab/button intentionally not added yet — Phase 4 */}
+        {view === 'weeklyReport' && <WeeklyReportPanel />}
 
         {view === 'backtest' && (
           <form className="debug-form" onSubmit={submitBacktest}>

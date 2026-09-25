@@ -84,6 +84,7 @@ from data.app_devices import (
 from alerts import push as push_alerts
 from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
 from data.app_insights import load_insights, add_insight, update_insight, delete_insight
+from data.app_weekly_report import load_reports, add_report, update_report, delete_report
 from data.app_sentiment import compute_sentiment
 from data.universe_stats import load_universe_stats, save_universe_stats
 from data.breadth import load_full_breadth, save_full_breadth
@@ -1486,6 +1487,129 @@ def api_learn_delete(article_id: str):
     if not removed:
         return jsonify({"error": "Article not found"}), 404
     return jsonify({"deleted": True, "id": article_id})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer app: Weekly Report (admin-entered historical performance)
+#
+# Admin-entered, not computed — there is no code anywhere in this repo that
+# watches a fired signal afterwards to determine whether price later hit a
+# target or a stop loss (see IMPLEMENTATION_SPEC_weekly_report_and_
+# sentiment.md §A.4). The owner enters the week, its stocks, profit %, and
+# outcome by hand on the website; these three routes just store and serve
+# that, following the exact same GET/POST/DELETE shape as /api/learn.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/weekly-report", methods=["GET"])
+def api_weekly_report_list():
+    """
+    List of weekly performance reports, newest week first. Hidden reports
+    (enabled=false) are excluded unless ?all=1 is passed by an admin
+    session — same convention as /api/learn and /api/insights.
+
+    Response shape
+    ──────────────
+    {
+        "reports": [
+            { "id": "...", "week_start": "2026-09-06", "week_end": "2026-09-12",
+              "enabled": true,
+              "stocks": [ { "symbol": "RELIANCE", "profit_pct": 4.2,
+                            "outcome": "target" } ],
+              "created_at": "...", "updated_at": "..." },
+            ...
+        ]
+    }
+    """
+    include_hidden = request.args.get("all") == "1" and _is_admin()
+    return jsonify({"reports": load_reports(enabled_only=not include_hidden)})
+
+
+@app.route("/api/weekly-report", methods=["POST"])
+def api_weekly_report_add():
+    """
+    Website-only. Body: {"week_start": "2026-09-06", "week_end": "2026-09-12",
+    "stocks": [{"symbol": "RELIANCE", "profit_pct": 4.2, "outcome": "target"}]}.
+    Pass "id" in the body to edit an existing report instead of creating one
+    (same convention /api/learn uses to distinguish create vs. update).
+
+    The full "stocks" list replaces whatever was previously stored for that
+    report on every save — simplest, and matches how
+    app_signals.py::save_signals persists its whole list at once, rather
+    than supporting incremental "add one row" edits.
+
+    Each row's "outcome" must be exactly "target" or "stop_loss" — no other
+    spelling accepted, so the value means the same thing in the backend,
+    the website, and (Phase 5) the Flutter app. Invalid rows reject the
+    whole save with 400 rather than silently dropping or reinterpreting one
+    row, since this is a small admin-entered form, not a bulk import.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    payload    = request.get_json(silent=True) or {}
+    report_id  = payload.get("id")
+    week_start = str(payload.get("week_start") or "").strip()
+    week_end   = str(payload.get("week_end") or "").strip()
+    raw_stocks = payload.get("stocks")
+
+    if not week_start or not week_end:
+        return jsonify({"error": "week_start and week_end are required"}), 400
+    if not isinstance(raw_stocks, list) or not raw_stocks:
+        return jsonify({"error": "at least one stock row is required"}), 400
+
+    stocks = []
+    for row in raw_stocks:
+        if not isinstance(row, dict):
+            return jsonify({"error": "each stock row must be an object"}), 400
+        symbol  = str(row.get("symbol") or "").strip().upper()
+        outcome = str(row.get("outcome") or "").strip().lower()
+        if not symbol:
+            return jsonify({"error": "each stock row needs a symbol"}), 400
+        if outcome not in ("target", "stop_loss"):
+            return jsonify({
+                "error": f"invalid outcome for {symbol}: must be 'target' or 'stop_loss'"
+            }), 400
+        try:
+            profit_pct = float(row.get("profit_pct"))
+        except (TypeError, ValueError):
+            return jsonify({"error": f"invalid profit_pct for {symbol}"}), 400
+        stocks.append({"symbol": symbol, "profit_pct": profit_pct, "outcome": outcome})
+
+    if report_id:
+        updated = update_report(
+            str(report_id),
+            week_start,
+            week_end,
+            stocks,
+            **_content_fields(payload),
+        )
+        if updated is None:
+            return jsonify({"error": "Report not found"}), 404
+        return jsonify({"report": updated})
+
+    entry = add_report(
+        week_start=week_start,
+        week_end=week_end,
+        stocks=stocks,
+        **_content_fields(payload),
+    )
+    return jsonify({"report": entry}), 201
+
+
+@app.route("/api/weekly-report/<string:report_id>", methods=["DELETE"])
+def api_weekly_report_delete(report_id: str):
+    """
+    Admin-only. Soft-deletes: sets enabled=false rather than removing the
+    entry, so past weekly performance records stay in history (same
+    convention app_signals.py's DELETE uses) — GET /api/weekly-report
+    (without ?all=1) simply stops returning it.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    removed = delete_report(report_id)
+    if not removed:
+        return jsonify({"error": "Report not found"}), 404
+    return jsonify({"deleted": True, "id": report_id})
 
 
 # ── React catch-all (serves index.html for all non-API routes) ───────────────
