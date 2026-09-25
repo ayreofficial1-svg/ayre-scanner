@@ -62,12 +62,6 @@ export interface SignalPick {
   change_pct?: number | null
 }
 
-export interface SentimentData {
-  sentiment: number | null
-  updated_at: string | null
-  note?: string | null
-}
-
 export interface LearnArticle {
   id: string
   title: string

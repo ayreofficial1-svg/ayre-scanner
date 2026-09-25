@@ -8,11 +8,13 @@ import type { InsightContent } from '../types'
 // Formerly the second half of SentimentPanel.tsx (the "Insights" CRUD form).
 // Split out and renamed in Phase 1 of IMPLEMENTATION_SPEC_weekly_report_and_
 // sentiment.md: this manages the content cards that power the Home tab's
-// "Market Insight" hero carousel (AyreInsightCarousel in the Flutter app) —
-// NOT the tab-local "Desk notes" section that used to also render the same
-// data on the Insights tab (that duplicate render was removed from the app;
-// the underlying data/endpoint stays, because the Home tab carousel still
-// depends on it).
+// "Market Insight" hero carousel (AyreInsightCarousel in the Flutter app).
+//
+// Note: the same /api/insights data is ALSO still rendered as a second,
+// separate "Desk notes" section on the Flutter app's own Insights tab
+// (insights_tab.dart). That duplicate on-screen section was deliberately
+// left in place (not removed) — see the implementation spec's Phase 1 log —
+// so editing content here updates both surfaces at once.
 //
 // The manual 0-100 sentiment number form that used to live alongside this in
 // SentimentPanel.tsx has been removed outright — GET/POST /api/sentiment's
