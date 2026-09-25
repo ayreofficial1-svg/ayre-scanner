@@ -152,13 +152,15 @@ WATCHLIST_FILE = "watchlist.json"
 ALERT_LOG_FILE = "alert_log.json"
 SIGNAL_LOG_DIR = "logs"
 
-# ── Consumer app: admin-curated signals, learn content, sentiment ────────────
+# ── Consumer app: admin-curated signals, learn content, insights ─────────────
 APP_SIGNALS_FILE   = "app_signals.json"
 APP_LEARN_FILE     = "app_learn.json"
 APP_INSIGHTS_FILE  = "app_insights.json"
-APP_SENTIMENT_FILE = "app_sentiment.json"
 APP_ASSET_DIR      = "static/uploads"
-APP_SENTIMENT_DEFAULT = 65  # 0-100 placeholder until a real formula is defined
+# Sentiment is computed automatically from Nifty-500 breadth as of Phase 2
+# (see data/app_sentiment.py) — APP_SENTIMENT_FILE/APP_SENTIMENT_DEFAULT (the
+# old hand-set-value file and its placeholder score) are retired; nothing
+# else in the repo referenced them (verified by repo-wide search).
 
 # Optional: restrict POST/DELETE on /api/signals and /api/learn to a subset of
 # SCANNER_USERS. Comma-separated usernames, e.g. "raghav,admin".

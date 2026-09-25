@@ -84,7 +84,7 @@ from data.app_devices import (
 from alerts import push as push_alerts
 from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
 from data.app_insights import load_insights, add_insight, update_insight, delete_insight
-from data.app_sentiment import load_sentiment
+from data.app_sentiment import compute_sentiment
 from data.universe_stats import load_universe_stats, save_universe_stats
 from data.breadth import load_full_breadth, save_full_breadth
 from data.market_close import load_close_snapshot, save_close_snapshot
@@ -1212,30 +1212,42 @@ def api_push_send():
 @app.route("/api/sentiment", methods=["GET"])
 def api_sentiment():
     """
-    Sentiment gauge value (0-100, currently read from a stored file via
-    data/app_sentiment.py::load_sentiment — the manual POST write path has
-    been removed; automatic computation lands in a later phase)
-    plus, when the live Fyers feed has ticked enough stocks, real
-    advances/declines/unchanged counted across the full tracked universe
-    (Nifty 50 + Sensex 30 + Bank Nifty, deduplicated).
+    Sentiment gauge value (0-100), computed live from the cached full
+    Nifty-500 breadth snapshot via data/app_sentiment.py::compute_sentiment
+    — see that module's docstring for the formula. This reads the same
+    in-memory `_breadth_full_cache` GET /api/breadth/full serves, so this
+    route makes no Fyers call and no disk read of its own; the manual
+    admin-set value (formerly load_sentiment/save_sentiment) was retired
+    in Phase 1/2.
+
+    Also merges in, when the live Fyers feed has ticked enough stocks,
+    real advances/declines/unchanged counted across the full tracked
+    universe (Nifty 50 + Sensex 30 + Bank Nifty, deduplicated) — this is a
+    smaller, different universe from the Nifty-500 breadth the score
+    itself is computed from, and is included purely as supplementary
+    display data, exactly as before.
 
     Response shape
     ──────────────
     {
-        "sentiment" : 65,
-        "updated_at": "<ISO timestamp>" | null,
-        "note"      : "..." | null,
+        "sentiment" : 65 | null,
+        "updated_at": "<as_of timestamp>" | null,
+        "note"      : "312 of 490 stocks advancing" | null,
         "advances"  : 312 | absent,
         "declines"  : 178 | absent,
         "unchanged" : 10  | absent
     }
 
+    sentiment/updated_at/note are null together when there's no breadth
+    snapshot yet or coverage is too thin to trust (see compute_sentiment).
     advances/declines/unchanged are omitted entirely (not null) until the
     live WebSocket has enough data — the Flutter app already falls back to
     its own locally-computed breadth in that case, so omitting rather than
     sending nulls/zeros avoids it briefly showing "0 advances".
     """
-    data = load_sentiment()
+    with _breadth_full_lock:
+        breadth_snapshot = dict(_breadth_full_cache) if _breadth_full_cache else None
+    data = compute_sentiment(breadth_snapshot)
     try:
         live_breadth = _fyers_stream.breadth()
     except Exception:
