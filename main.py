@@ -84,7 +84,7 @@ from data.app_devices import (
 from alerts import push as push_alerts
 from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
 from data.app_insights import load_insights, add_insight, update_insight, delete_insight
-from data.app_sentiment import load_sentiment, save_sentiment
+from data.app_sentiment import load_sentiment
 from data.universe_stats import load_universe_stats, save_universe_stats
 from data.breadth import load_full_breadth, save_full_breadth
 from data.market_close import load_close_snapshot, save_close_snapshot
@@ -1212,7 +1212,9 @@ def api_push_send():
 @app.route("/api/sentiment", methods=["GET"])
 def api_sentiment():
     """
-    Sentiment gauge value (0-100, still hand-set — see data/app_sentiment.py)
+    Sentiment gauge value (0-100, currently read from a stored file via
+    data/app_sentiment.py::load_sentiment — the manual POST write path has
+    been removed; automatic computation lands in a later phase)
     plus, when the live Fyers feed has ticked enough stocks, real
     advances/declines/unchanged counted across the full tracked universe
     (Nifty 50 + Sensex 30 + Bank Nifty, deduplicated).
@@ -1244,30 +1246,6 @@ def api_sentiment():
         closing_breadth = _closing_breadth()
         if closing_breadth:
             data = {**data, **closing_breadth}
-    return jsonify(data)
-
-
-@app.route("/api/sentiment", methods=["POST"])
-def api_sentiment_set():
-    """
-    Website-only. Manually set the sentiment value.
-    Body: {"value": 65, "note": "optional short note"}
-    """
-    if not _is_admin():
-        return jsonify({"error": "Admin access required"}), 403
-
-    payload = request.get_json(silent=True) or {}
-    raw_value = payload.get("value")
-    note = payload.get("note")
-
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        return jsonify({"error": "value must be an integer between 0 and 100"}), 400
-    if not (0 <= value <= 100):
-        return jsonify({"error": "value must be an integer between 0 and 100"}), 400
-
-    data = save_sentiment(value, note=note)
     return jsonify(data)
 
 

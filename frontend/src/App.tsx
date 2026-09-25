@@ -6,10 +6,12 @@ import ScanRing from './components/ScanRing'
 import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
 import SignalsPanel from './components/SignalsPanel'
-import SentimentPanel from './components/SentimentPanel'
+import MarketInsightPanel from './components/MarketInsightPanel'
 import LearnPanel from './components/LearnPanel'
 
-type View = 'scanner' | 'backtest' | 'signals' | 'sentiment' | 'learn'
+// NOTE: 'weeklyReport' is reserved for Phase 4 (Weekly Report tab) — see
+// IMPLEMENTATION_SPEC_weekly_report_and_sentiment.md. Not wired up yet.
+type View = 'scanner' | 'backtest' | 'signals' | 'insights' | 'learn' | 'weeklyReport'
 type AuthState = 'checking' | 'authenticated' | 'login'
 type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none'
 type TradeReadyTimes = Record<string, string>
@@ -440,7 +442,7 @@ export default function App() {
             <button className={view === 'scanner'   ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
             <button className={view === 'backtest'  ? 'active' : ''} onClick={() => setView('backtest')}>Backtest</button>
             <button className={view === 'signals'   ? 'active' : ''} onClick={() => setView('signals')}>Signals</button>
-            <button className={view === 'sentiment' ? 'active' : ''} onClick={() => setView('sentiment')}>Sentiment</button>
+            <button className={view === 'insights' ? 'active' : ''} onClick={() => setView('insights')}>Market Insight</button>
             <button className={view === 'learn'     ? 'active' : ''} onClick={() => setView('learn')}>Learn</button>
           </nav>
 
@@ -453,8 +455,9 @@ export default function App() {
         </header>
 
         {view === 'signals' && <SignalsPanel />}
-        {view === 'sentiment' && <SentimentPanel />}
+        {view === 'insights' && <MarketInsightPanel />}
         {view === 'learn' && <LearnPanel />}
+        {/* 'weeklyReport' tab/button intentionally not added yet — Phase 4 */}
 
         {view === 'backtest' && (
           <form className="debug-form" onSubmit={submitBacktest}>

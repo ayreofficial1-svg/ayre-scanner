@@ -1,19 +1,17 @@
 """
 data/app_sentiment.py
 ───────────────────────
-Placeholder market-sentiment value for the consumer app's "Insights" tab
-gauge. No scoring logic lives here yet — see master prompt §5 for the real
-formula (NSE advance/decline, VIX, etc.) planned for later.
+Market-sentiment value for the consumer app's Home tab gauge.
 
-GET /api/sentiment just returns whatever is in APP_SENTIMENT_FILE (a single
-JSON object), falling back to APP_SENTIMENT_DEFAULT if the file doesn't
-exist yet. Edit the file by hand (or via a future admin endpoint) to change
-the number the app shows — no app release required.
+The manual hand-set write path (formerly `save_sentiment`, wired to a
+website POST form) has been removed — see IMPLEMENTATION_SPEC_weekly_
+report_and_sentiment.md Phase 1. `GET /api/sentiment` still reads through
+`load_sentiment()` below for now; automatic computation from Nifty-500
+breadth data replaces this file's role entirely in Phase 2.
 """
 
 import os
 import json
-import datetime
 from config.settings import APP_SENTIMENT_FILE, APP_SENTIMENT_DEFAULT
 
 
@@ -31,15 +29,3 @@ def load_sentiment() -> dict:
         "updated_at": None,
         "note"      : None,
     }
-
-
-def save_sentiment(value: int, note: str | None = None) -> dict:
-    value = max(0, min(100, int(value)))
-    data = {
-        "sentiment" : value,
-        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "note"      : (note or "").strip() or None,
-    }
-    with open(APP_SENTIMENT_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    return data
