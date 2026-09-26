@@ -28,9 +28,34 @@ type StockRow = {
   symbol: string
   profit_pct: string // kept as a string while editing so a bare "-" or "" mid-type isn't clobbered
   outcome: WeeklyReportOutcome
+  // Everything below is optional (Phase 6 — trade-card redesign). Left
+  // blank, the Flutter app falls back to the pre-Phase-6 plain layout — see
+  // ayre_weekly_report.dart's [_OutcomeBand].
+  name: string
+  bullish: boolean
+  trade_label: string
+  entry_price: string
+  exit_price: string
+  pnl_amount: string
+  date_of_recommendation: string
+  exit_date: string
+  duration_days: string
 }
 
-const EMPTY_ROW = (): StockRow => ({ symbol: '', profit_pct: '', outcome: 'target' })
+const EMPTY_ROW = (): StockRow => ({
+  symbol: '',
+  profit_pct: '',
+  outcome: 'target',
+  name: '',
+  bullish: true,
+  trade_label: '',
+  entry_price: '',
+  exit_price: '',
+  pnl_amount: '',
+  date_of_recommendation: '',
+  exit_date: '',
+  duration_days: '',
+})
 
 function emptyForm() {
   return {
@@ -94,6 +119,15 @@ export default function WeeklyReportPanel() {
             symbol: s.symbol,
             profit_pct: String(s.profit_pct),
             outcome: s.outcome,
+            name: s.name ?? '',
+            bullish: s.bullish ?? true,
+            trade_label: s.trade_label ?? '',
+            entry_price: s.entry_price != null ? String(s.entry_price) : '',
+            exit_price: s.exit_price != null ? String(s.exit_price) : '',
+            pnl_amount: s.pnl_amount != null ? String(s.pnl_amount) : '',
+            date_of_recommendation: s.date_of_recommendation ?? '',
+            exit_date: s.exit_date ?? '',
+            duration_days: s.duration_days != null ? String(s.duration_days) : '',
           }))
         : [EMPTY_ROW()],
     })
@@ -119,11 +153,23 @@ export default function WeeklyReportPanel() {
     event.preventDefault()
     setError(null)
 
+    const numOrUndefined = (v: string) => (v.trim() === '' ? undefined : Number(v))
+    const intOrUndefined = (v: string) => (v.trim() === '' ? undefined : parseInt(v, 10))
+
     const rows = form.stocks
       .map(row => ({
         symbol: row.symbol.trim().toUpperCase(),
         profit_pct: Number(row.profit_pct),
         outcome: row.outcome,
+        name: row.name.trim() || undefined,
+        bullish: row.bullish,
+        trade_label: row.trade_label.trim() || undefined,
+        entry_price: numOrUndefined(row.entry_price),
+        exit_price: numOrUndefined(row.exit_price),
+        pnl_amount: numOrUndefined(row.pnl_amount),
+        date_of_recommendation: row.date_of_recommendation || undefined,
+        exit_date: row.exit_date || undefined,
+        duration_days: intOrUndefined(row.duration_days),
       }))
       .filter(row => row.symbol.length > 0)
 
@@ -137,6 +183,18 @@ export default function WeeklyReportPanel() {
     }
     if (rows.some(row => Number.isNaN(row.profit_pct))) {
       setError('Every stock row needs a numeric profit %')
+      return
+    }
+    if (rows.some(row => row.entry_price !== undefined && Number.isNaN(row.entry_price))) {
+      setError('Entry price must be numeric')
+      return
+    }
+    if (rows.some(row => row.exit_price !== undefined && Number.isNaN(row.exit_price))) {
+      setError('Exit price must be numeric')
+      return
+    }
+    if (rows.some(row => row.pnl_amount !== undefined && Number.isNaN(row.pnl_amount))) {
+      setError('Profit/loss amount must be numeric')
       return
     }
 
@@ -251,12 +309,94 @@ export default function WeeklyReportPanel() {
                   <option value="target">Target hit</option>
                   <option value="stop_loss">Stop-loss hit</option>
                 </select>
+                <select
+                  value={row.bullish ? 'bullish' : 'bearish'}
+                  onChange={e => updateRow(index, { bullish: e.target.value === 'bullish' })}
+                >
+                  <option value="bullish">Bullish</option>
+                  <option value="bearish">Bearish</option>
+                </select>
                 <button type="button" className="theme-btn" onClick={() => removeRow(index)}>
                   Remove row
                 </button>
               </div>
+
+              {/* Optional trade-card fields (Phase 6). Every input here may
+                  be left blank — the Flutter app falls back to the plain
+                  pre-Phase-6 layout whenever "Profit/loss ₹" is empty. */}
+              <div className="backtest-result-main" style={{ marginTop: '0.5rem' }}>
+                <input
+                  value={row.name}
+                  onChange={e => updateRow(index, { name: e.target.value })}
+                  placeholder="Company name (optional)"
+                  style={{ maxWidth: '12rem' }}
+                />
+                <input
+                  value={row.trade_label}
+                  onChange={e => updateRow(index, { trade_label: e.target.value })}
+                  placeholder="Trade label, e.g. BUY SEP 3850 CE"
+                  style={{ maxWidth: '14rem' }}
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  value={row.entry_price}
+                  onChange={e => updateRow(index, { entry_price: e.target.value })}
+                  placeholder="Entry price"
+                  style={{ maxWidth: '8rem' }}
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  value={row.exit_price}
+                  onChange={e => updateRow(index, { exit_price: e.target.value })}
+                  placeholder="Exit price"
+                  style={{ maxWidth: '8rem' }}
+                />
+                <input
+                  type="number"
+                  step="0.01"
+                  value={row.pnl_amount}
+                  onChange={e => updateRow(index, { pnl_amount: e.target.value })}
+                  placeholder="Profit/loss ₹"
+                  style={{ maxWidth: '8rem' }}
+                />
+              </div>
+              <div className="backtest-result-main" style={{ marginTop: '0.5rem' }}>
+                <label className="field inline-field">
+                  <span>Date of recommendation</span>
+                  <input
+                    type="date"
+                    value={row.date_of_recommendation}
+                    onChange={e => updateRow(index, { date_of_recommendation: e.target.value })}
+                  />
+                </label>
+                <label className="field inline-field">
+                  <span>Exit date</span>
+                  <input
+                    type="date"
+                    value={row.exit_date}
+                    onChange={e => updateRow(index, { exit_date: e.target.value })}
+                  />
+                </label>
+                <label className="field inline-field">
+                  <span>Duration (days)</span>
+                  <input
+                    type="number"
+                    min="0"
+                    value={row.duration_days}
+                    onChange={e => updateRow(index, { duration_days: e.target.value })}
+                    style={{ maxWidth: '6rem' }}
+                  />
+                </label>
+              </div>
             </div>
           ))}
+        </div>
+        <div className="section-sub" style={{ width: '100%' }}>
+          Company name, trade label, entry/exit price, profit/loss ₹, dates and duration are all optional.
+          Leave "Profit/loss ₹" blank to keep a stock's card in the simple %-only layout. Date of
+          recommendation / exit date fall back to the week's own start/end date in the app when left blank.
         </div>
 
         <button type="button" className="theme-btn" onClick={addRow}>+ Add stock row</button>
@@ -287,6 +427,12 @@ export default function WeeklyReportPanel() {
                 {report.stocks.map(s => (
                   <span key={s.symbol} className={`result-badge ${s.outcome === 'target' ? 'signal' : 'watchlist'}`} style={{ marginRight: '0.5rem' }}>
                     {s.symbol} {s.profit_pct >= 0 ? '+' : ''}{s.profit_pct}% · {s.outcome === 'target' ? 'Target' : 'Stop-loss'}
+                    {s.bullish === false ? ' · Bearish' : ''}
+                    {s.trade_label ? ` · ${s.trade_label}` : ''}
+                    {s.entry_price != null && s.exit_price != null
+                      ? ` · Entry ₹${s.entry_price} → Exit ₹${s.exit_price}`
+                      : ''}
+                    {s.pnl_amount != null ? ` · ₹${s.pnl_amount}` : ''}
                   </span>
                 ))}
               </div>

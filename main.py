@@ -1532,7 +1532,13 @@ def api_weekly_report_list():
             { "id": "...", "week_start": "2026-09-06", "week_end": "2026-09-12",
               "enabled": true,
               "stocks": [ { "symbol": "RELIANCE", "profit_pct": 4.2,
-                            "outcome": "target" } ],
+                            "outcome": "target",
+                            # Phase 6 (trade-card redesign) — all optional,
+                            # see data/app_weekly_report.py's docstring:
+                            "name": "", "bullish": true, "trade_label": "",
+                            "entry_price": null, "exit_price": null,
+                            "pnl_amount": null, "date_of_recommendation": "",
+                            "exit_date": "", "duration_days": null } ],
               "created_at": "...", "updated_at": "..." },
             ...
         ]
@@ -1560,6 +1566,15 @@ def api_weekly_report_add():
     the website, and (Phase 5) the Flutter app. Invalid rows reject the
     whole save with 400 rather than silently dropping or reinterpreting one
     row, since this is a small admin-entered form, not a bulk import.
+
+    Phase 6 (trade-card redesign) adds a set of OPTIONAL per-row fields —
+    "name", "bullish", "trade_label", "entry_price", "exit_price",
+    "pnl_amount", "date_of_recommendation", "exit_date", "duration_days" —
+    on top of the required "symbol"/"profit_pct"/"outcome" trio above. Any
+    of them may be omitted or left blank; only a value that IS supplied but
+    isn't the right shape (e.g. a non-numeric entry_price) rejects the save,
+    same "small admin form, not a bulk import" reasoning as the required
+    fields.
     """
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
@@ -1574,6 +1589,24 @@ def api_weekly_report_add():
         return jsonify({"error": "week_start and week_end are required"}), 400
     if not isinstance(raw_stocks, list) or not raw_stocks:
         return jsonify({"error": "at least one stock row is required"}), 400
+
+    def _optional_float(row: dict, key: str, symbol: str):
+        raw = row.get(key)
+        if raw is None or raw == "":
+            return None, None
+        try:
+            return float(raw), None
+        except (TypeError, ValueError):
+            return None, f"invalid {key} for {symbol}"
+
+    def _optional_int(row: dict, key: str, symbol: str):
+        raw = row.get(key)
+        if raw is None or raw == "":
+            return None, None
+        try:
+            return int(raw), None
+        except (TypeError, ValueError):
+            return None, f"invalid {key} for {symbol}"
 
     stocks = []
     for row in raw_stocks:
@@ -1591,7 +1624,34 @@ def api_weekly_report_add():
             profit_pct = float(row.get("profit_pct"))
         except (TypeError, ValueError):
             return jsonify({"error": f"invalid profit_pct for {symbol}"}), 400
-        stocks.append({"symbol": symbol, "profit_pct": profit_pct, "outcome": outcome})
+
+        entry_price, err = _optional_float(row, "entry_price", symbol)
+        if err:
+            return jsonify({"error": err}), 400
+        exit_price, err = _optional_float(row, "exit_price", symbol)
+        if err:
+            return jsonify({"error": err}), 400
+        pnl_amount, err = _optional_float(row, "pnl_amount", symbol)
+        if err:
+            return jsonify({"error": err}), 400
+        duration_days, err = _optional_int(row, "duration_days", symbol)
+        if err:
+            return jsonify({"error": err}), 400
+
+        stocks.append({
+            "symbol"                : symbol,
+            "profit_pct"            : profit_pct,
+            "outcome"               : outcome,
+            "name"                  : str(row.get("name") or "").strip(),
+            "bullish"               : bool(row.get("bullish", True)),
+            "trade_label"           : str(row.get("trade_label") or "").strip(),
+            "entry_price"           : entry_price,
+            "exit_price"            : exit_price,
+            "pnl_amount"            : pnl_amount,
+            "date_of_recommendation": str(row.get("date_of_recommendation") or "").strip(),
+            "exit_date"             : str(row.get("exit_date") or "").strip(),
+            "duration_days"         : duration_days,
+        })
 
     if report_id:
         updated = update_report(

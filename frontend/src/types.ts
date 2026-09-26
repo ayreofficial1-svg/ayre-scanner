@@ -106,10 +106,22 @@ export interface InsightContent {
 // anything else with 400, so this union is the full set, not illustrative.
 export type WeeklyReportOutcome = 'target' | 'stop_loss'
 
+// Everything below `outcome` is optional (Phase 6 — trade-card redesign).
+// Older reports simply have these absent/blank; the Flutter app falls back
+// to the pre-Phase-6 plain layout whenever `pnl_amount` is missing.
 export interface WeeklyReportStock {
   symbol: string
   profit_pct: number
   outcome: WeeklyReportOutcome
+  name?: string
+  bullish?: boolean
+  trade_label?: string
+  entry_price?: number | null
+  exit_price?: number | null
+  pnl_amount?: number | null
+  date_of_recommendation?: string
+  exit_date?: string
+  duration_days?: number | null
 }
 
 export interface WeeklyReport {

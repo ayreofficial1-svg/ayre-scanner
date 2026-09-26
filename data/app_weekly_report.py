@@ -22,7 +22,25 @@ Entry schema (JSON list)
       "week_start"   : "2026-09-06",        # ISO date
       "week_end"     : "2026-09-12",        # ISO date
       "stocks"       : [
-        { "symbol": "RELIANCE", "profit_pct": 4.2, "outcome": "target" },
+        {
+          "symbol"    : "RELIANCE",
+          "profit_pct": 4.2,
+          "outcome"   : "target",
+          # ── Optional (Phase 6 — trade-card redesign). Every field below
+          # is entirely optional and defaults to null/empty/true so a report
+          # saved before Phase 6 keeps parsing and displaying exactly as it
+          # always has; the Flutter app falls back to the pre-Phase-6 plain
+          # layout whenever "pnl_amount" is absent. ─────────────────────────
+          "name"                    : "Reliance Industries",
+          "bullish"                 : true,
+          "trade_label"             : "BUY SEP 2960 CE",
+          "entry_price"             : 64.0,
+          "exit_price"              : 60.0,
+          "pnl_amount"              : -700.0,
+          "date_of_recommendation"  : "2026-09-08",
+          "exit_date"               : "2026-09-08",
+          "duration_days"           : 1
+        },
         { "symbol": "TCS",      "profit_pct": -1.8, "outcome": "stop_loss" }
       ],
       "enabled"      : true,                # false = hidden, soft-deleted
@@ -81,17 +99,50 @@ def _to_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _to_float_or_none(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int_or_none(value):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _normalize_stock(row: dict) -> dict:
     """
     Defensive, read-side normalization of one stock row. Does not enforce
     `outcome` to be a valid value (that's the write-side API route's job) —
     it only lower-cases/strips whatever is already stored so a hand-edited
     or older row doesn't crash the read path.
+
+    Every field from "name" onward is optional (Phase 6 — trade-card
+    redesign, see this module's docstring): a row that never had them (any
+    report saved before Phase 6) normalizes to null/empty/true here, which
+    is exactly the "not provided" state the Flutter app's own parser
+    already treats as "fall back to the plain pre-Phase-6 layout".
     """
     return {
-        "symbol"    : str(row.get("symbol") or "").strip().upper(),
-        "profit_pct": _to_float(row.get("profit_pct")),
-        "outcome"   : str(row.get("outcome") or "").strip().lower(),
+        "symbol"                : str(row.get("symbol") or "").strip().upper(),
+        "profit_pct"            : _to_float(row.get("profit_pct")),
+        "outcome"               : str(row.get("outcome") or "").strip().lower(),
+        "name"                  : str(row.get("name") or "").strip(),
+        "bullish"               : bool(row.get("bullish", True)),
+        "trade_label"           : str(row.get("trade_label") or "").strip(),
+        "entry_price"           : _to_float_or_none(row.get("entry_price")),
+        "exit_price"            : _to_float_or_none(row.get("exit_price")),
+        "pnl_amount"            : _to_float_or_none(row.get("pnl_amount")),
+        "date_of_recommendation": str(row.get("date_of_recommendation") or "").strip(),
+        "exit_date"             : str(row.get("exit_date") or "").strip(),
+        "duration_days"         : _to_int_or_none(row.get("duration_days")),
     }
 
 
