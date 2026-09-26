@@ -90,6 +90,7 @@ from data.universe_stats import load_universe_stats, save_universe_stats
 from data.breadth import load_full_breadth, save_full_breadth
 from data.market_close import load_close_snapshot, save_close_snapshot
 from config.settings import APP_ASSET_DIR
+from config.settings import RA_REGISTRATION_NUMBER, DISCLAIMER
 
 try:
     from flask import Flask, jsonify, request, send_from_directory, session
@@ -1355,6 +1356,23 @@ def api_insights_volume_surge():
     return jsonify({
         "items": rows[:limit],
         "as_of": _state.get("universe_stats_as_of"),
+    })
+
+
+@app.route("/api/compliance")
+def api_compliance():
+    """
+    SEBI Research Analyst registration number and the standard disclaimer
+    text (spec: Phase 6, Research Analyst information screen). Both values
+    already live in config/settings.py and are reused as-is by
+    alerts/notify.py and utils/logger.py — this route just exposes the same
+    in-memory strings over HTTP so the app has one real source instead of a
+    second, hard-coded copy that could drift. No Fyers call, no scan, no
+    per-request file read — this returns two already-loaded config values.
+    """
+    return jsonify({
+        "ra_registration_number": RA_REGISTRATION_NUMBER,
+        "disclaimer": DISCLAIMER,
     })
 
 
