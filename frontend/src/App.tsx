@@ -9,6 +9,7 @@ import SignalsPanel from './components/SignalsPanel'
 import MarketInsightPanel from './components/MarketInsightPanel'
 import LearnPanel from './components/LearnPanel'
 import WeeklyReportPanel from './components/WeeklyReportPanel'
+import DatePicker from './components/DatePicker'
 
 type View = 'scanner' | 'backtest' | 'signals' | 'insights' | 'learn' | 'weeklyReport'
 type AuthState = 'checking' | 'authenticated' | 'login'
@@ -461,16 +462,13 @@ export default function App() {
 
         {view === 'backtest' && (
           <form className="debug-form" onSubmit={submitBacktest}>
-            <label className="field inline-field">
-              <span>Date</span>
-              <input
-                type="date"
-                value={backtestDate}
-                max={todayIso()}
-                onChange={e => setBacktestDate(e.target.value)}
-                required
-              />
-            </label>
+            <DatePicker
+              label="Date"
+              value={backtestDate}
+              onChange={setBacktestDate}
+              max={todayIso()}
+              required
+            />
             <button className="rescan-btn" type="submit" disabled={backtestLoading}>
               {backtestLoading ? 'Running...' : 'Run Backtest'}
             </button>

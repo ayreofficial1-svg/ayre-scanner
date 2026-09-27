@@ -1108,6 +1108,25 @@ tbody tr {
   align-items: start;
 }
 
+/* Mismatched min-widths between a plain text input (220px), the stock
+   autocomplete input (220px) and the date-picker control (180px) made grid
+   columns resize unevenly once several fields shared a row. Inside these
+   grids every field fills its column edge-to-edge instead, so labels,
+   inputs and the date picker line up on a common grid. */
+.clean-form-grid > .field,
+.report-row-grid > .field {
+  min-width: 0;
+}
+.clean-form-grid .field input,
+.clean-form-grid .field textarea,
+.clean-form-grid .date-picker-control,
+.report-row-grid .field input,
+.report-row-grid .field textarea,
+.report-row-grid .date-picker-control {
+  width: 100%;
+  min-width: 0;
+}
+
 .clean-form-footer {
   display: flex;
   align-items: center;
@@ -1307,7 +1326,7 @@ tbody tr {
 /* Date picker */
 .date-picker { position: relative; }
 
-.date-picker-trigger {
+.date-picker-control {
   display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
   min-width: 180px;
   background: var(--bg-base);
@@ -1317,12 +1336,38 @@ tbody tr {
   font-family: var(--font);
   font-size: 0.9rem;
   border-radius: 0;
+  transition: var(--tr);
+}
+.date-picker-control:hover { border-color: var(--text-main); }
+.date-picker-control:focus-within {
+  border-color: var(--text-main);
+  background: var(--bg-surface);
+}
+
+.date-picker-input {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--text-main);
+  font-family: var(--font);
+  font-size: 0.9rem;
+  line-height: 1.3;
+  outline: none;
+}
+.date-picker-input::placeholder { color: var(--text-dim); }
+
+.date-picker-icon-btn {
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  background: transparent; border: none; padding: 0;
+  color: var(--text-muted);
   cursor: pointer;
   transition: var(--tr);
 }
-.date-picker-trigger:hover { border-color: var(--text-main); }
-.date-picker-trigger .placeholder { color: var(--text-dim); }
-.date-picker-trigger svg { color: var(--text-muted); flex-shrink: 0; }
+.date-picker-icon-btn:hover { color: var(--text-main); }
 
 .date-picker-popover {
   position: absolute; z-index: 20;
@@ -1376,6 +1421,9 @@ tbody tr {
 .date-picker-day.selected {
   background: var(--accent); color: var(--bg-base); font-weight: 600;
 }
+.date-picker-day:disabled {
+  color: var(--text-dim); cursor: not-allowed; background: transparent;
+}
 
 .date-picker-footer {
   display: flex; justify-content: space-between;
@@ -1392,3 +1440,4 @@ tbody tr {
 }
 .date-picker-today-btn:hover { color: var(--text-main); }
 .date-picker-clear-btn:hover { color: var(--red); }
+.date-picker-today-btn:disabled { color: var(--text-dim); cursor: not-allowed; }

@@ -68,6 +68,10 @@ export default function WeeklyReportPanel() {
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Tracks whether the admin has picked Week End themselves. Until they do,
+  // picking Week Start also fills Week End with the same date (a sensible
+  // starting point for a 5-7 day range) — they can still change it after.
+  const [weekEndTouched, setWeekEndTouched] = useState(false)
 
   const load = async () => {
     setLoading(true)
@@ -86,9 +90,10 @@ export default function WeeklyReportPanel() {
 
   useEffect(() => { load() }, [])
 
-  const resetForm = () => setForm(emptyForm())
+  const resetForm = () => { setForm(emptyForm()); setWeekEndTouched(false) }
 
   const editReport = (report: WeeklyReport) => {
+    setWeekEndTouched(true)
     setForm({
       id: report.id,
       week_start: report.week_start,
@@ -206,8 +211,24 @@ export default function WeeklyReportPanel() {
 
       <form className="clean-form" onSubmit={saveReport}>
         <div className="clean-form-grid">
-          <DatePicker label="Week start" value={form.week_start} onChange={v => setForm(f => ({ ...f, week_start: v }))} required />
-          <DatePicker label="Week end" value={form.week_end} onChange={v => setForm(f => ({ ...f, week_end: v }))} required />
+          <DatePicker
+            label="Week start"
+            value={form.week_start}
+            onChange={v => setForm(f => ({
+              ...f,
+              week_start: v,
+              // Give Week End a sensible starting date until the admin picks
+              // their own — makes the second field faster to fill in.
+              week_end: weekEndTouched ? f.week_end : v,
+            }))}
+            required
+          />
+          <DatePicker
+            label="Week end"
+            value={form.week_end}
+            onChange={v => { setWeekEndTouched(true); setForm(f => ({ ...f, week_end: v })) }}
+            required
+          />
         </div>
 
         <div className="report-rows">
