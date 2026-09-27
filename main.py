@@ -964,6 +964,29 @@ def _content_fields(payload: dict) -> dict:
     return fields
 
 
+def _signal_price_fields(payload: dict) -> tuple[dict, str | None]:
+    """
+    Signals-only numeric fields (entry/exit/stop-loss) — kept separate from
+    _content_fields' generic whitelist since no other admin-curated resource
+    (learn/insights) has these. All three are optional; a value that IS
+    supplied but isn't numeric rejects the save with an error message rather
+    than silently dropping it.
+    """
+    fields: dict = {}
+    for key in ("entry_price", "exit_price", "stop_loss"):
+        if key not in payload:
+            continue
+        raw = payload.get(key)
+        if raw is None or raw == "":
+            fields[key] = None
+            continue
+        try:
+            fields[key] = float(raw)
+        except (TypeError, ValueError):
+            return {}, f"{key.replace('_', ' ')} must be numeric"
+    return fields, None
+
+
 @app.route("/api/uploads", methods=["POST"])
 def api_upload_asset():
     if not _is_admin():
@@ -982,6 +1005,88 @@ def api_upload_asset():
     path = os.path.join(APP_ASSET_DIR, stored)
     file.save(path)
     return jsonify({"url": f"/uploads/{stored}"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Website: stock directory for the admin panel's search-as-you-type pickers
+# (Signals tab, Weekly Report tab). Not used by the Flutter app.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_stock_directory_lock  = threading.Lock()
+_stock_directory_cache: dict = {"data": None, "expires_at": 0.0}
+_STOCK_DIRECTORY_TTL   = 3600  # seconds — this is a name/symbol list for a
+                                # search box, not a price feed, so an hour is
+                                # plenty fresh and avoids hammering NSE.
+
+
+def _build_stock_directory() -> list[dict]:
+    """
+    One deduplicated {symbol, name} list the admin panel's autocomplete
+    searches client-side. Built entirely from data this codebase already
+    fetches for other features (data/symbols.py's index baskets plus the
+    live-enriched Nifty/Sensex/Bank Nifty constituents), so there is no new
+    external data source — just a merged, de-duplicated view of it.
+    """
+    by_symbol: dict[str, str] = {}
+
+    # Company names where already known (constituents cache/live feed).
+    for market_cfg in MARKETS:
+        try:
+            payload = _get_constituents(market_cfg)
+        except Exception:
+            continue
+        for row in payload.get("stocks", []) or []:
+            sym = str(row.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            name = str(row.get("company_name") or "").strip()
+            if name and (sym not in by_symbol or len(name) > len(by_symbol[sym])):
+                by_symbol[sym] = name
+
+    # Broader symbol coverage (name-less is fine — the search matches symbols
+    # too) from the same hardcoded/CSV baskets the scanner itself uses.
+    from data.symbols import (
+        _NIFTY50_FALLBACK, _NIFTY_BANK_FALLBACK, _NIFTY_NEXT50_FALLBACK,
+    )
+    for sym in (*_NIFTY50_FALLBACK, *_NIFTY_BANK_FALLBACK, *_NIFTY_NEXT50_FALLBACK, *SENSEX30):
+        sym = sym.strip().upper()
+        by_symbol.setdefault(sym, "")
+
+    try:
+        for sym in plain_constituents_for_market("nifty"):
+            sym = sym.strip().upper()
+            by_symbol.setdefault(sym, "")
+    except Exception:
+        pass
+
+    return sorted(
+        ({"symbol": s, "name": n} for s, n in by_symbol.items()),
+        key=lambda r: r["symbol"],
+    )
+
+
+@app.route("/api/stocks", methods=["GET"])
+def api_stocks_directory():
+    """
+    Website-only. {symbol, name} list for the admin panel's stock-picker
+    search box (Signals tab, Weekly Report tab). Cached in-process for
+    _STOCK_DIRECTORY_TTL since it backs a search box, not a live price feed.
+    """
+    if not _is_authenticated():
+        return jsonify({"error": "Login required"}), 403
+
+    now = time.time()
+    with _stock_directory_lock:
+        cached = _stock_directory_cache["data"]
+        if cached is not None and _stock_directory_cache["expires_at"] > now:
+            return jsonify({"stocks": cached})
+
+    stocks = _build_stock_directory()
+    with _stock_directory_lock:
+        _stock_directory_cache["data"] = stocks
+        _stock_directory_cache["expires_at"] = now + _STOCK_DIRECTORY_TTL
+
+    return jsonify({"stocks": stocks})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1037,7 +1142,16 @@ def api_signals_list():
 
 @app.route("/api/signals", methods=["POST"])
 def api_signals_add():
-    """Website-only. Creates or updates an admin-curated stock recommendation."""
+    """
+    Website-only. Creates or updates an admin-curated stock recommendation.
+
+    Body: {"symbol": "RELIANCE", "enabled": true,
+           "entry_price": 2850.0, "exit_price": 3050.0, "stop_loss": 2760.0}.
+    Pass "id" to edit an existing signal instead of creating one.
+    entry_price/exit_price/stop_loss are all optional; each accepts a
+    number or null/blank to clear it, but a non-numeric value rejects the
+    save with 400.
+    """
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
 
@@ -1048,7 +1162,11 @@ def api_signals_add():
     if not symbol:
         return jsonify({"error": "symbol is required"}), 400
 
-    fields = _content_fields(payload)
+    price_fields, price_err = _signal_price_fields(payload)
+    if price_err:
+        return jsonify({"error": price_err}), 400
+
+    fields = {**_content_fields(payload), **price_fields}
     if signal_id:
         previous = next(
             (s for s in load_signals() if s.get("id") == str(signal_id)), None

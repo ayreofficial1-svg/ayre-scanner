@@ -60,6 +60,15 @@ export interface SignalPick {
   tags?: string[]
   last_price?: number | null
   change_pct?: number | null
+  entry_price?: number | null
+  exit_price?: number | null
+  stop_loss?: number | null
+}
+
+// One row of /api/stocks — the admin panel's search-as-you-type source.
+export interface StockDirectoryEntry {
+  symbol: string
+  name: string
 }
 
 export interface LearnArticle {

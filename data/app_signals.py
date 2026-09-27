@@ -14,7 +14,10 @@ Entry schema (JSON list, newest first)
       "rationale" : "Breakout above SMA44 with rising volume.",
       "date_added": "2026-07-03",     # ISO date
       "added_by"  : "raghav",         # username from session
-      "active"    : true              # false once deactivated via DELETE
+      "active"    : true,             # false once deactivated via DELETE
+      "entry_price": 2850.0,          # optional — website admin panel field
+      "exit_price" : 3050.0,          # optional
+      "stop_loss"  : 2760.0           # optional
     },
     ...
   ]
@@ -86,7 +89,19 @@ def _normalize_signal(entry: dict) -> dict:
         "start_at": (entry.get("start_at") or "").strip() or None,
         "end_at": (entry.get("end_at") or "").strip() or None,
         "tags": entry.get("tags") if isinstance(entry.get("tags"), list) else [],
+        "entry_price": _to_float_or_none(entry.get("entry_price")),
+        "exit_price": _to_float_or_none(entry.get("exit_price")),
+        "stop_loss": _to_float_or_none(entry.get("stop_loss")),
     }
+
+
+def _to_float_or_none(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _sort_key(entry: dict) -> tuple[int, int, str]:

@@ -2,22 +2,34 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { SignalPick } from '../types'
 import { inr, pct } from '../utils'
+import StockPicker from './StockPicker'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SignalsPanel
+//
+// Pick a stock, set Entry / Exit / Stop Loss, and it stays live in the app
+// until manually disabled or removed. Everything else the old form exposed
+// (rationale, category, image, scheduling window, featured/pinned ordering)
+// is still accepted by the API for backward compatibility but is no longer
+// surfaced here — this tab now only edits the fields it's actually for.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function emptyForm() {
+  return {
+    id: '',
+    symbol: '',
+    entry_price: '',
+    exit_price: '',
+    stop_loss: '',
+    enabled: true,
+  }
+}
 
 export default function SignalsPanel() {
   const [signals, setSignals] = useState<SignalPick[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError]     = useState<string | null>(null)
-  const [symbol, setSymbol]       = useState('')
-  const [rationale, setRationale] = useState('')
-  const [editingId, setEditingId] = useState('')
-  const [enabled, setEnabled] = useState(true)
-  const [featured, setFeatured] = useState(false)
-  const [pinned, setPinned] = useState(false)
-  const [displayOrder, setDisplayOrder] = useState(0)
-  const [category, setCategory] = useState('')
-  const [imageUrl, setImageUrl] = useState('')
-  const [startAt, setStartAt] = useState('')
-  const [endAt, setEndAt] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [form, setForm] = useState(emptyForm)
   const [submitting, setSubmitting] = useState(false)
 
   const load = async () => {
@@ -37,63 +49,54 @@ export default function SignalsPanel() {
 
   useEffect(() => { load() }, [])
 
-  const resetForm = () => {
-    setEditingId('')
-    setSymbol('')
-    setRationale('')
-    setEnabled(true)
-    setFeatured(false)
-    setPinned(false)
-    setDisplayOrder(0)
-    setCategory('')
-    setImageUrl('')
-    setStartAt('')
-    setEndAt('')
-  }
+  const resetForm = () => setForm(emptyForm())
 
   const editSignal = (signal: SignalPick) => {
-    setEditingId(signal.id)
-    setSymbol(signal.symbol)
-    setRationale(signal.rationale ?? '')
-    setEnabled(signal.enabled ?? signal.active ?? true)
-    setFeatured(signal.featured ?? false)
-    setPinned(signal.pinned ?? false)
-    setDisplayOrder(signal.display_order ?? 0)
-    setCategory(signal.category ?? '')
-    setImageUrl(signal.image_url ?? '')
-    setStartAt(signal.start_at ?? '')
-    setEndAt(signal.end_at ?? '')
+    setForm({
+      id: signal.id,
+      symbol: signal.symbol,
+      entry_price: signal.entry_price != null ? String(signal.entry_price) : '',
+      exit_price: signal.exit_price != null ? String(signal.exit_price) : '',
+      stop_loss: signal.stop_loss != null ? String(signal.stop_loss) : '',
+      enabled: signal.enabled ?? signal.active ?? true,
+    })
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
   const addSignal = async (event: FormEvent) => {
     event.preventDefault()
-    if (!symbol.trim()) return
+    if (!form.symbol.trim()) return
+    setError(null)
+
+    const numOrNull = (v: string) => (v.trim() === '' ? null : Number(v))
+    const entry_price = numOrNull(form.entry_price)
+    const exit_price = numOrNull(form.exit_price)
+    const stop_loss = numOrNull(form.stop_loss)
+    if ([entry_price, exit_price, stop_loss].some(v => v !== null && Number.isNaN(v))) {
+      setError('Entry, exit and stop loss must be numeric')
+      return
+    }
+
     setSubmitting(true)
     try {
       const res  = await fetch('/api/signals', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          id: editingId || undefined,
-          symbol: symbol.trim().toUpperCase(),
-          rationale: rationale.trim(),
-          enabled,
-          featured,
-          pinned,
-          display_order: displayOrder,
-          category: category.trim() || null,
-          image_url: imageUrl.trim() || null,
-          start_at: startAt || null,
-          end_at: endAt || null,
+          id: form.id || undefined,
+          symbol: form.symbol.trim().toUpperCase(),
+          enabled: form.enabled,
+          entry_price,
+          exit_price,
+          stop_loss,
         }),
       })
       const data = await res.json().catch(() => ({})) as { error?: string }
-      if (!res.ok) throw new Error(data.error || 'Failed to add signal')
+      if (!res.ok) throw new Error(data.error || 'Failed to save signal')
       resetForm()
       await load()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to add signal')
+      setError(err instanceof Error ? err.message : 'Failed to save signal')
     } finally {
       setSubmitting(false)
     }
@@ -113,83 +116,108 @@ export default function SignalsPanel() {
   return (
     <div className="section">
       <div className="section-header">
-        <div>
-          <div className="section-title">Signals</div>
-          <div className="section-sub">Admin-curated picks shown in the consumer app</div>
-        </div>
+        <div className="section-title">Signals</div>
       </div>
 
-      <form className="debug-form" onSubmit={addSignal}>
-        <label className="field inline-field">
-          <span>Symbol</span>
-          <input value={symbol} onChange={e => setSymbol(e.target.value)} placeholder="RELIANCE" required />
-        </label>
-        <label className="field">
-          <span>Rationale</span>
-          <input value={rationale} onChange={e => setRationale(e.target.value)} placeholder="Short reason" />
-        </label>
-        <label className="field inline-field">
-          <span>Order</span>
-          <input type="number" value={displayOrder} onChange={e => setDisplayOrder(Number(e.target.value) || 0)} />
-        </label>
-        <label className="field">
-          <span>Category</span>
-          <input value={category} onChange={e => setCategory(e.target.value)} placeholder="Breakout" />
-        </label>
-        <label className="field">
-          <span>Image URL</span>
-          <input value={imageUrl} onChange={e => setImageUrl(e.target.value)} placeholder="/uploads/chart.webp" />
-        </label>
-        <label className="field inline-field">
-          <span>Start</span>
-          <input type="datetime-local" value={startAt} onChange={e => setStartAt(e.target.value)} />
-        </label>
-        <label className="field inline-field">
-          <span>End</span>
-          <input type="datetime-local" value={endAt} onChange={e => setEndAt(e.target.value)} />
-        </label>
-        <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.6rem' }}>
-          <input type="checkbox" style={{ width: 'auto' }} checked={enabled} onChange={e => setEnabled(e.target.checked)} />
-          <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>Enabled</span>
-        </label>
-        <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.6rem' }}>
-          <input type="checkbox" style={{ width: 'auto' }} checked={featured} onChange={e => setFeatured(e.target.checked)} />
-          <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>Featured</span>
-        </label>
-        <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: '0.6rem' }}>
-          <input type="checkbox" style={{ width: 'auto' }} checked={pinned} onChange={e => setPinned(e.target.checked)} />
-          <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>Pinned</span>
-        </label>
-        <button className="rescan-btn" type="submit" disabled={submitting}>
-          {submitting ? 'Saving...' : editingId ? 'Update Signal' : 'Add Signal'}
-        </button>
-        {editingId && <button type="button" className="theme-btn" onClick={resetForm}>Cancel edit</button>}
-      </form>
-
       {error && <div className="error-bar">{error}</div>}
+
+      <form className="clean-form" onSubmit={addSignal}>
+        <div className="clean-form-grid">
+          <StockPicker
+            label="Stock"
+            value={form.symbol}
+            onChange={symbol => setForm(f => ({ ...f, symbol }))}
+            required
+          />
+          <label className="field">
+            <span>Entry price</span>
+            <input
+              type="number"
+              step="0.01"
+              value={form.entry_price}
+              onChange={e => setForm(f => ({ ...f, entry_price: e.target.value }))}
+              placeholder="₹"
+            />
+          </label>
+          <label className="field">
+            <span>Exit price</span>
+            <input
+              type="number"
+              step="0.01"
+              value={form.exit_price}
+              onChange={e => setForm(f => ({ ...f, exit_price: e.target.value }))}
+              placeholder="₹"
+            />
+          </label>
+          <label className="field">
+            <span>Stop loss</span>
+            <input
+              type="number"
+              step="0.01"
+              value={form.stop_loss}
+              onChange={e => setForm(f => ({ ...f, stop_loss: e.target.value }))}
+              placeholder="₹"
+            />
+          </label>
+        </div>
+
+        <div className="clean-form-footer">
+          <label className="switch-field">
+            <input
+              type="checkbox"
+              checked={form.enabled}
+              onChange={e => setForm(f => ({ ...f, enabled: e.target.checked }))}
+            />
+            <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
+            <span className="switch-label">Enabled</span>
+          </label>
+
+          <div className="clean-form-actions">
+            {form.id && <button type="button" className="theme-btn" onClick={resetForm}>Cancel</button>}
+            <button className="rescan-btn" type="submit" disabled={submitting}>
+              {submitting ? 'Saving...' : form.id ? 'Update signal' : 'Add signal'}
+            </button>
+          </div>
+        </div>
+      </form>
 
       {loading ? (
         <div className="empty-state">Loading signals...</div>
       ) : signals.length === 0 ? (
-        <div className="empty-state">No active signals.</div>
+        <div className="empty-state">No signals yet. Add your first stock above.</div>
       ) : (
-        <div className="backtest-results-list">
+        <div className="signal-list">
           {signals.map(s => (
-            <div className="backtest-result" key={s.id}>
-              <div className="backtest-result-main">
+            <div className={`signal-row${s.enabled === false ? ' disabled' : ''}`} key={s.id}>
+              <div className="signal-row-main">
                 <span className="card-sym">{s.symbol}</span>
                 <span className={`card-val ${(s.change_pct ?? 0) >= 0 ? 'g' : 'r'}`}>
                   {inr(s.last_price)} · {pct(s.change_pct)}
                 </span>
+                {s.enabled === false && <span className="tag-disabled">Disabled</span>}
+              </div>
+              <div className="signal-row-prices">
+                <PriceTag label="Entry" value={s.entry_price} />
+                <PriceTag label="Exit" value={s.exit_price} />
+                <PriceTag label="Stop loss" value={s.stop_loss} />
+              </div>
+              <div className="signal-row-actions">
                 <button className="theme-btn" onClick={() => editSignal(s)}>Edit</button>
                 <button className="theme-btn" onClick={() => removeSignal(s.id)}>Remove</button>
               </div>
-              <div className="details-value">{s.rationale}</div>
-              <div className="card-date">{s.date_added}{s.added_by ? ` · ${s.added_by}` : ''}</div>
             </div>
           ))}
         </div>
       )}
     </div>
+  )
+}
+
+function PriceTag({ label, value }: { label: string; value?: number | null }) {
+  return (
+    <span className="price-tag">
+      <small>{label}</small>
+      <strong>{value != null ? inr(value) : '—'}</strong>
+    </span>
   )
 }
