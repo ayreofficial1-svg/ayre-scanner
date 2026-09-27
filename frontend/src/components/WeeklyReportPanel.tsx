@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { WeeklyReport, WeeklyReportOutcome } from '../types'
-import { inr } from '../utils'
+import { inr, pct } from '../utils'
 import StockPicker from './StockPicker'
 import DatePicker from './DatePicker'
 
@@ -9,21 +9,29 @@ import DatePicker from './DatePicker'
 // WeeklyReportPanel
 //
 // One past weekly report = a date range plus a row per recommended stock:
-// stock, entry price, exit price, profit %, date of recommendation. Nothing
-// else is shown here — the older optional fields (company name, trade
-// label, duration, ₹ P&L, per-row enabled) still round-trip through the API
+// stock, entry price, exit price, profit per share, date of recommendation.
+// Nothing else is shown here — the older optional fields (company name,
+// trade label, duration, per-row enabled) still round-trip through the API
 // untouched but are no longer edited on this screen.
 //
+// Return % is no longer a manual field — it is always derived from Entry
+// price and Exit price (server-side, authoritatively, in POST
+// /api/weekly-report) so it can never drift from the two prices the admin
+// actually entered. Profit per share (₹) IS still manual — it is the ₹
+// figure per share, which the two prices alone can't tell us (lot size,
+// brokerage, etc. are the admin's call) — and is optional.
+//
 // `outcome` ("target"/"stop_loss") is still required by the API/Flutter
-// parser, so it's derived automatically from the sign of profit % (>=0 is a
-// target hit, negative is a stop-loss hit) rather than asked for by hand.
+// parser, so it's derived automatically from the sign of the computed
+// return % (>=0 is a target hit, negative is a stop-loss hit) rather than
+// asked for by hand.
 // ─────────────────────────────────────────────────────────────────────────────
 
 type StockRow = {
   symbol: string
   entry_price: string
   exit_price: string
-  profit_pct: string
+  pnl_amount: string
   date_of_recommendation: string
 }
 
@@ -31,9 +39,20 @@ const EMPTY_ROW = (): StockRow => ({
   symbol: '',
   entry_price: '',
   exit_price: '',
-  profit_pct: '',
+  pnl_amount: '',
   date_of_recommendation: '',
 })
+
+function outcomeFor(profitPct: number): WeeklyReportOutcome {
+  return profitPct >= 0 ? 'target' : 'stop_loss'
+}
+
+// Mirrors the backend's own calculation (main.py::api_weekly_report_add) so
+// the admin sees the same return % here, before saving, that the Flutter
+// app will end up showing.
+function computeProfitPct(entryPrice: number, exitPrice: number): number {
+  return ((exitPrice - entryPrice) / entryPrice) * 100
+}
 
 function emptyForm() {
   return {
@@ -42,10 +61,6 @@ function emptyForm() {
     week_end: '',
     stocks: [EMPTY_ROW()],
   }
-}
-
-function outcomeFor(profitPct: number): WeeklyReportOutcome {
-  return profitPct >= 0 ? 'target' : 'stop_loss'
 }
 
 function formatDate(iso: string): string {
@@ -103,7 +118,7 @@ export default function WeeklyReportPanel() {
             symbol: s.symbol,
             entry_price: s.entry_price != null ? String(s.entry_price) : '',
             exit_price: s.exit_price != null ? String(s.exit_price) : '',
-            profit_pct: String(s.profit_pct),
+            pnl_amount: s.pnl_amount != null ? String(s.pnl_amount) : '',
             date_of_recommendation: s.date_of_recommendation ?? '',
           }))
         : [EMPTY_ROW()],
@@ -134,13 +149,16 @@ export default function WeeklyReportPanel() {
 
     const rows = form.stocks
       .map(row => {
-        const profit_pct = Number(row.profit_pct)
+        const entry_price = Number(row.entry_price)
+        const exit_price = Number(row.exit_price)
+        const profit_pct = computeProfitPct(entry_price, exit_price)
         return {
           symbol: row.symbol.trim().toUpperCase(),
+          entry_price,
+          exit_price,
           profit_pct,
           outcome: outcomeFor(profit_pct),
-          entry_price: numOrUndefined(row.entry_price),
-          exit_price: numOrUndefined(row.exit_price),
+          pnl_amount: numOrUndefined(row.pnl_amount),
           date_of_recommendation: row.date_of_recommendation || undefined,
         }
       })
@@ -154,16 +172,16 @@ export default function WeeklyReportPanel() {
       setError('At least one stock row is required')
       return
     }
-    if (rows.some(row => Number.isNaN(row.profit_pct))) {
-      setError('Every stock row needs a numeric percentage return')
+    if (rows.some(row => Number.isNaN(row.entry_price) || row.entry_price === 0)) {
+      setError('Entry price is required and must be a non-zero number, for every stock row')
       return
     }
-    if (rows.some(row => row.entry_price !== undefined && Number.isNaN(row.entry_price))) {
-      setError('Entry price must be numeric')
+    if (rows.some(row => Number.isNaN(row.exit_price))) {
+      setError('Exit price is required and must be numeric, for every stock row')
       return
     }
-    if (rows.some(row => row.exit_price !== undefined && Number.isNaN(row.exit_price))) {
-      setError('Exit price must be numeric')
+    if (rows.some(row => row.pnl_amount !== undefined && Number.isNaN(row.pnl_amount))) {
+      setError('Profit per share must be numeric')
       return
     }
 
@@ -232,57 +250,76 @@ export default function WeeklyReportPanel() {
         </div>
 
         <div className="report-rows">
-          {form.stocks.map((row, index) => (
-            <div className="report-row" key={index}>
-              <div className="report-row-grid">
-                <StockPicker
-                  label="Stock"
-                  value={row.symbol}
-                  onChange={symbol => updateRow(index, { symbol })}
-                />
-                <label className="field">
-                  <span>Entry price</span>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={row.entry_price}
-                    onChange={e => updateRow(index, { entry_price: e.target.value })}
-                    placeholder="₹"
+          {form.stocks.map((row, index) => {
+            const entry = Number(row.entry_price)
+            const exit = Number(row.exit_price)
+            const hasBothPrices =
+              row.entry_price.trim() !== '' && row.exit_price.trim() !== '' &&
+              !Number.isNaN(entry) && !Number.isNaN(exit) && entry !== 0
+            const livePct = hasBothPrices ? computeProfitPct(entry, exit) : null
+
+            return (
+              <div className="report-row" key={index}>
+                <div className="report-row-grid">
+                  <StockPicker
+                    label="Stock"
+                    value={row.symbol}
+                    onChange={symbol => updateRow(index, { symbol })}
                   />
-                </label>
-                <label className="field">
-                  <span>Exit price</span>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={row.exit_price}
-                    onChange={e => updateRow(index, { exit_price: e.target.value })}
-                    placeholder="₹"
+                  <label className="field">
+                    <span>Entry price</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={row.entry_price}
+                      onChange={e => updateRow(index, { entry_price: e.target.value })}
+                      placeholder="₹"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Exit price</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={row.exit_price}
+                      onChange={e => updateRow(index, { exit_price: e.target.value })}
+                      placeholder="₹"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Return % (auto)</span>
+                    <input
+                      type="text"
+                      value={livePct == null ? '—' : pct(livePct)}
+                      readOnly
+                      disabled
+                      title="Calculated automatically from Entry price and Exit price"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Profit per share (₹)</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={row.pnl_amount}
+                      onChange={e => updateRow(index, { pnl_amount: e.target.value })}
+                      placeholder="₹ (optional)"
+                    />
+                  </label>
+                  <DatePicker
+                    label="Date of recommendation"
+                    value={row.date_of_recommendation}
+                    onChange={v => updateRow(index, { date_of_recommendation: v })}
                   />
-                </label>
-                <label className="field">
-                  <span>Return %</span>
-                  <input
-                    type="number"
-                    step="0.01"
-                    value={row.profit_pct}
-                    onChange={e => updateRow(index, { profit_pct: e.target.value })}
-                    placeholder="e.g. 4.2 or -1.8"
-                  />
-                </label>
-                <DatePicker
-                  label="Date of recommendation"
-                  value={row.date_of_recommendation}
-                  onChange={v => updateRow(index, { date_of_recommendation: v })}
-                />
+                </div>
+                {form.stocks.length > 1 && (
+                  <button type="button" className="report-row-remove" onClick={() => removeRow(index)} aria-label="Remove stock row">
+                    ✕
+                  </button>
+                )}
               </div>
-              {form.stocks.length > 1 && (
-                <button type="button" className="report-row-remove" onClick={() => removeRow(index)} aria-label="Remove stock row">
-                  ✕
-                </button>
-              )}
-            </div>
-          ))}
+            )
+          })}
         </div>
 
         <div className="clean-form-footer">
@@ -320,8 +357,13 @@ export default function WeeklyReportPanel() {
                   <div className="report-stock-chip" key={`${s.symbol}-${i}`}>
                     <span className="card-sym">{s.symbol}</span>
                     <span className={`card-val ${s.profit_pct >= 0 ? 'g' : 'r'}`}>
-                      {s.profit_pct >= 0 ? '+' : ''}{s.profit_pct}%
+                      {pct(s.profit_pct)}
                     </span>
+                    {s.pnl_amount != null && (
+                      <span className={`card-val ${s.pnl_amount >= 0 ? 'g' : 'r'}`}>
+                        {inr(s.pnl_amount)} / share
+                      </span>
+                    )}
                     {(s.entry_price != null || s.exit_price != null) && (
                       <span className="card-val dim">
                         {s.entry_price != null ? inr(s.entry_price) : '—'} → {s.exit_price != null ? inr(s.exit_price) : '—'}

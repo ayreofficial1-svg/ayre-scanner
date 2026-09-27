@@ -1628,12 +1628,15 @@ def api_learn_delete(article_id: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Consumer app: Weekly Report (admin-entered historical performance)
 #
-# Admin-entered, not computed — there is no code anywhere in this repo that
-# watches a fired signal afterwards to determine whether price later hit a
-# target or a stop loss (see IMPLEMENTATION_SPEC_weekly_report_and_
-# sentiment.md §A.4). The owner enters the week, its stocks, profit %, and
-# outcome by hand on the website; these three routes just store and serve
-# that, following the exact same GET/POST/DELETE shape as /api/learn.
+# Admin-entered, not computed from live market data — there is no code
+# anywhere in this repo that watches a fired signal afterwards to determine
+# whether price later hit a target or a stop loss (see
+# IMPLEMENTATION_SPEC_weekly_report_and_sentiment.md §A.4). The owner enters
+# the week, its stocks, their entry/exit price, and outcome by hand on the
+# website; "profit_pct" is calculated automatically from entry_price/
+# exit_price (POST below), never typed in directly. These three routes just
+# store and serve that, following the exact same GET/POST/DELETE shape as
+# /api/learn.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/api/weekly-report", methods=["GET"])
@@ -1649,12 +1652,15 @@ def api_weekly_report_list():
         "reports": [
             { "id": "...", "week_start": "2026-09-06", "week_end": "2026-09-12",
               "enabled": true,
-              "stocks": [ { "symbol": "RELIANCE", "profit_pct": 4.2,
-                            "outcome": "target",
+              "stocks": [ { "symbol": "RELIANCE",
+                            "entry_price": 64.0, "exit_price": 60.0,
+                            # Always derived server-side from entry/exit
+                            # price (see POST below) — never hand-typed.
+                            "profit_pct": -6.25,
+                            "outcome": "stop_loss",
                             # Phase 6 (trade-card redesign) — all optional,
                             # see data/app_weekly_report.py's docstring:
                             "name": "", "bullish": true, "trade_label": "",
-                            "entry_price": null, "exit_price": null,
                             "pnl_amount": null, "date_of_recommendation": "",
                             "exit_date": "", "duration_days": null } ],
               "created_at": "...", "updated_at": "..." },
@@ -1670,7 +1676,8 @@ def api_weekly_report_list():
 def api_weekly_report_add():
     """
     Website-only. Body: {"week_start": "2026-09-06", "week_end": "2026-09-12",
-    "stocks": [{"symbol": "RELIANCE", "profit_pct": 4.2, "outcome": "target"}]}.
+    "stocks": [{"symbol": "RELIANCE", "entry_price": 64.0, "exit_price": 60.0,
+    "outcome": "stop_loss"}]}.
     Pass "id" in the body to edit an existing report instead of creating one
     (same convention /api/learn uses to distinguish create vs. update).
 
@@ -1685,14 +1692,22 @@ def api_weekly_report_add():
     whole save with 400 rather than silently dropping or reinterpreting one
     row, since this is a small admin-entered form, not a bulk import.
 
-    Phase 6 (trade-card redesign) adds a set of OPTIONAL per-row fields —
-    "name", "bullish", "trade_label", "entry_price", "exit_price",
-    "pnl_amount", "date_of_recommendation", "exit_date", "duration_days" —
-    on top of the required "symbol"/"profit_pct"/"outcome" trio above. Any
-    of them may be omitted or left blank; only a value that IS supplied but
-    isn't the right shape (e.g. a non-numeric entry_price) rejects the save,
-    same "small admin form, not a bulk import" reasoning as the required
-    fields.
+    "profit_pct" is never accepted as a raw manual number from the client —
+    "entry_price" and "exit_price" are required for every row instead, and
+    this route always derives profit_pct itself as
+    ((exit_price - entry_price) / entry_price) * 100, so the stored return %
+    can never drift from the two prices the admin actually entered. Any
+    "profit_pct" present in the request body is ignored.
+
+    Phase 6 (trade-card redesign) adds a set of further OPTIONAL per-row
+    fields — "name", "bullish", "trade_label", "pnl_amount" (Profit per
+    share, in ₹ — still a manual figure, since lot size/brokerage aren't
+    derivable from the two prices alone), "date_of_recommendation",
+    "exit_date", "duration_days" — on top of the required
+    "symbol"/"entry_price"/"exit_price"/"outcome" above. Any of them may be
+    omitted or left blank; only a value that IS supplied but isn't the
+    right shape (e.g. a non-numeric pnl_amount) rejects the save, same
+    "small admin form, not a bulk import" reasoning as the required fields.
     """
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
@@ -1738,10 +1753,6 @@ def api_weekly_report_add():
             return jsonify({
                 "error": f"invalid outcome for {symbol}: must be 'target' or 'stop_loss'"
             }), 400
-        try:
-            profit_pct = float(row.get("profit_pct"))
-        except (TypeError, ValueError):
-            return jsonify({"error": f"invalid profit_pct for {symbol}"}), 400
 
         entry_price, err = _optional_float(row, "entry_price", symbol)
         if err:
@@ -1749,6 +1760,18 @@ def api_weekly_report_add():
         exit_price, err = _optional_float(row, "exit_price", symbol)
         if err:
             return jsonify({"error": err}), 400
+        # Return % is calculated automatically from entry/exit price, never
+        # accepted as a raw manual number — so both prices are required, and
+        # whatever "profit_pct" the client may have sent is ignored below.
+        if entry_price is None or exit_price is None:
+            return jsonify({
+                "error": f"entry_price and exit_price are required for {symbol} "
+                         "to calculate return %"
+            }), 400
+        if entry_price == 0:
+            return jsonify({"error": f"entry_price for {symbol} must not be zero"}), 400
+        profit_pct = round(((exit_price - entry_price) / entry_price) * 100, 4)
+
         pnl_amount, err = _optional_float(row, "pnl_amount", symbol)
         if err:
             return jsonify({"error": err}), 400

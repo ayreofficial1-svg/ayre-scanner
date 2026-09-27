@@ -7,12 +7,16 @@ were profitable, with the profit percentage and whether the target or the
 stop loss was hit. Read by the Flutter app via GET /api/weekly-report;
 written by the website admin panel via POST/DELETE.
 
-This is admin-entered data, not computed. There is no code anywhere in
-this repo that watches a fired signal afterwards to determine whether
-price later hit a target or a stop loss (see
+This is admin-entered data, not computed from live market data. There is
+no code anywhere in this repo that watches a fired signal afterwards to
+determine whether price later hit a target or a stop loss (see
 IMPLEMENTATION_SPEC_weekly_report_and_sentiment.md §A.4) — the owner enters
-the week, the stocks, their profit %, and the outcome by hand on the
-website, and this module just stores exactly that.
+the week, the stocks, their entry/exit price and (optionally) profit per
+share by hand on the website. `profit_pct` itself is NOT hand-entered: the
+API route (main.py's POST /api/weekly-report) always derives it from
+`entry_price`/`exit_price` before it ever reaches this module, so what
+lands in storage is a calculated value, not a typed-in one. This module
+just stores exactly what it's given.
 
 Entry schema (JSON list)
 ─────────────────────────
