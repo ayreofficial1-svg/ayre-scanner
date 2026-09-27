@@ -1633,9 +1633,10 @@ def api_learn_delete(article_id: str):
 # whether price later hit a target or a stop loss (see
 # IMPLEMENTATION_SPEC_weekly_report_and_sentiment.md §A.4). The owner enters
 # the week, its stocks, their entry/exit price, and outcome by hand on the
-# website; "profit_pct" is calculated automatically from entry_price/
-# exit_price (POST below), never typed in directly. These three routes just
-# store and serve that, following the exact same GET/POST/DELETE shape as
+# website; "profit_pct" and "pnl_amount" (₹ profit/loss per share) are both
+# calculated automatically from entry_price/exit_price (POST below), never
+# typed in directly. These three routes just store and serve that, following
+# the exact same GET/POST/DELETE shape as
 # /api/learn.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1654,14 +1655,14 @@ def api_weekly_report_list():
               "enabled": true,
               "stocks": [ { "symbol": "RELIANCE",
                             "entry_price": 64.0, "exit_price": 60.0,
-                            # Always derived server-side from entry/exit
+                            # Both always derived server-side from entry/exit
                             # price (see POST below) — never hand-typed.
-                            "profit_pct": -6.25,
+                            "profit_pct": -6.25, "pnl_amount": -4.0,
                             "outcome": "stop_loss",
                             # Phase 6 (trade-card redesign) — all optional,
                             # see data/app_weekly_report.py's docstring:
                             "name": "", "bullish": true, "trade_label": "",
-                            "pnl_amount": null, "date_of_recommendation": "",
+                            "date_of_recommendation": "",
                             "exit_date": "", "duration_days": null } ],
               "created_at": "...", "updated_at": "..." },
             ...
@@ -1692,21 +1693,21 @@ def api_weekly_report_add():
     whole save with 400 rather than silently dropping or reinterpreting one
     row, since this is a small admin-entered form, not a bulk import.
 
-    "profit_pct" is never accepted as a raw manual number from the client —
-    "entry_price" and "exit_price" are required for every row instead, and
-    this route always derives profit_pct itself as
-    ((exit_price - entry_price) / entry_price) * 100, so the stored return %
-    can never drift from the two prices the admin actually entered. Any
-    "profit_pct" present in the request body is ignored.
+    "profit_pct" and "pnl_amount" are never accepted as raw manual numbers
+    from the client — "entry_price" and "exit_price" are required for every
+    row instead, and this route always derives both itself:
+      profit_pct = ((exit_price - entry_price) / entry_price) * 100
+      pnl_amount = exit_price - entry_price    # ₹ profit/loss per share
+    so neither figure can ever drift from the two prices the admin actually
+    entered. Any "profit_pct"/"pnl_amount" present in the request body is
+    ignored.
 
     Phase 6 (trade-card redesign) adds a set of further OPTIONAL per-row
-    fields — "name", "bullish", "trade_label", "pnl_amount" (Profit per
-    share, in ₹ — still a manual figure, since lot size/brokerage aren't
-    derivable from the two prices alone), "date_of_recommendation",
+    fields — "name", "bullish", "trade_label", "date_of_recommendation",
     "exit_date", "duration_days" — on top of the required
     "symbol"/"entry_price"/"exit_price"/"outcome" above. Any of them may be
     omitted or left blank; only a value that IS supplied but isn't the
-    right shape (e.g. a non-numeric pnl_amount) rejects the save, same
+    right shape (e.g. a non-numeric duration_days) rejects the save, same
     "small admin form, not a bulk import" reasoning as the required fields.
     """
     if not _is_admin():
@@ -1760,21 +1761,20 @@ def api_weekly_report_add():
         exit_price, err = _optional_float(row, "exit_price", symbol)
         if err:
             return jsonify({"error": err}), 400
-        # Return % is calculated automatically from entry/exit price, never
-        # accepted as a raw manual number — so both prices are required, and
-        # whatever "profit_pct" the client may have sent is ignored below.
+        # Return % and Profit/Share are both calculated automatically from
+        # entry/exit price, never accepted as raw manual numbers — so both
+        # prices are required, and whatever "profit_pct"/"pnl_amount" the
+        # client may have sent is ignored below.
         if entry_price is None or exit_price is None:
             return jsonify({
                 "error": f"entry_price and exit_price are required for {symbol} "
-                         "to calculate return %"
+                         "to calculate return % and profit per share"
             }), 400
         if entry_price == 0:
             return jsonify({"error": f"entry_price for {symbol} must not be zero"}), 400
         profit_pct = round(((exit_price - entry_price) / entry_price) * 100, 4)
+        pnl_amount = round(exit_price - entry_price, 4)
 
-        pnl_amount, err = _optional_float(row, "pnl_amount", symbol)
-        if err:
-            return jsonify({"error": err}), 400
         duration_days, err = _optional_int(row, "duration_days", symbol)
         if err:
             return jsonify({"error": err}), 400

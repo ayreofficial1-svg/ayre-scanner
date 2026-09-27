@@ -9,17 +9,17 @@ import DatePicker from './DatePicker'
 // WeeklyReportPanel
 //
 // One past weekly report = a date range plus a row per recommended stock:
-// stock, entry price, exit price, profit per share, date of recommendation.
-// Nothing else is shown here — the older optional fields (company name,
-// trade label, duration, per-row enabled) still round-trip through the API
-// untouched but are no longer edited on this screen.
+// stock, entry price, exit price, date of recommendation. Nothing else is
+// shown here — the older optional fields (company name, trade label,
+// duration, per-row enabled) still round-trip through the API untouched
+// but are no longer edited on this screen.
 //
 // Return % is no longer a manual field — it is always derived from Entry
 // price and Exit price (server-side, authoritatively, in POST
 // /api/weekly-report) so it can never drift from the two prices the admin
-// actually entered. Profit per share (₹) IS still manual — it is the ₹
-// figure per share, which the two prices alone can't tell us (lot size,
-// brokerage, etc. are the admin's call) — and is optional.
+// actually entered. Profit per share (₹) works the same way now — it's
+// exit price minus entry price, shown live as the admin types, and never a
+// separately-typed number either.
 //
 // `outcome` ("target"/"stop_loss") is still required by the API/Flutter
 // parser, so it's derived automatically from the sign of the computed
@@ -31,7 +31,6 @@ type StockRow = {
   symbol: string
   entry_price: string
   exit_price: string
-  pnl_amount: string
   date_of_recommendation: string
 }
 
@@ -39,7 +38,6 @@ const EMPTY_ROW = (): StockRow => ({
   symbol: '',
   entry_price: '',
   exit_price: '',
-  pnl_amount: '',
   date_of_recommendation: '',
 })
 
@@ -52,6 +50,12 @@ function outcomeFor(profitPct: number): WeeklyReportOutcome {
 // app will end up showing.
 function computeProfitPct(entryPrice: number, exitPrice: number): number {
   return ((exitPrice - entryPrice) / entryPrice) * 100
+}
+
+// Mirrors the backend's own calculation (main.py::api_weekly_report_add) —
+// ₹ profit/loss per share is exit price minus entry price.
+function computePnlAmount(entryPrice: number, exitPrice: number): number {
+  return exitPrice - entryPrice
 }
 
 function emptyForm() {
@@ -118,7 +122,6 @@ export default function WeeklyReportPanel() {
             symbol: s.symbol,
             entry_price: s.entry_price != null ? String(s.entry_price) : '',
             exit_price: s.exit_price != null ? String(s.exit_price) : '',
-            pnl_amount: s.pnl_amount != null ? String(s.pnl_amount) : '',
             date_of_recommendation: s.date_of_recommendation ?? '',
           }))
         : [EMPTY_ROW()],
@@ -145,20 +148,19 @@ export default function WeeklyReportPanel() {
     event.preventDefault()
     setError(null)
 
-    const numOrUndefined = (v: string) => (v.trim() === '' ? undefined : Number(v))
-
     const rows = form.stocks
       .map(row => {
         const entry_price = Number(row.entry_price)
         const exit_price = Number(row.exit_price)
         const profit_pct = computeProfitPct(entry_price, exit_price)
+        const pnl_amount = computePnlAmount(entry_price, exit_price)
         return {
           symbol: row.symbol.trim().toUpperCase(),
           entry_price,
           exit_price,
           profit_pct,
+          pnl_amount,
           outcome: outcomeFor(profit_pct),
-          pnl_amount: numOrUndefined(row.pnl_amount),
           date_of_recommendation: row.date_of_recommendation || undefined,
         }
       })
@@ -178,10 +180,6 @@ export default function WeeklyReportPanel() {
     }
     if (rows.some(row => Number.isNaN(row.exit_price))) {
       setError('Exit price is required and must be numeric, for every stock row')
-      return
-    }
-    if (rows.some(row => row.pnl_amount !== undefined && Number.isNaN(row.pnl_amount))) {
-      setError('Profit per share must be numeric')
       return
     }
 
@@ -257,6 +255,7 @@ export default function WeeklyReportPanel() {
               row.entry_price.trim() !== '' && row.exit_price.trim() !== '' &&
               !Number.isNaN(entry) && !Number.isNaN(exit) && entry !== 0
             const livePct = hasBothPrices ? computeProfitPct(entry, exit) : null
+            const livePnl = hasBothPrices ? computePnlAmount(entry, exit) : null
 
             return (
               <div className="report-row" key={index}>
@@ -297,13 +296,13 @@ export default function WeeklyReportPanel() {
                     />
                   </label>
                   <label className="field">
-                    <span>Profit per share (₹)</span>
+                    <span>Profit/Share (auto)</span>
                     <input
-                      type="number"
-                      step="0.01"
-                      value={row.pnl_amount}
-                      onChange={e => updateRow(index, { pnl_amount: e.target.value })}
-                      placeholder="₹ (optional)"
+                      type="text"
+                      value={livePnl == null ? '—' : inr(livePnl)}
+                      readOnly
+                      disabled
+                      title="Calculated automatically from Entry price and Exit price"
                     />
                   </label>
                   <DatePicker

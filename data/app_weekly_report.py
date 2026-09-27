@@ -11,12 +11,12 @@ This is admin-entered data, not computed from live market data. There is
 no code anywhere in this repo that watches a fired signal afterwards to
 determine whether price later hit a target or a stop loss (see
 IMPLEMENTATION_SPEC_weekly_report_and_sentiment.md §A.4) — the owner enters
-the week, the stocks, their entry/exit price and (optionally) profit per
-share by hand on the website. `profit_pct` itself is NOT hand-entered: the
-API route (main.py's POST /api/weekly-report) always derives it from
-`entry_price`/`exit_price` before it ever reaches this module, so what
-lands in storage is a calculated value, not a typed-in one. This module
-just stores exactly what it's given.
+the week, the stocks, and their entry/exit price by hand on the website.
+`profit_pct` and `pnl_amount` are NOT hand-entered: the API route (main.py's
+POST /api/weekly-report) always derives both from `entry_price`/
+`exit_price` before they ever reach this module, so what lands in storage
+is a calculated value, not a typed-in one. This module just stores exactly
+what it's given.
 
 Entry schema (JSON list)
 ─────────────────────────
