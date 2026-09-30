@@ -73,6 +73,7 @@ from scanner.watchlist import (
 from scanner.engine import run_scan
 from scanner.historical import run_historical_scan
 from utils.logger import get_log_summary
+from utils.scan_progress import LIVE_PROGRESS, BACKTEST_PROGRESS
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk, fetch_full_market_breadth
 from data.app_signals import (
     load_signals, add_signal, update_signal, delete_signal,
@@ -484,6 +485,22 @@ def api_results():
     })
 
 
+@app.route("/api/scan/progress")
+def api_scan_progress():
+    """
+    Live progress of the scheduled/manual scan ("live") and of the Backtest
+    scan ("backtest"), read from the in-memory trackers the scan loops feed
+    (utils/scan_progress.py). Pure memory read — never touches Fyers — so the
+    website can poll it every second while a scan runs.
+    """
+    resp = jsonify({
+        "live"    : LIVE_PROGRESS.snapshot(),
+        "backtest": BACKTEST_PROGRESS.snapshot(),
+    })
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/api/rescan", methods=["POST"])
 def api_rescan():
     if _state["scanning"]:
@@ -670,14 +687,22 @@ def api_backtest_state_set():
 def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
     global _fyers, _symbols
 
+    progress_error: str | None = None
+    progress_run = BACKTEST_PROGRESS.start(
+        total=len(_symbols or []), target_date=target_date.isoformat()
+    )
     try:
         print(f"🧪  Backtest API request: date={target_date.isoformat()}")
         if _symbols is None:
             _symbols = fetch_nifty500()
         if _fyers is None:
             _fyers = reconnect_fyers()
+        BACKTEST_PROGRESS.set_total(len(_symbols))
 
-        result = run_historical_scan(_fyers, _symbols, target_date)
+        result = run_historical_scan(
+            _fyers, _symbols, target_date, progress=BACKTEST_PROGRESS
+        )
+        progress_error = result.get("error")
         scan_time = datetime.datetime.now(_IST).strftime("%d %b %Y %H:%M:%S")
         requested = datetime.date.fromisoformat(result["requested_date"]).strftime("%d %b %Y")
         resolved = (
@@ -757,6 +782,7 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
             _backtest_state["error"] = payload.get("error")
             _bt_commit_locked()
     except Exception as e:
+        progress_error = str(e)
         print(f"🧪  Backtest job failed: id={job_id} error={e}")
         with _backtest_lock:
             if job_id in _backtest_jobs:
@@ -767,6 +793,7 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
             _backtest_state["error"] = str(e)
             _bt_commit_locked()
     finally:
+        BACKTEST_PROGRESS.finish(error=progress_error, run_id=progress_run)
         # §3: marks "a heavy Fyers op just finished" for the breadth
         # poller's busy-guard cooldown — set regardless of success/failure.
         _state["last_heavy_fyers_op_at"] = time.time()
@@ -2021,6 +2048,7 @@ def _do_scan():
     global _fyers, _symbols
     _state["scanning"] = True
     _state["error"]    = None
+    progress_run = LIVE_PROGRESS.start(total=len(_symbols or []))
     try:
         if not _fyers_market_data_allowed():
             _state["error"] = "Scan skipped because the market is not source-confirmed open."
@@ -2037,6 +2065,7 @@ def _do_scan():
             interval  = "D",
             watchlist = watchlist,
             alert_log = alert_log,
+            progress  = LIVE_PROGRESS,
         )
 
         _state["signals"]         = signals
@@ -2058,7 +2087,11 @@ def _do_scan():
     except Exception as e:
         _state["error"] = str(e)
     finally:
+        # `scanning` flips first so that by the time the website sees the
+        # progress tracker go inactive, /api/results already reports the
+        # finished scan.
         _state["scanning"] = False
+        LIVE_PROGRESS.finish(error=_state.get("error"), run_id=progress_run)
         # §3: marks "a heavy Fyers op just finished" for the breadth
         # poller's busy-guard cooldown — set regardless of success/failure.
         _state["last_heavy_fyers_op_at"] = time.time()

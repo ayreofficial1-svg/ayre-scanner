@@ -164,6 +164,7 @@ def _apply_weekly_filter(
 def _evaluate_all(
     candle_data: dict[str, pd.DataFrame],
     weekly_status: dict[str, bool | None],
+    progress=None,
 ) -> tuple[dict[str, dict], list[dict], list[dict], dict[str, int], dict[str, int], list[dict]]:
     results: dict[str, dict] = {}
     signals: list[dict] = []
@@ -172,7 +173,12 @@ def _evaluate_all(
     stage_counts: Counter[str] = Counter()
     evaluation_errors: list[dict] = []
 
-    for symbol, raw in candle_data.items():
+    if progress is not None:
+        progress.begin_analyse(len(candle_data))
+
+    for eval_idx, (symbol, raw) in enumerate(candle_data.items()):
+        if progress is not None:
+            progress.analyse_done(eval_idx)   # symbols fully evaluated so far
         try:
             res = evaluate_debug(symbol, raw, weekly_rising=weekly_status.get(symbol))
         except Exception as exc:
@@ -199,6 +205,9 @@ def _evaluate_all(
             signals.append(values)
         elif status == "watchlist":
             watchlist_items.append(values)
+
+    if progress is not None:
+        progress.analyse_done(len(candle_data))
 
     return (
         results,
@@ -234,6 +243,7 @@ def run_historical_scan(
     csv_output: str | None = None,
     json_output: str | None = None,
     quiet_mode: bool = True,
+    progress=None,
 ) -> dict[str, Any]:
     """
     Run the debug_run.py historical execution flow without mutating live
@@ -252,6 +262,7 @@ def run_historical_scan(
         symbols=symbols,
         range_to=target_date,
         verbose=False,
+        progress=progress,
     )
     print(
         "🧪  Backtest fetch complete: "
@@ -352,7 +363,7 @@ def run_historical_scan(
         status_counts,
         stage_counts,
         evaluation_errors,
-    ) = _evaluate_all(prepared, weekly_status)
+    ) = _evaluate_all(prepared, weekly_status, progress=progress)
 
     # ── Symbols with no usable data: list them so the full universe is visible ─
     # They are NOT counted as evaluated and are never mistaken for rejections.

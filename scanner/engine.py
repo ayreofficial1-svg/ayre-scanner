@@ -213,6 +213,7 @@ def run_scan(
     watchlist : dict,
     alert_log : dict,
     verbose   : bool = False,
+    progress  = None,
 ) -> tuple[list[dict], list[dict], dict, dict]:
     """
     Execute a full scan across all symbols.
@@ -225,6 +226,9 @@ def run_scan(
     watchlist   : mutable dict loaded from watchlist.json
     alert_log   : mutable dict loaded from alert_log.json
     verbose     : if True, print per-symbol results
+    progress    : optional utils.scan_progress.ScanProgress. Fed from counters
+                  the scan already keeps (in-memory only — no extra Fyers calls)
+                  so the website can show live progress.
 
     Returns
     -------
@@ -250,7 +254,7 @@ def run_scan(
     weekly_report: dict = {"valid": 0, "no_data": 0, "failed": 0, "attempted": 0}
 
     candle_data, fetch_report = fetch_candles_bulk_persistent(
-        fyers, symbols, interval, verbose
+        fyers, symbols, interval, verbose, progress=progress
     )
     if WEEKLY_RISING_FILTER:
         weekly_data, weekly_report = weekly_candles_from_daily(candle_data)
@@ -348,7 +352,12 @@ def run_scan(
     # ── Step 3: Evaluate each symbol ─────────────────────────────────────────
     print("⚙️   Evaluating conditions …")
 
-    for symbol, raw in candle_data.items():
+    if progress is not None:
+        progress.begin_analyse(len(candle_data))
+
+    for eval_idx, (symbol, raw) in enumerate(candle_data.items()):
+        if progress is not None:
+            progress.analyse_done(eval_idx)   # symbols fully evaluated so far
         try:
             # NEW — computed once, shared by evaluate() AND the stats
             # capture below. Pure pandas over ~700 rows; zero Fyers cost.
@@ -451,6 +460,9 @@ def run_scan(
             if verbose:
                 print(f"   ⚠️  {symbol}: {e}")
             continue
+
+    if progress is not None:
+        progress.analyse_done(len(candle_data))
 
     save_watchlist(watchlist)
 

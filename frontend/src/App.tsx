@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
-import type { BacktestDebugResult, DebugStatus, ScanState } from './types'
+import type {
+  BacktestDebugResult, DebugStatus, ScanProgressInfo, ScanProgressResponse, ScanState,
+} from './types'
 import Clock from './components/Clock'
 import ScanRing from './components/ScanRing'
+import ScanProgress from './components/ScanProgress'
 import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
 import SignalsPanel from './components/SignalsPanel'
@@ -185,6 +188,11 @@ export default function App() {
   //    reset results. ────────────────────────────────────────────────────────
   const [backtestFilter, setBacktestFilter] = useState<BacktestFilter>('all')
 
+  // Live scan progress (scheduled/manual scan + backtest). Fed by
+  // /api/scan/progress — an in-memory read on the server, no Fyers calls.
+  const [progress, setProgress] = useState<ScanProgressResponse | null>(null)
+  const progressWasActive = useRef({ live: false, backtest: false })
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
     localStorage.setItem('theme', theme)
@@ -252,6 +260,7 @@ export default function App() {
       return
     }
     poll()
+    setTimeout(() => { pollProgress() }, 400)
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -336,6 +345,38 @@ export default function App() {
     const id = setInterval(syncBacktest, backtestRunning ? 3_000 : 10_000)
     return () => clearInterval(id)
   }, [auth, syncBacktest, backtestRunning])
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Live scan progress.
+  //
+  // Polled every second while a scan/backtest is running and every few seconds
+  // otherwise (so scheduled scans that start on their own are noticed within a
+  // moment). When a run finishes, the real results are fetched immediately
+  // rather than waiting for the slower regular polls.
+  // ─────────────────────────────────────────────────────────────────────────
+  const pollProgress = useCallback(async () => {
+    if (auth !== 'authenticated') return
+    try {
+      const res = await fetch('/api/scan/progress', { cache: 'no-store' })
+      if (res.status === 401) { setAuth('login'); return }
+      if (!res.ok) return
+      const data = await res.json() as ScanProgressResponse
+      setProgress(data)
+
+      const was = progressWasActive.current
+      progressWasActive.current = { live: data.live.active, backtest: data.backtest.active }
+      if (was.live && !data.live.active)         poll()
+      if (was.backtest && !data.backtest.active) syncBacktest()
+    } catch { /* keep last progress */ }
+  }, [auth, poll, syncBacktest])
+
+  const anyScanActive = !!(progress?.live.active || progress?.backtest.active)
+  useEffect(() => {
+    if (auth !== 'authenticated') return
+    pollProgress()
+    const id = setInterval(pollProgress, anyScanActive ? 1_000 : 3_000)
+    return () => clearInterval(id)
+  }, [auth, pollProgress, anyScanActive])
 
   // Explicit, shared changes to the page state (persisted on the server).
   const saveBacktestSetting = async (patch: { date?: string; filter?: BacktestFilter }) => {
@@ -468,8 +509,14 @@ export default function App() {
 
   // ── Derive the active state for the current view. ─────────────────────────
   const activeState = view === 'backtest' ? backtest.state : state
-  const { scanning, scan_time, total_scanned, signals, watchlist_items, error } = activeState
-  const backtestLoading = backtest.loading
+  const { scan_time, total_scanned, signals, watchlist_items, error } = activeState
+  const backtestLoading = backtest.loading || !!progress?.backtest.active
+
+  // A scan counts as running if either the page state or the live progress
+  // tracker says so — so scheduled scans that start on their own show up
+  // within a second instead of waiting for the next results poll.
+  const activeProgress = view === 'backtest' ? progress?.backtest ?? null : progress?.live ?? null
+  const scanning = activeState.scanning || !!activeProgress?.active
 
   return (
     <Frame>
@@ -565,6 +612,9 @@ export default function App() {
 
             <Results
               state={activeState}
+              scanning={scanning}
+              progress={activeProgress}
+              backtestRunning={backtestLoading}
               view={view}
               tradeReadyTimes={tradeReadyTimes}
               backtestFilter={backtestFilter}
@@ -591,18 +641,24 @@ export default function App() {
 // ─────────────────────────────────────────────────────────────────────────────
 function Results({
   state,
+  scanning,
+  progress,
+  backtestRunning,
   view,
   tradeReadyTimes,
   backtestFilter,
   onBacktestFilter,
 }: {
   state: ScanState
+  scanning: boolean
+  progress: ScanProgressInfo | null
+  backtestRunning: boolean
   view: View
   tradeReadyTimes: TradeReadyTimes
   backtestFilter: BacktestFilter
   onBacktestFilter: (filter: BacktestFilter) => void
 }) {
-  const { scanning, signals, watchlist_items } = state
+  const { signals, watchlist_items } = state
 
   if (view === 'backtest') {
     // Always render the BacktestResults component in backtest mode.
@@ -610,6 +666,8 @@ function Results({
     return (
       <BacktestResults
         scanning={scanning}
+        progress={progress}
+        running={backtestRunning}
         results={state.backtest_results ?? []}
         filter={backtestFilter}
         onFilter={onBacktestFilter}
@@ -628,7 +686,7 @@ function Results({
           </span>
         </div>
         {scanning ? (
-          <ScanRing />
+          <ScanProgress progress={progress} kind="live" />
         ) : signals.length > 0 ? (
           <div className="trade-ready-list">
             {signals.map(s => (
@@ -672,11 +730,15 @@ function Results({
 // ─────────────────────────────────────────────────────────────────────────────
 function BacktestResults({
   scanning,
+  progress,
+  running,
   results,
   filter,
   onFilter,
 }: {
   scanning: boolean
+  progress: ScanProgressInfo | null
+  running: boolean          // a backtest is genuinely in flight (vs. the initial page load)
   results: BacktestDebugResult[]
   filter: BacktestFilter
   onFilter: (filter: BacktestFilter) => void
@@ -718,7 +780,11 @@ function BacktestResults({
       </div>
 
       {scanning ? (
-        <ScanRing />
+        // Before the first server load `scanning` is true with nothing running:
+        // keep the plain spinner for that, the progress panel for real runs.
+        progress?.active || running
+          ? <ScanProgress progress={progress} kind="backtest" />
+          : <ScanRing />
       ) : results.length === 0 ? (
         <div className="empty-state">
           Select a date and click Run Backtest to see results.
@@ -794,7 +860,9 @@ function BacktestResultRow({ result }: { result: BacktestDebugResult }) {
         )}
       </div>
       {result.category && <p className="result-category">{result.category}</p>}
-      <p className="result-explanation">{result.explanation ?? result.reason}</p>
+      <p className="result-explanation">
+        {highlightTechnical(result.explanation ?? result.reason)}
+      </p>
       {result.explanation && (
         <details className="result-tech">
           <summary>Technical detail</summary>
@@ -811,6 +879,19 @@ function BacktestResultRow({ result }: { result: BacktestDebugResult }) {
         <Metric label="Weekly ↑"  value={formatBool(values.weekly_rising)} />
       </div>
     </article>
+  )
+}
+
+// Technical figures inside a plain-English explanation: ₹ prices, percentages,
+// MACD-style decimals, SMA44/MACD terms, check codes (C1a, C1b/C1c) and day
+// counts. They are wrapped in <span class="tech"> so they read brighter than
+// the surrounding sentence. Display only — the text itself is unchanged.
+const TECH_TOKEN =
+  /(₹\s?\d+(?:,\d{2,3})*(?:\.\d+)?|[+-]?\d+(?:,\d{3})*(?:\.\d+)?%|[+-]?\d+\.\d+x?|\b\d+x\b|\b\d+\s(?:trading\s)?days?\b|\bSMA\d+\b|\bMACD\b|\bC[123][abc]?(?:\/C[123][abc]?)*\b)/g
+
+function highlightTechnical(text: string): ReactNode {
+  return text.split(TECH_TOKEN).map((part, i) =>
+    i % 2 === 1 ? <span key={i} className="tech">{part}</span> : part
   )
 }
 

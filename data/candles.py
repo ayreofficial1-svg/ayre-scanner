@@ -601,6 +601,7 @@ def fetch_candles_bulk(
     symbols : list[str],
     interval: str = "D",
     verbose : bool = False,
+    progress=None,
 ) -> tuple[dict[str, pd.DataFrame], dict]:
     """
     Fetch daily candles for all symbols sequentially (live mode).
@@ -654,6 +655,8 @@ def fetch_candles_bulk(
             results[sym] = df
         else:
             to_retry.append(sym)   # classify after pass-2
+        if progress is not None:
+            progress.fetch_result(sym, df is not None)   # in-memory only
 
         if i % 50 == 0 or i == total:
             print(
@@ -669,6 +672,8 @@ def fetch_candles_bulk(
 
     if to_retry:
         print(f"   🔄  Retrying {len(to_retry)} failed symbols …")
+        if progress is not None:
+            progress.begin_retry(len(to_retry), retry_pass=1)
         time.sleep(_RETRY_PAUSE)
 
         for sym in to_retry:
@@ -676,13 +681,18 @@ def fetch_candles_bulk(
             if df is not None:
                 results[sym] = df
                 recovered_count += 1
+                outcome = "valid"
             else:
                 # Classify: structural missing vs transient error
                 bucket = _classify_symbol(fyers, sym)
                 if bucket == "no_data":
                     no_data.append(sym)
+                    outcome = "no_data"
                 else:
                     still_failed.append(sym)
+                    outcome = "failed"
+            if progress is not None:
+                progress.retry_result(sym, outcome)
 
         if recovered_count:
             print(f"   ✅  Recovered {recovered_count} on retry")
@@ -724,6 +734,9 @@ def fetch_candles_bulk(
         "failed"    : len(still_failed),
         "recovered" : recovered_count,
         "missing"   : missing,   # valid + no_data + failed == attempted
+        # Only the symbols that failed for transient reasons (excludes
+        # no_data). fetch_candles_bulk_persistent() retries exactly these.
+        "failed_symbols": list(still_failed),
     }
 
     return results, report
@@ -734,6 +747,7 @@ def fetch_candles_bulk_persistent(
     symbols : list[str],
     interval: str = "D",
     verbose : bool = False,
+    progress=None,
 ) -> tuple[dict[str, pd.DataFrame], dict]:
     """
     Fetch candles with persistent retry logic for failed symbols.
@@ -776,13 +790,16 @@ def fetch_candles_bulk_persistent(
     """
     if not _PERSISTENT_RETRY_ENABLED:
         # Persistent retry disabled — just run standard fetch
-        return fetch_candles_bulk(fyers, symbols, interval, verbose)
+        return fetch_candles_bulk(fyers, symbols, interval, verbose, progress=progress)
 
     # ── Step 1: Standard two-pass fetch and classification ──────────────────
-    results, report = fetch_candles_bulk(fyers, symbols, interval, verbose)
+    results, report = fetch_candles_bulk(fyers, symbols, interval, verbose, progress=progress)
 
     # ── Step 2: Persistent retry loop for failed symbols ────────────────────
-    failed_symbols = report["missing"].copy()  # Start with no_data + failed
+    # Retry ONLY symbols that failed for transient reasons. Symbols already
+    # classified as no_data (Fyers has no history) are final: re-fetching them
+    # wastes ~6 Fyers requests each per wave and double-counts them below.
+    failed_symbols = list(report.get("failed_symbols", []))
     no_data_set = set()
     retry_attempt = 0
     retry_interval = _PERSISTENT_RETRY_INTERVAL
@@ -799,6 +816,8 @@ def fetch_candles_bulk_persistent(
             f"   🔄  Persistent retry attempt {retry_attempt}/{_PERSISTENT_MAX_RETRIES if _PERSISTENT_MAX_RETRIES > 0 else '∞'} "
             f"({failed_count} symbols) — waiting {retry_interval:.1f}s …"
         )
+        if progress is not None:
+            progress.begin_retry(failed_count, retry_pass=retry_attempt + 1)
         time.sleep(retry_interval)
 
         # Retry all currently-failed symbols
@@ -811,13 +830,18 @@ def fetch_candles_bulk_persistent(
                 results[sym] = df
                 newly_recovered.append(sym)
                 persistent_recovered += 1
+                outcome = "valid"
             else:
                 # Classify this symbol to decide if it's no_data or still failing
                 bucket = _classify_symbol(fyers, sym)
                 if bucket == "no_data":
                     no_data_set.add(sym)
+                    outcome = "no_data"
                 else:
                     still_failed.append(sym)
+                    outcome = "failed"
+            if progress is not None:
+                progress.retry_result(sym, outcome)
 
         persistent_retries += 1
 
@@ -838,8 +862,14 @@ def fetch_candles_bulk_persistent(
 
     # ── Step 3: Generate updated report ────────────────────────────────────
     # Update the original report with persistent retry results
+    # valid + no_data + failed == attempted must still hold after recoveries,
+    # so valid is refreshed from the final results. no_data_set only holds
+    # symbols reclassified during these waves (they were counted as "failed"
+    # before), so adding it here does not double-count.
+    report["valid"] = len(results)
     report["failed"] = len(failed_symbols)
     report["no_data"] += len(no_data_set)
+    report["failed_symbols"] = list(failed_symbols)
     report["persistent_retries"] = persistent_retries
     report["persistent_recovered"] = persistent_recovered
     report["missing"] = [s for s in symbols if s not in results]
@@ -858,6 +888,7 @@ def fetch_candles_bulk_at_date(
     symbols : list[str],
     range_to: datetime.date | None = None,
     verbose : bool = False,
+    progress=None,
 ) -> tuple[dict[str, pd.DataFrame], dict]:
     """
     Fetch candles for all symbols at a specific date (or today if range_to=None).
@@ -907,6 +938,8 @@ def fetch_candles_bulk_at_date(
             results[sym] = df
         else:
             to_retry.append(sym)
+        if progress is not None:
+            progress.fetch_result(sym, df is not None)   # in-memory only
 
         if i % 50 == 0 or i == total:
             print(
@@ -922,6 +955,8 @@ def fetch_candles_bulk_at_date(
 
     if to_retry:
         print(f"   🔄  Retrying {len(to_retry)} failed symbols …")
+        if progress is not None:
+            progress.begin_retry(len(to_retry), retry_pass=1)
         time.sleep(_RETRY_PAUSE)
 
         for sym in to_retry:
@@ -929,13 +964,18 @@ def fetch_candles_bulk_at_date(
             if df is not None:
                 results[sym] = df
                 recovered_count += 1
+                outcome = "valid"
             else:
                 # Classify: structural missing vs transient error
                 bucket = _classify_symbol(fyers, sym, range_to)
                 if bucket == "no_data":
                     no_data.append(sym)
+                    outcome = "no_data"
                 else:
                     still_failed.append(sym)
+                    outcome = "failed"
+            if progress is not None:
+                progress.retry_result(sym, outcome)
 
         if recovered_count:
             print(f"   ✅  Recovered {recovered_count} on retry")
@@ -985,6 +1025,8 @@ def fetch_candles_bulk_at_date(
             f"   🔄  Persistent retry attempt {retry_attempt}/{_PERSISTENT_MAX_RETRIES if _PERSISTENT_MAX_RETRIES > 0 else '∞'} "
             f"({failed_count} symbols) — waiting {retry_interval:.1f}s …"
         )
+        if progress is not None:
+            progress.begin_retry(failed_count, retry_pass=retry_attempt + 1)
         time.sleep(retry_interval)
 
         newly_recovered = []
@@ -996,12 +1038,17 @@ def fetch_candles_bulk_at_date(
                 results[sym] = df
                 newly_recovered.append(sym)
                 persistent_recovered += 1
+                outcome = "valid"
             else:
                 bucket = _classify_symbol(fyers, sym, range_to)
                 if bucket == "no_data":
                     no_data_set.add(sym)
+                    outcome = "no_data"
                 else:
                     still_failed_after.append(sym)
+                    outcome = "failed"
+            if progress is not None:
+                progress.retry_result(sym, outcome)
 
         persistent_retries += 1
 

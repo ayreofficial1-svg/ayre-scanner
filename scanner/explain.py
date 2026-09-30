@@ -8,8 +8,13 @@ scanner.debug_evaluate.evaluate_debug() into a short, specific explanation
 of WHY a stock landed in its category. It only reads values — it never
 changes any pass/fail decision.
 
+Explanations are deliberately concise: one or two short sentences per check,
+each carrying the real numbers that decided it. The website highlights those
+technical figures (₹ prices, percentages, MACD values, SMA44, day counts) in
+brighter text, so keep them in plain "₹1,234.50" / "2.10%" / "0.1234" form.
+
 Returns:
-    {"category": "<short plain label>", "explanation": "<several sentences>"}
+    {"category": "<short plain label>", "explanation": "<short paragraph>"}
 """
 
 from __future__ import annotations
@@ -91,30 +96,24 @@ def _age(bars_ago) -> str:
 
 # ── reusable building blocks ─────────────────────────────────────────────────
 def _trend_ok_sentence(d: dict) -> str:
-    """'The long-term trend check passed' sentence with real numbers."""
-    parts = [
-        f"The 44-day average price line (SMA44) is at {_rs(d.get('sma44_today'))}"
-    ]
+    """Trend check passed, with the real numbers."""
+    sma = f"44-day average (SMA44) {_rs(d.get('sma44_today'))}"
     if d.get("sma44_lookback") is not None and d.get("pct_slope") is not None:
-        parts.append(
-            f", versus {_rs(d.get('sma44_lookback'))} {_bars(d.get('sma_slope_lookback', SMA_SLOPE_LOOKBACK))} ago "
+        sma += (
+            f" vs {_rs(d.get('sma44_lookback'))} "
+            f"{_bars(d.get('sma_slope_lookback', SMA_SLOPE_LOOKBACK))} ago "
             f"({_signed_pct(d.get('pct_slope'))})"
         )
     ma_type = d.get("ma_type")
     if ma_type == "type1":
-        parts.append(", so the trend is clearly rising.")
-    elif ma_type == "type2":
-        parts.append(
-            ", so the line is flat or only just turning up — a base-building / recovering trend, "
-            "which the scanner accepts."
-        )
-    else:
-        parts.append(", and it passed the trend checks.")
-    return "".join(parts)
+        return f"{sma} — clearly rising."
+    if ma_type == "type2":
+        return f"{sma} — flat or just turning up (base-building, accepted)."
+    return f"{sma} — passed the trend checks."
 
 
 def _support_ok_sentence(d: dict) -> str:
-    """'Price is at its support line' sentence with real numbers."""
+    """Price is at its support line, with the real numbers."""
     low_dist = d.get("low_vs_sma44_pct")
     try:
         low_dist_f = float(low_dist)
@@ -123,50 +122,43 @@ def _support_ok_sentence(d: dict) -> str:
 
     if d.get("price_interaction_type") == "crossover" and low_dist_f is not None and low_dist_f < 0:
         s = (
-            f"Price tested that line today: it dipped to {_rs(d.get('low_today'))} "
-            f"({_abs_pct(low_dist_f)} below the line) and then recovered to close at "
-            f"{_rs(d.get('close'))}, {_abs_pct(d.get('close_vs_sma_pct'))} above it — "
-            f"buyers stepped in right at the line."
+            f"dipped to {_rs(d.get('low_today'))} ({_abs_pct(low_dist_f)} below SMA44), "
+            f"then closed {_rs(d.get('close'))}, {_abs_pct(d.get('close_vs_sma_pct'))} above — "
+            "buyers defended the line."
         )
     else:
         where = "above" if (low_dist_f is None or low_dist_f >= 0) else "below"
         s = (
-            f"Price came down to the line today: the low of {_rs(d.get('low_today'))} was only "
-            f"{_abs_pct(low_dist_f)} {where} it (allowed: within {_BUFFER_PCT}%), and the stock closed at "
-            f"{_rs(d.get('close'))}, {_abs_pct(d.get('close_vs_sma_pct'))} above the line."
+            f"low {_rs(d.get('low_today'))} came within {_abs_pct(low_dist_f)} {where} SMA44 "
+            f"(limit {_BUFFER_PCT}%); closed {_rs(d.get('close'))}, "
+            f"{_abs_pct(d.get('close_vs_sma_pct'))} above it."
         )
     if d.get("is_double_bottom"):
-        s += (
-            " It also touched this line within the last 20 days and held, "
-            "so buyers have defended this level more than once."
-        )
+        s += " It also held this line within the last 20 days."
     return s
 
 
 def _weekly_sentence(d: dict) -> str:
     w = d.get("weekly_rising")
     if w is True:
-        return "The weekly chart agrees: the weekly 44-period average is also rising."
+        return "Weekly SMA44 is also rising."
     if w is False:
-        return (
-            "Caution: the weekly 44-period average is NOT rising. The scanner no longer removes such stocks "
-            "before analysis, so this one is shown for your judgement — treat it with extra care."
-        )
-    return "The weekly trend could not be measured (not enough weekly history), so it is not used here."
+        return "Caution: weekly SMA44 is not rising (shown for your judgement)."
+    return "Weekly trend unavailable (too little weekly history)."
 
 
 def _prior_checks_passed(d: dict, up_to: str) -> str:
-    """Which earlier checks this stock cleared, for rejected stocks."""
+    """Which earlier checks a rejected stock cleared."""
     cleared = []
     if up_to in ("c1_slope", "c2_close_vs_sma", "c3_macd"):
-        cleared.append("the trend is pointing up (C1a)")
+        cleared.append("trend up (C1a)")
     if up_to in ("c2_close_vs_sma", "c3_macd"):
-        cleared.append("the trend has a healthy size and steadiness (C1b/C1c)")
+        cleared.append("trend size and steadiness (C1b/C1c)")
     if up_to == "c3_macd":
-        cleared.append("price is sitting at its support line (C2)")
+        cleared.append("price at support (C2)")
     if not cleared:
         return ""
-    return "It did clear the earlier checks: " + "; ".join(cleared) + ". "
+    return "Passed: " + ", ".join(cleared) + ". "
 
 
 # ── main entry point ─────────────────────────────────────────────────────────
@@ -184,30 +176,29 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
     if status == "signal" and cross_type == "confirmed":
         age = _age(payload.get("crossover_bars_ago", d.get("crossover_found_bars_ago")))
         text = (
-            "Why Trade Ready: the stock passed all three tests. "
-            f"1) Trend — {_trend_ok_sentence(d)} "
-            f"2) Support — {_support_ok_sentence(d)} "
-            f"3) Momentum — the MACD line crossed above its signal line {age} "
-            f"(MACD {_num(d.get('macd_cur'), 4)} vs signal {_num(d.get('signal_cur'), 4)}), "
-            "which is the buy trigger. "
+            "Passed all three tests. "
+            f"Trend: {_trend_ok_sentence(d)} "
+            f"Support: {_support_ok_sentence(d)} "
+            f"Momentum: MACD crossed above its signal line {age} "
+            f"(MACD {_num(d.get('macd_cur'), 4)} vs signal {_num(d.get('signal_cur'), 4)}) — the buy trigger. "
             f"{_weekly_sentence(d)} "
-            "Watch-out: the setup weakens if the stock closes back below its 44-day line."
+            "Weakens if it closes below SMA44."
         )
         return {"category": CATEGORY_LABELS["trade_ready_confirmed"], "explanation": text}
 
     # ── Trade Ready: imminent crossover ──────────────────────────────────────
     if status == "signal":
         text = (
-            "Why Trade Ready (early): trend and support checks passed, and momentum is about to turn. "
-            f"1) Trend — {_trend_ok_sentence(d)} "
-            f"2) Support — {_support_ok_sentence(d)} "
-            f"3) Momentum — MACD ({_num(d.get('macd_cur'), 4)}) is still just below its signal line "
-            f"({_num(d.get('signal_cur'), 4)}), but the gap is only {_num(d.get('imminent_gap_ratio'))}% of the signal level "
-            f"(limit {_IMMINENT_GAP_PCT}%) and it has been closing for "
-            f"{d.get('hist_consecutive_rising', '?')} days in a row (needs at least {IMMINENT_HIST_MIN}). "
-            "A crossover looks likely within a day or so, so the scanner promotes it now instead of waiting. "
+            "Trend and support passed; momentum is about to turn. "
+            f"Trend: {_trend_ok_sentence(d)} "
+            f"Support: {_support_ok_sentence(d)} "
+            f"Momentum: MACD {_num(d.get('macd_cur'), 4)} is just under its signal line "
+            f"{_num(d.get('signal_cur'), 4)}. The gap is {_num(d.get('imminent_gap_ratio'))}% of the signal "
+            f"(limit {_IMMINENT_GAP_PCT}%) and has narrowed for "
+            f"{d.get('hist_consecutive_rising', '?')} days running (needs {IMMINENT_HIST_MIN}), "
+            "so a crossover looks likely within a day. "
             f"{_weekly_sentence(d)} "
-            "Watch-out: the crossover has not actually happened yet; if the gap widens again the setup fades."
+            "Not crossed yet — fades if the gap widens."
         )
         return {"category": CATEGORY_LABELS["trade_ready_imminent"], "explanation": text}
 
@@ -217,29 +208,28 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
         missing = []
         if not d.get("imminent_hist_ok"):
             missing.append(
-                f"the gap to the signal line has closed on only {hist_n if hist_n is not None else 0} "
-                f"day(s) in a row (needs {IMMINENT_HIST_MIN}+)"
+                f"the gap has narrowed only {hist_n if hist_n is not None else 0} day(s) "
+                f"running (needs {IMMINENT_HIST_MIN}+)"
             )
         if not d.get("imminent_gap_ok"):
             missing.append(
-                f"the gap is still {_num(d.get('imminent_gap_ratio'))}% of the signal level "
-                f"(must be {_IMMINENT_GAP_PCT}% or less)"
+                f"the gap is {_num(d.get('imminent_gap_ratio'))}% of the signal "
+                f"(max {_IMMINENT_GAP_PCT}%)"
             )
         why_not_yet = (
-            "It is not Trade Ready yet because " + " and ".join(missing) + "."
+            "Not Trade Ready: " + " and ".join(missing) + "."
             if missing else
-            "It is not Trade Ready yet because the crossover has not been confirmed."
+            "Not Trade Ready: crossover not confirmed."
         )
         text = (
-            "Why Watchlist: the price setup is good but momentum has not turned up yet. "
-            f"1) Trend — {_trend_ok_sentence(d)} "
-            f"2) Support — {_support_ok_sentence(d)} "
-            f"3) Momentum — MACD ({_num(d.get('macd_cur'), 4)}) is still below its signal line "
-            f"({_num(d.get('signal_cur'), 4)}) and there was no bullish crossover in the last "
+            "Good price setup, momentum not turned yet. "
+            f"Trend: {_trend_ok_sentence(d)} "
+            f"Support: {_support_ok_sentence(d)} "
+            f"Momentum: MACD {_num(d.get('macd_cur'), 4)} is below its signal line "
+            f"{_num(d.get('signal_cur'), 4)} with no bullish crossover in the last "
             f"{MACD_CROSSOVER_LOOKBACK} days. {why_not_yet} "
             f"{_weekly_sentence(d)} "
-            "What happens next: it moves to Trade Ready when MACD crosses above its signal line, "
-            "and is removed if the stock closes below its 44-day line."
+            "Moves to Trade Ready on a MACD crossover; dropped if it closes below SMA44."
         )
         return {"category": CATEGORY_LABELS["watchlist"], "explanation": text}
 
@@ -247,11 +237,9 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
     if stage == "preflight":
         raw = d.get("raw_bars", 0)
         text = (
-            f"Why skipped: only {raw} daily price bars were available up to this date, and "
-            f"{d.get('valid_bars', 0)} were usable after the indicators warmed up. The scanner needs at least "
-            f"{MIN_BARS} bars (and 44 just to calculate the first SMA44 value) to judge a trend reliably. "
-            "This is typical for a recently listed stock or one with a data gap. "
-            "This is not a judgement on the stock — it simply has too little history on this date."
+            f"Skipped: only {raw} daily bars available ({d.get('valid_bars', 0)} usable after "
+            f"indicator warm-up); the scanner needs {MIN_BARS} (44 just for the first SMA44). "
+            "Typical of a recent listing or a data gap — not a judgement on the stock."
         )
         return {"category": CATEGORY_LABELS["preflight"], "explanation": text}
 
@@ -259,19 +247,16 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
         close_vs = d.get("close_vs_sma_pct")
         try:
             cv = float(close_vs)
-            pos = f"The stock closed {_abs_pct(cv)} {'above' if cv >= 0 else 'below'} that line. "
+            pos = f"Closed {_abs_pct(cv)} {'above' if cv >= 0 else 'below'} it. "
         except (TypeError, ValueError):
             pos = ""
         text = (
-            f"Why rejected: the 44-day average price line (SMA44) is not rising. It is at "
-            f"{_rs(d.get('sma44_today'))} today, versus {_rs(d.get('c1a_sma_n_ago'))} "
-            f"{d.get('c1a_lookback')} days ago, so it is not higher. The scanner also checked the "
-            f"{d.get('c1a_linreg_window')}-day trend of the line and whether it is starting to recover "
-            "over the last 5 days — neither showed an upturn. "
+            f"Rejected: SMA44 is not rising — {_rs(d.get('sma44_today'))} today vs "
+            f"{_rs(d.get('c1a_sma_n_ago'))} {d.get('c1a_lookback')} days ago. "
+            f"The {d.get('c1a_linreg_window')}-day trend and 5-day recovery checks showed no upturn either. "
             f"{pos}"
-            "This strategy only buys pullbacks in stocks whose average is moving up, because buying into a "
-            "falling average means fighting the trend. "
-            "It would qualify once the 44-day line stops falling and starts to rise."
+            "The strategy only buys pullbacks in rising trends. "
+            "Qualifies once SMA44 stops falling and turns up."
         )
         return {"category": CATEGORY_LABELS["c1_sma_rising"], "explanation": text}
 
@@ -281,13 +266,13 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
         pmin, pmax = d.get("pct_slope_min"), d.get("pct_slope_max")
         if not d.get("c1_slope_ready", False):
             detail = (
-                f"There are not enough usable bars to measure the {SMA_SLOPE_LOOKBACK}-day slope "
+                f"Too few usable bars to measure the {SMA_SLOPE_LOOKBACK}-day slope "
                 f"(have {d.get('valid_bars')}, need {SMA_SLOPE_LOOKBACK + 1})."
             )
-            fix = "It can be judged once more history is available."
+            fix = "Can be judged once more history exists."
         elif d.get("c1_slope_error"):
-            detail = "The price data for this stock produced an invalid value for the slope calculation."
-            fix = "It cannot be judged until the data is valid."
+            detail = "The price data produced an invalid slope value."
+            fix = "Cannot be judged until the data is valid."
         else:
             try:
                 pct_f = float(pct)
@@ -302,37 +287,32 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
 
             if not pct_ok and pct_f is not None and pct_f < float(pmin):
                 detail = (
-                    f"Over the last {_bars(SMA_SLOPE_LOOKBACK)} the SMA44 line changed by {_signed_pct(pct_f)}. "
-                    f"The scanner allows at most a {_abs_pct(pmin)} decline, so the trend is too weak."
+                    f"SMA44 changed {_signed_pct(pct_f)} over {_bars(SMA_SLOPE_LOOKBACK)}; "
+                    f"at most a {_abs_pct(pmin)} decline is allowed — trend too weak."
                 )
-                fix = "It would need the 44-day line to stop falling before it qualifies."
+                fix = "Needs SMA44 to stop falling."
             elif not pct_ok and pct_f is not None:
                 detail = (
-                    f"Over the last {_bars(SMA_SLOPE_LOOKBACK)} the SMA44 line rose {_signed_pct(pct_f)}, which "
-                    f"is above the {_abs_pct(pmax)} cap. The stock is stretched after a very fast climb, which "
-                    "raises the risk of a sharp pullback."
+                    f"SMA44 rose {_signed_pct(pct_f)} over {_bars(SMA_SLOPE_LOOKBACK)}, above the "
+                    f"{_abs_pct(pmax)} cap — stretched after a fast climb, so pullback risk is higher."
                 )
-                fix = "It would qualify if the rise cools off and the average grows more steadily."
+                fix = "Qualifies if the rise cools and steadies."
             elif not atr_ok:
                 detail = (
-                    f"The SMA44 line moved {_num(atr_f)} times the stock's normal daily range over "
-                    f"{_bars(SMA_SLOPE_LOOKBACK)} (must be above {_num(d.get('atr_slope_min'))}). "
-                    "That means the line has not climbed enough compared with how much the stock normally "
-                    "moves in a day."
+                    f"SMA44 moved {_num(atr_f)}x the stock's normal daily range over "
+                    f"{_bars(SMA_SLOPE_LOOKBACK)} (needs above {_num(d.get('atr_slope_min'))}) — "
+                    "not enough climb for its usual volatility."
                 )
-                fix = "It would qualify if the 44-day line climbed more clearly."
+                fix = "Needs a clearer climb in SMA44."
             else:
                 detail = (
-                    f"The trend is uneven. The older half of the period was "
-                    f"{_signed_pct(d.get('slope_first_half_pct'))}, but the recent half is only "
-                    f"{_signed_pct(d.get('slope_second_half_pct'))} "
-                    f"(must be {d.get('slope_recent_half_min_pct')}% or better). "
-                    "The stock was rising earlier but has recently gone flat or turned down."
+                    f"Uneven trend: the older half was {_signed_pct(d.get('slope_first_half_pct'))}, "
+                    f"the recent half only {_signed_pct(d.get('slope_second_half_pct'))} "
+                    f"(needs {d.get('slope_recent_half_min_pct')}% or better) — it rose earlier "
+                    "but has gone flat or down."
                 )
-                fix = "It would qualify if the recent part of the trend stopped weakening and turned back up."
-        text = (
-            f"Why rejected: the trend exists but is not healthy enough. {prior}{detail} {fix}"
-        )
+                fix = "Qualifies if the recent trend turns back up."
+        text = f"Rejected: trend exists but is not healthy enough. {prior}{detail} {fix}"
         return {"category": CATEGORY_LABELS["c1_slope"], "explanation": text}
 
     if stage == "c2_close_vs_sma":
@@ -346,26 +326,25 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
         if not d.get("c2a_low_proximity_pass", False):
             if ld is not None and ld > 0:
                 lines.append(
-                    f"Today's low of {_rs(d.get('low_today'))} stayed {_abs_pct(ld)} above the 44-day line "
-                    f"({_rs(d.get('sma44_today'))}); the stock needs to come within {_BUFFER_PCT}% of it. "
-                    "It has not pulled back to the line, so there is no low-risk entry point"
+                    f"Low {_rs(d.get('low_today'))} stayed {_abs_pct(ld)} above SMA44 "
+                    f"({_rs(d.get('sma44_today'))}); it must come within {_BUFFER_PCT}% — "
+                    "no pullback, so no low-risk entry"
                 )
             else:
                 lines.append(
-                    f"Today's low of {_rs(d.get('low_today'))} fell {_abs_pct(ld)} below the 44-day line "
-                    f"({_rs(d.get('sma44_today'))}) — more than the {_BUFFER_PCT}% allowed. "
-                    "That is a deeper break than a normal dip to support"
+                    f"Low {_rs(d.get('low_today'))} fell {_abs_pct(ld)} below SMA44 "
+                    f"({_rs(d.get('sma44_today'))}), beyond the {_BUFFER_PCT}% allowed — "
+                    "deeper than a normal dip"
                 )
         if not d.get("c2b_close_above_sma_pass", False):
             lines.append(
-                f"The stock closed at {_rs(d.get('close'))}, {_abs_pct(d.get('close_vs_sma_pct'))} below the line, "
-                "meaning the line failed to hold as support on this day"
+                f"Closed {_rs(d.get('close'))}, {_abs_pct(d.get('close_vs_sma_pct'))} below the line — "
+                "support failed"
             )
-        body = ". ".join(lines) + "." if lines else "The price did not meet the support rules."
+        body = ". ".join(lines) + "." if lines else "Price did not meet the support rules."
         text = (
-            f"Why rejected: price is not sitting on its support line. {prior}{body} "
-            f"It would qualify if the stock comes back to within {_BUFFER_PCT}% of the 44-day line "
-            "and closes on or above it."
+            f"Rejected: price is not at its support line. {prior}{body} "
+            f"Qualifies if it returns within {_BUFFER_PCT}% of SMA44 and closes on or above it."
         )
         return {"category": CATEGORY_LABELS["c2_close_vs_sma"], "explanation": text}
 
@@ -373,28 +352,25 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
         prior = _prior_checks_passed(d, "c3_macd")
         if d.get("imminent_not_crossed"):
             mom = (
-                f"MACD ({_num(d.get('macd_cur'), 4)}) is below its signal line ({_num(d.get('signal_cur'), 4)}) "
-                f"with no crossover in the last {MACD_CROSSOVER_LOOKBACK} days."
+                f"MACD {_num(d.get('macd_cur'), 4)} is below its signal line "
+                f"{_num(d.get('signal_cur'), 4)} with no crossover in the last {MACD_CROSSOVER_LOOKBACK} days."
             )
         else:
             mom = (
-                f"MACD ({_num(d.get('macd_cur'), 4)}) is already above its signal line "
-                f"({_num(d.get('signal_cur'), 4)}), but that crossover happened more than "
-                f"{MACD_CROSSOVER_LOOKBACK} days ago. The buy trigger is meant to be a fresh crossover, so "
-                "this entry moment has already passed."
+                f"MACD {_num(d.get('macd_cur'), 4)} is already above its signal line "
+                f"{_num(d.get('signal_cur'), 4)}, but the crossover was over "
+                f"{MACD_CROSSOVER_LOOKBACK} days ago — the fresh entry moment has passed."
             )
         text = (
-            f"Why rejected: the price setup is fine but the momentum entry signal is missing. {prior}{mom} "
-            "It would be reconsidered if MACD dips below its signal line and then crosses back above it."
+            f"Rejected: price setup is fine but the momentum trigger is missing. {prior}{mom} "
+            "Reconsidered if MACD dips below its signal line and crosses back above."
         )
         return {"category": CATEGORY_LABELS["c3_macd"], "explanation": text}
 
     if stage == "no_data":
         text = (
-            "Why not analysed: no usable price history was received for this stock up to this date. "
-            "Possible reasons: the stock was not listed yet, was suspended or renamed, or the data request "
-            "failed temporarily. It is listed here so you can see the whole stock universe was attempted — "
-            "this is not a rejection based on the stock's chart."
+            "Not analysed: no usable price history was received (not yet listed, suspended or "
+            "renamed, or a temporary data failure). Not a judgement on the stock's chart."
         )
         return {"category": CATEGORY_LABELS["no_data"], "explanation": text}
 
@@ -402,4 +378,3 @@ def build_explanation(status: str, stage: str, d: dict, payload: dict | None = N
         "category": "Rejected",
         "explanation": "This stock did not meet the scanner's conditions on this date.",
     }
-

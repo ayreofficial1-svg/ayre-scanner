@@ -193,3 +193,40 @@ export interface ScanState {
     debug_outputs?: Record<string, string>
   }
 }
+
+// ── Live scan progress ───────────────────────────────────────────────────────
+// Served by GET /api/scan/progress. Every number is a real counter fed by the
+// scan loops (the same counts shown in the Railway logs) — nothing estimated.
+export type ScanProgressStage = 'idle' | 'fetch' | 'retry' | 'analyse' | 'done' | 'error'
+
+export interface ScanProgressInfo {
+  kind: 'live' | 'backtest'
+  run_id: number
+  active: boolean
+  stage: ScanProgressStage
+  stage_label: string
+  percent: number          // completed fraction of the CURRENT stage, 0-100
+  stage_done: number
+  stage_total: number
+  total: number            // symbols in the universe
+  processed: number
+  valid: number
+  to_retry: number         // still being retried (0 once the scan has finished)
+  no_data: number          // Fyers has no history for these
+  failed: number           // still failing after retries
+  not_scanned: number      // no_data (+ failed once the scan has finished)
+  recovered: number
+  retry_pass: number       // 0 = no retry was needed
+  analysed: number
+  analyse_total: number
+  target_date: string | null
+  started_at: string | null
+  finished_at: string | null
+  elapsed_seconds: number
+  error: string | null
+}
+
+export interface ScanProgressResponse {
+  live: ScanProgressInfo
+  backtest: ScanProgressInfo
+}
