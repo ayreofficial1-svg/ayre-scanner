@@ -35,6 +35,7 @@ from config.settings import (
 )
 from indicators.technical import compute_indicators
 from scanner.conditions import evaluate, _RECENT_HALF_SLOPE_MIN, _slope_consistency_pass, _sma_linreg_slope
+from scanner.explain import build_explanation
 
 
 def _r(v, n: int = 4):
@@ -59,6 +60,7 @@ def _result(symbol: str, stage: str, reason: str, values: dict, status: str = "n
 
 
 _STAGE_ORDER = [
+    "no_data",
     "preflight",
     "c1_sma_rising",
     "c1_slope",
@@ -69,6 +71,7 @@ _STAGE_ORDER = [
 ]
 
 _STAGE_LABEL = {
+    "no_data"           : "NO DATA — no price history received",
     "preflight"         : "PRE-FLIGHT — insufficient data",
     "c1_sma_rising"     : "C1 — SMA44 NOT RISING",
     "c1_slope"          : "C1 — SLOPE VALIDATION FAILED (pct / atr / consistency)",
@@ -458,7 +461,38 @@ def evaluate_debug(
                 f"watchlist as pending. Imminent metadata: {imminent}."
             )
 
-    return _result(tag, stage, reason, display, status=status)
+    result_out = _result(tag, stage, reason, display, status=status)
+    # Plain-English explanation (display only — never affects pass/fail).
+    try:
+        extra = build_explanation(status, stage, display, payload)
+    except Exception:
+        extra = {"category": _STAGE_LABEL.get(stage, stage), "explanation": reason}
+    result_out["category"] = extra["category"]
+    result_out["explanation"] = extra["explanation"]
+    return result_out
+
+
+def no_data_result(symbol: str) -> dict:
+    """Result row for a symbol that returned no usable candles (not analysed)."""
+    tag = (
+        symbol.replace("NSE:", "")
+        .replace("BSE:", "")
+        .replace("-EQ", "")
+        .replace("-BE", "")
+        .strip()
+        or symbol
+    )
+    res = _result(
+        tag,
+        "no_data",
+        "No usable price history was received for this symbol.",
+        {"weekly_rising": None},
+        status="no_data",
+    )
+    extra = build_explanation("no_data", "no_data", {}, {})
+    res["category"] = extra["category"]
+    res["explanation"] = extra["explanation"]
+    return res
 
 
 def _fmt(val, decimals: int = 4) -> str:
@@ -1400,6 +1434,7 @@ def save_html_report(
     <span class="toggle-icon">▼</span>
   </div>
   <div class="card-body">
+    <div class="reason"><strong>{res.get("category", "")}</strong><br>{res.get("explanation", "")}</div>
     <div class="reason">{reason}</div>
     <div class="metrics">{metrics}</div>
     <div class="section">
@@ -1475,7 +1510,9 @@ def save_debug_csv(results: dict, filepath: str = "debug_out.csv") -> None:
             "symbol": res.get("symbol", sym),
             "status": res.get("status"),
             "stage": res.get("stage"),
+            "category": res.get("category"),
             "reason": res.get("reason"),
+            "explanation": res.get("explanation"),
         }
         for key, value in res.get("values", {}).items():
             if isinstance(value, (list, dict)):

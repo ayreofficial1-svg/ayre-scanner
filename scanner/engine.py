@@ -46,6 +46,7 @@ from fyers_apiv3 import fyersModel
 from config.settings import (
     QUALITY_STOCK_WHITELIST,
     WEEKLY_C1A_LOOKBACK,
+    WEEKLY_FILTER_EXCLUDES,
     WEEKLY_RISING_FILTER,
 )
 from data.candles import (
@@ -266,6 +267,7 @@ def run_scan(
     # ── Step 1b: Apply weekly pre-filter results (data already fetched above) ─
     weekly_status: dict[str, bool | None] = {}
     weekly_filtered = 0
+    weekly_not_rising = 0
     symbols_to_evaluate = list(candle_data.keys())
     if WEEKLY_RISING_FILTER:
         print(
@@ -273,24 +275,33 @@ def run_scan(
             f"{weekly_report['no_data']} skipped\n"
         )
 
-        # Filter symbols: only keep those where weekly SMA44 is rising
-        filtered_count = 0
+        # Weekly trend is always computed per symbol (cheap, derived from daily
+        # bars) and passed to evaluate() as metadata. Symbols are only removed
+        # from the scan universe when WEEKLY_FILTER_EXCLUDES is True.
+        not_rising_count = 0
         symbols_to_evaluate_filtered = []
         for sym in symbols_to_evaluate:
             weekly_df = weekly_data.get(sym)
             weekly_rising = _check_weekly_sma_rising(weekly_df)
             weekly_status[sym] = weekly_rising
-            if weekly_rising is not False:
-                symbols_to_evaluate_filtered.append(sym)
-            else:
-                filtered_count += 1
+            if weekly_rising is False:
+                not_rising_count += 1
+                if WEEKLY_FILTER_EXCLUDES:
+                    continue
+            symbols_to_evaluate_filtered.append(sym)
 
-        if filtered_count > 0:
-            print(f"   📉  Weekly rising filter: {filtered_count} symbols excluded (weekly SMA44 not rising)\n")
-
-        symbols_to_evaluate = symbols_to_evaluate_filtered
-        candle_data = {k: v for k, v in candle_data.items() if k in symbols_to_evaluate}
-        weekly_filtered = filtered_count
+        weekly_not_rising = not_rising_count
+        if WEEKLY_FILTER_EXCLUDES:
+            weekly_filtered = not_rising_count
+            if weekly_filtered > 0:
+                print(f"   📉  Weekly rising filter: {weekly_filtered} symbols excluded (weekly SMA44 not rising)\n")
+            symbols_to_evaluate = symbols_to_evaluate_filtered
+            candle_data = {k: v for k, v in candle_data.items() if k in symbols_to_evaluate}
+        else:
+            print(
+                f"   📈  Weekly SMA44 not rising: {weekly_not_rising} symbols "
+                f"(informational only — full universe is scanned)\n"
+            )
 
     # ── Completeness assertion ────────────────────────────────────────────────
     # Every symbol must land in exactly one of: valid, no_data, failed.
@@ -307,6 +318,7 @@ def run_scan(
     fetch_report["daily_valid"] = fetch_report["valid"]
     fetch_report["quality_filtered"] = quality_filtered
     fetch_report["weekly_filtered"] = weekly_filtered
+    fetch_report["weekly_not_rising"] = weekly_not_rising
     fetch_report["evaluated"] = len(candle_data)
 
     if accounted != attempted:

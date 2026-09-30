@@ -7,7 +7,11 @@ from typing import Any
 
 import pandas as pd
 
-from config.settings import QUALITY_STOCK_WHITELIST, WEEKLY_RISING_FILTER
+from config.settings import (
+    QUALITY_STOCK_WHITELIST,
+    WEEKLY_FILTER_EXCLUDES,
+    WEEKLY_RISING_FILTER,
+)
 from data.candles import (
     _MIN_BARS,
     _NUM_WINDOWS,
@@ -17,6 +21,7 @@ from data.candles import (
 )
 from scanner.debug_evaluate import (
     evaluate_debug,
+    no_data_result,
     save_debug_csv,
     save_debug_json,
     summary_table_detailed,
@@ -45,13 +50,16 @@ def _format_date_ordinal(d: datetime.date) -> str:
 def _prepare_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """
     Safety-net deduplication from debug_run.py: keep only the last record per
-    calendar date and require the shared candle minimum.
+    calendar date.
+
+    Short-history stocks (fewer than the shared candle minimum) are NOT dropped
+    any more — they are still evaluated so they appear in the results with a
+    "not enough history" explanation. Only a completely empty frame is unusable.
     """
     if df is None or df.empty:
         return None
     dates = df.index.normalize()
-    deduped = df[~dates.duplicated(keep="last")]
-    return deduped if len(deduped) >= _MIN_BARS else None
+    return df[~dates.duplicated(keep="last")]
 
 
 def _empty_result(
@@ -89,19 +97,27 @@ def _empty_result(
 def _prepare_candle_data(
     candle_data: dict[str, pd.DataFrame],
 ) -> tuple[dict[str, pd.DataFrame], int, datetime.date | None]:
+    """
+    Returns (prepared, short_history_count, anchor_date).
+
+    Nothing is dropped for short history; `short_history_count` is how many
+    symbols have fewer than _MIN_BARS bars (they are still evaluated and
+    reported as "skipped — not enough history").
+    """
     if not candle_data:
         return {}, 0, None
 
     anchor = next(iter(candle_data.values())).index[-1].date()
     prepared: dict[str, pd.DataFrame] = {}
-    dropped_short = 0
+    short_history = 0
     for symbol, raw_df in candle_data.items():
         ready = _prepare_df(raw_df)
         if ready is None:
-            dropped_short += 1
-        else:
-            prepared[symbol] = ready
-    return prepared, dropped_short, anchor
+            continue
+        if len(ready) < _MIN_BARS:
+            short_history += 1
+        prepared[symbol] = ready
+    return prepared, short_history, anchor
 
 
 def _apply_quality_filter(
@@ -130,12 +146,17 @@ def _apply_weekly_filter(
 
     weekly_data, weekly_report = weekly_candles_from_daily(candle_data)
     filtered: dict[str, pd.DataFrame] = {}
+    not_rising = 0
     for symbol, df in candle_data.items():
         weekly_rising = _check_weekly_sma_rising(weekly_data.get(symbol))
         weekly_status[symbol] = weekly_rising
-        if weekly_rising is not False:
-            filtered[symbol] = df
+        if weekly_rising is False:
+            not_rising += 1
+            if WEEKLY_FILTER_EXCLUDES:
+                continue
+        filtered[symbol] = df
 
+    weekly_report["not_rising"] = not_rising
     weekly_report["filtered"] = len(candle_data) - len(filtered)
     return filtered, weekly_status, weekly_report
 
@@ -250,7 +271,10 @@ def run_historical_scan(
 
     prepared, dropped_short, anchor = _prepare_candle_data(candle_data)
     if dropped_short:
-        print(f"    ℹ️   {dropped_short} symbol(s) dropped (< {_MIN_BARS} bars in window)")
+        print(
+            f"    ℹ️   {dropped_short} symbol(s) have < {_MIN_BARS} bars — kept in the scan "
+            f"and reported as 'not enough history'"
+        )
     if not prepared:
         fetch_report["dropped_short"] = dropped_short
         return _empty_result(
@@ -292,6 +316,11 @@ def run_historical_scan(
         )
         if weekly_report.get("filtered", 0):
             print(f"    Weekly rising filter: excluded {weekly_report['filtered']} symbol(s)")
+        elif weekly_report.get("not_rising", 0):
+            print(
+                f"    Weekly SMA44 not rising: {weekly_report['not_rising']} symbol(s) "
+                f"(informational only — full universe evaluated)"
+            )
         if not prepared:
             fetch_report["dropped_short"] = dropped_short
             fetch_report["quality_filtered"] = quality_filtered
@@ -325,6 +354,23 @@ def run_historical_scan(
         evaluation_errors,
     ) = _evaluate_all(prepared, weekly_status)
 
+    # ── Symbols with no usable data: list them so the full universe is visible ─
+    # They are NOT counted as evaluated and are never mistaken for rejections.
+    unusable = [
+        sym for sym in symbols
+        if (sym not in candle_data or _prepare_df(candle_data.get(sym)) is None)
+        and (not QUALITY_STOCK_WHITELIST or sym in QUALITY_STOCK_WHITELIST)
+    ]
+    no_data_count = 0
+    for sym in unusable:
+        row = no_data_result(sym)
+        if row["symbol"] not in results:
+            results[row["symbol"]] = row
+            no_data_count += 1
+    if no_data_count:
+        status_counts["no_data"] = no_data_count
+        stage_counts["no_data"] = no_data_count
+
     if quiet_mode:
         print("\n" + "=" * 70)
         print("SCAN RESULTS (Summary Only — details returned to website)")
@@ -341,7 +387,9 @@ def run_historical_scan(
         {
             "daily_valid": fetch_report.get("valid", 0),
             "prepared": len(prepared),
-            "evaluated": len(results),
+            "evaluated": len(results) - no_data_count,
+            "universe_total": len(symbols),
+            "no_data_symbols": no_data_count,
             "dropped_short": dropped_short,
             "quality_filtered": quality_filtered,
             "weekly_valid": weekly_report.get("valid", 0),
@@ -356,7 +404,8 @@ def run_historical_scan(
     )
     print(
         "🧪  Backtest evaluated: "
-        f"{len(results)} evaluated | "
+        f"{len(results) - no_data_count} evaluated of {len(symbols)} in universe | "
+        f"{no_data_count} no-data | "
         f"{len(signals)} trade ready | "
         f"{len(watchlist_items)} watchlist | "
         f"{status_counts.get('none', 0)} rejected | "

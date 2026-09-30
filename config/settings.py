@@ -172,7 +172,12 @@ APP_ADMIN_USERS_ENV = "SCANNER_ADMIN_USERS"
 DOUBLE_BOTTOM_LOOKBACK = 20    # bars to search for a prior SMA44 support touch (double-bottom pattern)
 
 # ── Weekly Rising Pre-Filter ✅ ────────────────────────────────────────────────
-WEEKLY_RISING_FILTER = True      # If True, require weekly SMA44 also rising before signaling
+WEEKLY_RISING_FILTER = True      # If True, weekly SMA44 trend is computed (from daily bars, 0 API calls)
+                                 # and reported as the informational "weekly_rising" field on every result.
+WEEKLY_FILTER_EXCLUDES = False   # If True, symbols whose weekly SMA44 is NOT rising are removed from the
+                                 # scan universe before evaluation (old behaviour — drops most stocks).
+                                 # If False (default), the FULL universe is evaluated and the weekly trend
+                                 # is only attached as metadata.
 WEEKLY_C1A_LOOKBACK = 10         # same point-check logic applied to weekly bars
 
 # ── Quality Stock Whitelist ℹ ──────────────────────────────────────────────────

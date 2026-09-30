@@ -144,13 +144,15 @@ export interface WeeklyReport {
   updated_at: string
 }
 
-export type DebugStatus = 'signal' | 'watchlist' | 'none' | 'error' | string
+export type DebugStatus = 'signal' | 'watchlist' | 'none' | 'no_data' | 'error' | string
 
 export interface BacktestDebugResult {
   symbol: string
   status: DebugStatus
   stage: string
   reason: string
+  category?: string
+  explanation?: string
   values: Record<string, unknown> & Partial<Signal>
 }
 
@@ -173,6 +175,9 @@ export interface ScanState {
     daily_valid?: number
     prepared?: number
     dropped_short?: number
+    universe_total?: number
+    no_data_symbols?: number
+    weekly_not_rising?: number
     quality_filtered?: number
     weekly_valid?: number
     weekly_no_data?: number

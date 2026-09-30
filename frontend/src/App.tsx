@@ -13,7 +13,7 @@ import DatePicker from './components/DatePicker'
 
 type View = 'scanner' | 'backtest' | 'signals' | 'insights' | 'learn' | 'weeklyReport'
 type AuthState = 'checking' | 'authenticated' | 'login'
-type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none'
+type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none' | 'no_data'
 type TradeReadyTimes = Record<string, string>
 
 const TRADE_READY_TIMES_KEY = 'ayre.tradeReadyTimes.v1'
@@ -501,6 +501,9 @@ export default function App() {
                 <span>{signals.length} trade ready</span>
                 <span>{watchlist_items.length} watchlist</span>
                 <span>{activeState.debug.status_counts?.none ?? 0} rejected</span>
+                {(activeState.debug.no_data_symbols ?? 0) > 0 && (
+                  <span>{activeState.debug.no_data_symbols} no data</span>
+                )}
                 {activeState.debug.resolved_date && activeState.debug.requested_date !== activeState.debug.resolved_date && (
                   <span className="resolved-note">
                     Resolved to {formatDisplayDate(activeState.debug.resolved_date)}
@@ -632,14 +635,15 @@ function BacktestResults({
     signal:   results.filter(r => r.status === 'signal').length,
     watchlist:results.filter(r => r.status === 'watchlist').length,
     none:     results.filter(r => r.status === 'none').length,
+    no_data:  results.filter(r => r.status === 'no_data').length,
   }), [results])
 
   const visible = useMemo(() => {
     const filtered = filter === 'all' ? results : results.filter(r => r.status === filter)
     return [...filtered].sort((a, b) => {
-      const order = { signal: 0, watchlist: 1, none: 2 }
-      const ao = order[a.status as keyof typeof order] ?? 3
-      const bo = order[b.status as keyof typeof order] ?? 3
+      const order = { signal: 0, watchlist: 1, none: 2, no_data: 3 }
+      const ao = order[a.status as keyof typeof order] ?? 4
+      const bo = order[b.status as keyof typeof order] ?? 4
       if (ao !== bo) return ao - bo
       // Within the same status, sort by change_pct desc (mirrors debug_run.py)
       const aChg = (a.values?.change_pct as number) ?? 0
@@ -675,6 +679,9 @@ function BacktestResults({
             <FilterButton label="Trade Ready" value="signal"    active={filter} count={counts.signal}    onFilter={onFilter} />
             <FilterButton label="Watchlist"   value="watchlist" active={filter} count={counts.watchlist} onFilter={onFilter} />
             <FilterButton label="Rejected"    value="none"      active={filter} count={counts.none}      onFilter={onFilter} />
+            {counts.no_data > 0 && (
+              <FilterButton label="No Data" value="no_data" active={filter} count={counts.no_data} onFilter={onFilter} />
+            )}
           </div>
           <div className="backtest-results-list">
             {visible.map(result => (
@@ -735,7 +742,14 @@ function BacktestResultRow({ result }: { result: BacktestDebugResult }) {
           </span>
         )}
       </div>
-      <p className="result-reason">{result.reason}</p>
+      {result.category && <p className="result-category">{result.category}</p>}
+      <p className="result-explanation">{result.explanation ?? result.reason}</p>
+      {result.explanation && (
+        <details className="result-tech">
+          <summary>Technical detail</summary>
+          <p className="result-reason">{result.reason}</p>
+        </details>
+      )}
       <div className="result-metrics">
         <Metric label="Close"     value={close}  />
         <Metric label="SMA44"     value={sma44}  />
@@ -764,6 +778,7 @@ function statusClass(status: DebugStatus) {
   if (status === 'signal')    return 'signal'
   if (status === 'watchlist') return 'watchlist'
   if (status === 'none')      return 'none'
+  if (status === 'no_data')   return 'none'
   return 'error'
 }
 
@@ -771,6 +786,7 @@ function statusLabel(status: DebugStatus) {
   if (status === 'signal')    return 'Trade Ready'
   if (status === 'watchlist') return 'Watchlist'
   if (status === 'none')      return 'Rejected'
+  if (status === 'no_data')   return 'No Data'
   return 'Error'
 }
 

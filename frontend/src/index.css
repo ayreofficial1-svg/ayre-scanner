@@ -656,6 +656,39 @@ tbody tr:hover td {
   line-height: 1.55;
 }
 
+.backtest-result p.result-category {
+  margin: 0.75rem 0 0;
+  color: var(--text-main);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.backtest-result p.result-explanation {
+  margin: 0.35rem 0 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.84rem;
+  line-height: 1.65;
+}
+
+.result-tech {
+  margin: 0 0 0.75rem;
+  color: var(--text-dim);
+  font-size: 0.74rem;
+}
+
+.result-tech summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.result-tech p.result-reason {
+  margin: 0.4rem 0 0;
+  font-size: 0.76rem;
+}
+
 .result-metrics {
   display: grid;
   grid-template-columns: repeat(6, minmax(90px, 1fr));
