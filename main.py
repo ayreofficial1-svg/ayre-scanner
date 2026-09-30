@@ -303,6 +303,7 @@ _heavy_guard = threading.Lock()
 _heavy_kind: str | None = None
 _live_cancel = threading.Event()        # Stop for the scheduled / manual scan
 _backtest_cancel = threading.Event()    # Stop for the running backtest
+_backtest_stop_reason: str | None = None  # why the backtest was stopped (shown to the user)
 
 
 def _heavy_try_acquire(kind: str) -> bool:
@@ -729,6 +730,7 @@ def api_backtest_scan():
                          "Try again when it finishes, or stop it first.",
             }), 409
         _backtest_cancel.clear()
+        _backtest_stop_reason = None
 
         created_at = datetime.datetime.now(_IST).isoformat()
         _backtest_jobs[job_id] = {
@@ -882,7 +884,7 @@ def api_backtest_state_set():
 
 
 def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
-    global _fyers, _symbols
+    global _fyers, _symbols, _backtest_stop_reason
 
     progress_error: str | None = None
     cancelled = False
@@ -1019,10 +1021,12 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
                 _backtest_jobs[job_id]["status"] = "cancelled"
             _backtest_state["running_job"] = None
             _backtest_state["error"] = None
+            _why = f" because {_backtest_stop_reason}" if _backtest_stop_reason else ""
             _backtest_state["notice"] = (
-                f"Backtest for {target_date.strftime('%d %b %Y')} was stopped. "
-                "The previous result is kept."
+                f"Backtest for {target_date.strftime('%d %b %Y')} was stopped{_why}. "
+                "The previous result is kept — press Rescan to run it again."
             )
+            _backtest_stop_reason = None
             _bt_commit_locked()
     except Exception as e:
         progress_error = str(e)
@@ -2302,13 +2306,22 @@ def _scan_report_summary(fetch_report: dict) -> dict:
 def _do_scan(lock_held: bool = False):
     global _fyers, _symbols
 
-    # Take the shared Fyers lock. A scheduled scan WAITS for a running backtest
-    # (Stop cancels the wait); a manual Rescan has already acquired it.
+    # Take the shared Fyers lock. A scheduled scan has priority: if a backtest
+    # is running it is STOPPED (its previous saved result is kept) and the scan
+    # starts as soon as the backtest winds down. A manual Rescan has already
+    # acquired the lock (and is refused while a backtest runs).
+    global _backtest_stop_reason
     if not lock_held:
         _live_cancel.clear()
         _state["scan_waiting"] = _heavy_lock.locked()
         if _state["scan_waiting"]:
-            print("⏳  Scheduled scan is waiting for the running backtest to finish …")
+            if _heavy_kind == "backtest":
+                print("🛑  Scheduled scan is due — stopping the running backtest first …")
+                _backtest_stop_reason = "a scheduled scan started"
+                _backtest_cancel.set()
+                BACKTEST_PROGRESS.request_stop()
+            else:
+                print("⏳  Scheduled scan is waiting for the running scan to finish …")
         try:
             _heavy_acquire_wait("live", _live_cancel)
         except ScanCancelled:
