@@ -91,6 +91,11 @@ from data.universe_stats import load_universe_stats, save_universe_stats
 from data.backtest_store import (
     load_backtest_state, save_backtest_state, now_iso as _bt_now_iso, VALID_FILTERS as _BT_FILTERS,
 )
+from data.scan_store import (
+    save_result as _save_scan_result, load_result as _load_scan_result,
+    list_saved as _list_saved_scans,
+)
+from utils.scan_control import ScanCancelled, FyersAuthError
 from data.breadth import load_full_breadth, save_full_breadth
 from data.market_close import load_close_snapshot, save_close_snapshot
 from config.settings import APP_ASSET_DIR
@@ -161,6 +166,10 @@ _state = {
     # _fyers_busy_for_extras() to keep new extras off Fyers for a short
     # cooldown after any of the three ends.
     "last_heavy_fyers_op_at": None,
+    # Scan control / completeness (no Fyers calls — pure bookkeeping)
+    "notice"          : None,   # non-error message, e.g. "Scan stopped"
+    "scan_waiting"    : False,  # scheduled scan is waiting for a running backtest
+    "scan_report"     : None,   # data-completeness summary of the last live scan
 }
 _fyers      = None
 _symbols    = None
@@ -284,6 +293,85 @@ _quotes_updated_at: str | None = None
 _backtest_lock = threading.Lock()
 _backtest_jobs: dict[str, dict] = {}
 
+# ── One Fyers-heavy job at a time ─────────────────────────────────────────────
+# A scheduled/manual scan and a backtest both hammer Fyers history. Running them
+# together doubled the request rate and caused rate-limit failures in BOTH.
+# This lock makes them take turns. Scheduled scans wait for a running backtest;
+# user-triggered runs are refused with a clear message instead of queueing.
+_heavy_lock = threading.Lock()
+_heavy_guard = threading.Lock()
+_heavy_kind: str | None = None
+_live_cancel = threading.Event()        # Stop for the scheduled / manual scan
+_backtest_cancel = threading.Event()    # Stop for the running backtest
+
+
+def _heavy_try_acquire(kind: str) -> bool:
+    global _heavy_kind
+    if _heavy_lock.acquire(blocking=False):
+        with _heavy_guard:
+            _heavy_kind = kind
+        return True
+    return False
+
+
+def _heavy_acquire_wait(kind: str, cancel: threading.Event) -> bool:
+    """Block until the lock is free. Raises ScanCancelled if Stop is pressed."""
+    global _heavy_kind
+    while True:
+        if cancel.is_set():
+            raise ScanCancelled()
+        if _heavy_lock.acquire(timeout=1.0):
+            with _heavy_guard:
+                _heavy_kind = kind
+            return True
+
+
+def _heavy_release() -> None:
+    global _heavy_kind
+    with _heavy_guard:
+        _heavy_kind = None
+    try:
+        _heavy_lock.release()
+    except RuntimeError:
+        pass
+
+
+# ── Symbol universe refresh (NSE list — not a Fyers call) ────────────────────
+_MIN_FULL_UNIVERSE = 400
+_symbols_lock = threading.Lock()
+_symbols_ok_on: datetime.date | None = None
+_symbols_last_try = 0.0
+
+
+def _refresh_symbols() -> None:
+    """
+    Re-read the Nifty 500 list once per day (and retry every 10 min while the
+    list looks truncated, e.g. after the Nifty-50 fallback). A worse/shorter
+    list never replaces a good one.
+    """
+    global _symbols, _symbols_ok_on, _symbols_last_try
+    today = datetime.datetime.now(_IST).date()
+    with _symbols_lock:
+        full = bool(_symbols) and len(_symbols) >= _MIN_FULL_UNIVERSE
+        if full and _symbols_ok_on == today:
+            return
+        if not full and _symbols and time.time() - _symbols_last_try < 600:
+            return
+        _symbols_last_try = time.time()
+        try:
+            fresh = fetch_nifty500()
+        except Exception as exc:
+            print(f"⚠️   Symbol list refresh failed ({exc}); keeping the current list.")
+            return
+        if fresh and (not _symbols or len(fresh) >= 0.9 * len(_symbols)):
+            if _symbols and set(fresh) != set(_symbols):
+                print(f"🔄  Symbol universe updated: {len(_symbols)} → {len(fresh)} stocks")
+            _symbols = fresh
+            if len(fresh) >= _MIN_FULL_UNIVERSE:
+                _symbols_ok_on = today
+        else:
+            print(f"⚠️   Symbol refresh returned {len(fresh or [])} stocks; keeping {len(_symbols or [])}.")
+
 # Shared, persisted backtest page state (selected date, filter, running job,
 # last completed result). Guarded by _backtest_lock; always write to disk via
 # _bt_commit_locked() so every change bumps `revision`.
@@ -313,6 +401,7 @@ def _bt_public_state_locked() -> dict:
         "running_job": running,
         "result": st.get("result"),
         "error": st.get("error"),
+        "notice": st.get("notice"),
     }
 
 
@@ -482,7 +571,31 @@ def api_results():
         "signals"         : _state["signals"],
         "watchlist_items" : _state["watchlist_items"],
         "error"           : _state["error"],
+        "notice"          : _state.get("notice"),
+        "scan_waiting"    : _state.get("scan_waiting", False),
+        "scan_report"     : {
+            k: v for k, v in (_state.get("scan_report") or {}).items() if k != "ledger"
+        } or None,
     })
+
+
+@app.route("/api/scan/skipped")
+def api_scan_skipped():
+    """
+    Per-stock ledger of every stock that was NOT evaluated, with the reason
+    (no Fyers data / stale / Fyers failure with its error code / short history /
+    internal error). Memory read only — zero Fyers calls.
+    """
+    with _backtest_lock:
+        bt = (_backtest_state.get("result") or {}).get("debug") or {}
+    return jsonify(_json_safe({
+        "live": _state.get("scan_report"),
+        "backtest": {
+            "date": bt.get("requested_date"),
+            "ledger": bt.get("skipped"),
+            "failed_symbols": bt.get("failed_symbols"),
+        },
+    }))
 
 
 @app.route("/api/scan/progress")
@@ -515,9 +628,44 @@ def api_rescan():
             "message": "Manual scans are allowed only while free sources confirm the market is open.",
             "market_status": fresh_status,
         }), 409
+    if not _heavy_try_acquire("live"):
+        return jsonify({
+            "status": "busy",
+            "message": f"A {_heavy_kind or 'backtest'} scan is running and uses the same Fyers "
+                       "connection. Wait for it to finish, or stop it first.",
+        }), 409
+    _live_cancel.clear()
     _state["scanning"] = True
-    threading.Thread(target=_do_scan, daemon=True).start()
+    threading.Thread(target=_do_scan, kwargs={"lock_held": True}, daemon=True).start()
     return jsonify({"status": "started"})
+
+
+@app.route("/api/scan/stop", methods=["POST"])
+def api_scan_stop():
+    """Safely stop the running (or waiting) scheduled/manual scan."""
+    if not (_state["scanning"] or _state.get("scan_waiting")):
+        return jsonify({"status": "not_running"})
+    _live_cancel.set()
+    LIVE_PROGRESS.request_stop()
+    return jsonify({"status": "stopping"})
+
+
+@app.route("/api/backtest/stop", methods=["POST"])
+def api_backtest_stop():
+    """Safely stop the running backtest. The previous saved result is kept."""
+    with _backtest_lock:
+        running = _backtest_state.get("running_job")
+    if not running:
+        return jsonify({"status": "not_running"})
+    _backtest_cancel.set()
+    BACKTEST_PROGRESS.request_stop()
+    return jsonify({"status": "stopping"})
+
+
+@app.route("/api/backtest/saved")
+def api_backtest_saved():
+    """Dates that already have a saved backtest result (metadata only)."""
+    return jsonify({"dates": _list_saved_scans("backtest")})
 
 
 @app.route("/api/backtest/scan", methods=["POST"])
@@ -534,6 +682,32 @@ def api_backtest_scan():
     if target_date > today_ist:
         return jsonify({"error": "Backtests cannot run for a future date."}), 400
 
+    force = bool(payload.get("force"))
+    day_key = target_date.isoformat()
+
+    # ── Reuse a saved result instead of scanning again (no Fyers calls) ───────
+    if not force:
+        saved = _load_scan_result("backtest", day_key)
+        if saved and saved.get("session_final"):
+            with _backtest_lock:
+                if _backtest_state.get("running_job"):
+                    return jsonify({
+                        "error": "A backtest is already running. Wait for it to finish first.",
+                        "running_job": _backtest_state.get("running_job"),
+                        "state": _bt_public_state_locked(),
+                    }), 409
+                _backtest_state["result"] = saved["payload"]
+                _backtest_state["selected_date"] = day_key
+                _backtest_state["filter"] = "all"
+                _backtest_state["error"] = None
+                _backtest_state["notice"] = None
+                _bt_commit_locked()
+            print(f"🧪  Backtest {day_key}: loaded saved result (saved {saved.get('saved_at')}) — no scan run")
+            return jsonify({
+                "status": "cached", "cached": True, "date": day_key,
+                "saved_at": saved.get("saved_at"), "partial": bool(saved.get("partial")),
+            }), 200
+
     job_id = uuid.uuid4().hex
     with _backtest_lock:
         # One backtest at a time for the whole site. A second request while
@@ -547,6 +721,14 @@ def api_backtest_scan():
                 "running_job": existing,
                 "state": _bt_public_state_locked(),
             }), 409
+
+        if not _heavy_try_acquire("backtest"):
+            what = "A scheduled scan" if _heavy_kind == "live" else "Another scan"
+            return jsonify({
+                "error": f"{what} is running and uses the same Fyers connection. "
+                         "Try again when it finishes, or stop it first.",
+            }), 409
+        _backtest_cancel.clear()
 
         created_at = datetime.datetime.now(_IST).isoformat()
         _backtest_jobs[job_id] = {
@@ -565,6 +747,7 @@ def api_backtest_scan():
         _backtest_state["selected_date"] = target_date.isoformat()
         _backtest_state["filter"] = "all"
         _backtest_state["error"] = None
+        _backtest_state["notice"] = None
         _bt_commit_locked()
 
     threading.Thread(
@@ -599,6 +782,13 @@ def api_backtest_status(job_id: str):
             n_bt = len(result.get("backtest_results") or [])
             print(f"Backtest status served: id={job_id} status=done backtest_results={n_bt}")
             return jsonify(result)
+        if job["status"] == "cancelled":
+            return jsonify({
+                "job_id": job_id, "status": "cancelled", "scanning": False,
+                "scan_time": None, "total_scanned": 0, "total_attempted": 0,
+                "signals": [], "watchlist_items": [], "backtest_results": [],
+                "error": None,
+            })
         if job["status"] == "error":
             return jsonify({
                 "job_id": job_id,
@@ -668,6 +858,13 @@ def api_backtest_state_set():
             if new_date != _backtest_state.get("selected_date"):
                 _backtest_state["selected_date"] = new_date
                 changed = True
+                # Returning to an already-scanned date shows its saved result.
+                if not _backtest_state.get("running_job"):
+                    saved = _load_scan_result("backtest", new_date)
+                    if saved:
+                        _backtest_state["result"] = saved["payload"]
+                        _backtest_state["error"] = None
+                        _backtest_state["notice"] = None
         if "filter" in payload:
             new_filter = str(payload["filter"]).strip()
             if new_filter not in _BT_FILTERS:
@@ -688,20 +885,34 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
     global _fyers, _symbols
 
     progress_error: str | None = None
+    cancelled = False
     progress_run = BACKTEST_PROGRESS.start(
         total=len(_symbols or []), target_date=target_date.isoformat()
     )
     try:
         print(f"🧪  Backtest API request: date={target_date.isoformat()}")
+        _refresh_symbols()
         if _symbols is None:
             _symbols = fetch_nifty500()
         if _fyers is None:
             _fyers = reconnect_fyers()
         BACKTEST_PROGRESS.set_total(len(_symbols))
 
-        result = run_historical_scan(
-            _fyers, _symbols, target_date, progress=BACKTEST_PROGRESS
-        )
+        for _attempt in (1, 2):
+            try:
+                result = run_historical_scan(
+                    _fyers, _symbols, target_date,
+                    progress=BACKTEST_PROGRESS, cancel=_backtest_cancel,
+                )
+                break
+            except FyersAuthError as exc:
+                if _attempt == 2:
+                    raise
+                print(f"🧪  Fyers rejected the session ({exc}) — reconnecting and restarting the fetch once.")
+                _fyers = reconnect_fyers()
+                progress_run = BACKTEST_PROGRESS.start(
+                    total=len(_symbols), target_date=target_date.isoformat()
+                )
         progress_error = result.get("error")
         scan_time = datetime.datetime.now(_IST).strftime("%d %b %Y %H:%M:%S")
         requested = datetime.date.fromisoformat(result["requested_date"]).strftime("%d %b %Y")
@@ -754,7 +965,15 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
                 "persistent_retries": report.get("persistent_retries", 0),
                 "evaluation_errors": report.get("evaluation_errors", []),
                 "debug_outputs": report.get("debug_outputs", {}),
+                # Completeness: every stock that was not evaluated, with its reason.
+                "attempted": report.get("attempted", 0),
+                "failed_symbols": report.get("failed_symbols", []),
+                "short_history": report.get("short_history", 0),
+                "stale": report.get("stale", 0),
+                "skipped": report.get("ledger", {}),
             },
+            "saved_at": datetime.datetime.now(_IST).isoformat(),
+            "partial": bool(report.get("failed", 0)),
         })
         n_signals  = len(payload.get("signals", []))
         n_watchlist = len(payload.get("watchlist_items", []))
@@ -780,6 +999,30 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
             _backtest_state["result"] = payload
             _backtest_state["running_job"] = None
             _backtest_state["error"] = payload.get("error")
+            _backtest_state["notice"] = None
+            _bt_commit_locked()
+        # Persist per date so returning to this date never needs another scan.
+        if not payload.get("error"):
+            try:
+                _save_scan_result(
+                    "backtest", target_date.isoformat(), payload,
+                    partial=bool(payload.get("partial")),
+                )
+                print(f"🧪  Backtest result saved for {target_date.isoformat()}")
+            except Exception as exc:
+                print(f"🧪  WARNING: could not save backtest result: {exc}")
+    except ScanCancelled:
+        cancelled = True
+        print(f"🧪  Backtest stopped by user: id={job_id} date={target_date.isoformat()}")
+        with _backtest_lock:
+            if job_id in _backtest_jobs:
+                _backtest_jobs[job_id]["status"] = "cancelled"
+            _backtest_state["running_job"] = None
+            _backtest_state["error"] = None
+            _backtest_state["notice"] = (
+                f"Backtest for {target_date.strftime('%d %b %Y')} was stopped. "
+                "The previous result is kept."
+            )
             _bt_commit_locked()
     except Exception as e:
         progress_error = str(e)
@@ -793,7 +1036,9 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
             _backtest_state["error"] = str(e)
             _bt_commit_locked()
     finally:
-        BACKTEST_PROGRESS.finish(error=progress_error, run_id=progress_run)
+        BACKTEST_PROGRESS.finish(error=progress_error, run_id=progress_run, cancelled=cancelled)
+        _backtest_cancel.clear()
+        _heavy_release()
         # §3: marks "a heavy Fyers op just finished" for the breadth
         # poller's busy-guard cooldown — set regardless of success/failure.
         _state["last_heavy_fyers_op_at"] = time.time()
@@ -2029,7 +2274,7 @@ def _fyers_busy_for_extras() -> bool:
     breadth poller "pause and continue after scanning is done" behavior
     rather than "skip this cycle and wait an hour."
     """
-    if _state.get("scanning"):
+    if _state.get("scanning") or _heavy_kind is not None:
         return True
     with _backtest_lock:
         if any(j.get("status") == "running" for j in _backtest_jobs.values()):
@@ -2044,38 +2289,85 @@ def _fyers_busy_for_extras() -> bool:
 # Scan
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _do_scan():
+def _scan_report_summary(fetch_report: dict) -> dict:
+    """Small, JSON-safe completeness summary of a live scan (no Fyers calls)."""
+    keys = (
+        "attempted", "valid", "no_data", "failed", "recovered", "persistent_retries",
+        "short_history", "stale", "cached_no_data", "evaluated", "failed_symbols",
+        "evaluation_errors", "ledger",
+    )
+    return _json_safe({k: fetch_report.get(k) for k in keys if k in fetch_report})
+
+
+def _do_scan(lock_held: bool = False):
     global _fyers, _symbols
+
+    # Take the shared Fyers lock. A scheduled scan WAITS for a running backtest
+    # (Stop cancels the wait); a manual Rescan has already acquired it.
+    if not lock_held:
+        _live_cancel.clear()
+        _state["scan_waiting"] = _heavy_lock.locked()
+        if _state["scan_waiting"]:
+            print("⏳  Scheduled scan is waiting for the running backtest to finish …")
+        try:
+            _heavy_acquire_wait("live", _live_cancel)
+        except ScanCancelled:
+            _state["scan_waiting"] = False
+            _state["notice"] = "Scan stopped before it started."
+            return
+        _state["scan_waiting"] = False
+
     _state["scanning"] = True
     _state["error"]    = None
+    _state["notice"]   = None
     progress_run = LIVE_PROGRESS.start(total=len(_symbols or []))
+    cancelled = False
     try:
         if not _fyers_market_data_allowed():
             _state["error"] = "Scan skipped because the market is not source-confirmed open."
             return
+
+        _refresh_symbols()
+        LIVE_PROGRESS.set_total(len(_symbols or []))
 
         watchlist = clean_watchlist(load_watchlist())
         alert_log = clean_alert_log(load_alert_log())
         save_watchlist(watchlist)
         save_alert_log(alert_log)
 
-        signals, watchlist_items, fetch_report, universe_stats = run_scan(
-            fyers     = _fyers,
-            symbols   = _symbols,
-            interval  = "D",
-            watchlist = watchlist,
-            alert_log = alert_log,
-            progress  = LIVE_PROGRESS,
-        )
+        for _attempt in (1, 2):
+            try:
+                signals, watchlist_items, fetch_report, universe_stats = run_scan(
+                    fyers     = _fyers,
+                    symbols   = _symbols,
+                    interval  = "D",
+                    watchlist = watchlist,
+                    alert_log = alert_log,
+                    progress  = LIVE_PROGRESS,
+                    cancel    = _live_cancel,
+                )
+                break
+            except FyersAuthError as exc:
+                if _attempt == 2:
+                    raise
+                print(f"⚠️   Fyers rejected the session ({exc}) — reconnecting and restarting the fetch once.")
+                _fyers = reconnect_fyers()
+                progress_run = LIVE_PROGRESS.start(total=len(_symbols or []))
 
         _state["signals"]         = signals
         _state["watchlist_items"] = watchlist_items
         _state["scan_time"]       = datetime.datetime.now(_IST).strftime("%d %b %Y %H:%M:%S")
-        # Use authoritative counts from the fetch completeness report.
-        # total_scanned = symbols that reached conditions.py after optional filters.
+        # total_scanned = symbols actually evaluated (evaluation errors excluded).
         # total_attempted = ground truth len(symbols) — never varies.
         _state["total_scanned"]   = fetch_report.get("evaluated", fetch_report["valid"])
         _state["total_attempted"] = fetch_report["attempted"]
+        _state["scan_report"]     = _scan_report_summary(fetch_report)
+
+        if fetch_report.get("failed"):
+            _state["notice"] = (
+                f"{fetch_report['failed']} stock(s) could not be fetched from Fyers after all retries "
+                "(see /api/scan/skipped). Rescan to try them again."
+            )
 
         # Insights (spec §2) — persist so a restart doesn't blank the charts
         # until the next scan, and update the in-memory copy the
@@ -2084,6 +2376,21 @@ def _do_scan():
         saved_stats = save_universe_stats(universe_stats)
         _state["universe_stats_as_of"] = saved_stats["as_of"]
 
+        # Persist the day's latest scan so a restart does not lose it.
+        try:
+            _save_scan_result("live", datetime.datetime.now(_IST).date().isoformat(), _json_safe({
+                "signals": signals, "watchlist_items": watchlist_items,
+                "scan_time": _state["scan_time"], "total_scanned": _state["total_scanned"],
+                "total_attempted": _state["total_attempted"], "scan_report": _state["scan_report"],
+            }), partial=bool(fetch_report.get("failed")))
+        except Exception as exc:
+            print(f"⚠️   Could not save live scan result: {exc}")
+
+    except ScanCancelled:
+        cancelled = True
+        _state["error"]  = None
+        _state["notice"] = "Scan stopped. The previous results are kept."
+        print("🛑  Scan stopped by user — previous results kept.")
     except Exception as e:
         _state["error"] = str(e)
     finally:
@@ -2091,7 +2398,9 @@ def _do_scan():
         # progress tracker go inactive, /api/results already reports the
         # finished scan.
         _state["scanning"] = False
-        LIVE_PROGRESS.finish(error=_state.get("error"), run_id=progress_run)
+        LIVE_PROGRESS.finish(error=_state.get("error"), run_id=progress_run, cancelled=cancelled)
+        _live_cancel.clear()
+        _heavy_release()
         # §3: marks "a heavy Fyers op just finished" for the breadth
         # poller's busy-guard cooldown — set regardless of success/failure.
         _state["last_heavy_fyers_op_at"] = time.time()
@@ -3671,6 +3980,22 @@ def main():
     _state["universe_stats_as_of"] = loaded_stats["as_of"]
     _breadth_full_cache = load_full_breadth()
     _close_snapshot     = load_close_snapshot()
+
+    # Restore today's latest saved scheduled scan so a restart does not blank
+    # the Scanner page until the next slot.
+    try:
+        _saved_live = _load_scan_result("live", datetime.datetime.now(_IST).date().isoformat())
+        if _saved_live and not _state["signals"]:
+            _p = _saved_live["payload"]
+            _state["signals"]         = _p.get("signals", [])
+            _state["watchlist_items"] = _p.get("watchlist_items", [])
+            _state["scan_time"]       = _p.get("scan_time")
+            _state["total_scanned"]   = _p.get("total_scanned", 0)
+            _state["total_attempted"] = _p.get("total_attempted", 0)
+            _state["scan_report"]     = _p.get("scan_report")
+            print(f"📂  Restored today's saved scan ({_state['scan_time']})")
+    except Exception as exc:
+        print(f"⚠️   Could not restore saved live scan: {exc}")
 
     # A backtest that was running when the server stopped can never finish —
     # clear it so every user sees the last completed result instead of a

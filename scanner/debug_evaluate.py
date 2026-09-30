@@ -472,7 +472,8 @@ def evaluate_debug(
     return result_out
 
 
-def no_data_result(symbol: str) -> dict:
+def no_data_result(symbol: str, reason: str | None = None,
+                   category: str | None = None, explanation: str | None = None) -> dict:
     """Result row for a symbol that returned no usable candles (not analysed)."""
     tag = (
         symbol.replace("NSE:", "")
@@ -485,13 +486,13 @@ def no_data_result(symbol: str) -> dict:
     res = _result(
         tag,
         "no_data",
-        "No usable price history was received for this symbol.",
+        reason or "No usable price history was received for this symbol.",
         {"weekly_rising": None},
         status="no_data",
     )
     extra = build_explanation("no_data", "no_data", {}, {})
-    res["category"] = extra["category"]
-    res["explanation"] = extra["explanation"]
+    res["category"] = category or extra["category"]
+    res["explanation"] = explanation or extra["explanation"]
     return res
 
 

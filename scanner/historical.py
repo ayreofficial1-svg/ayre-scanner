@@ -8,6 +8,8 @@ from typing import Any
 import pandas as pd
 
 from config.settings import (
+    SMA_PERIOD,
+    SMA_SLOPE_LOOKBACK,
     QUALITY_STOCK_WHITELIST,
     WEEKLY_FILTER_EXCLUDES,
     WEEKLY_RISING_FILTER,
@@ -27,6 +29,7 @@ from scanner.debug_evaluate import (
     summary_table_detailed,
 )
 from scanner.engine import _check_weekly_sma_rising
+from utils.scan_control import ScanCancelled, check_cancel
 
 _LOOKBACK_DAYS = _NUM_WINDOWS * _WINDOW_DAYS
 
@@ -107,7 +110,12 @@ def _prepare_candle_data(
     if not candle_data:
         return {}, 0, None
 
-    anchor = next(iter(candle_data.values())).index[-1].date()
+    # Most common newest-bar date across the universe. Never the first stock's
+    # date: one stale or lagging stock must not decide the resolved session.
+    _last_dates = Counter(
+        df.index[-1].date() for df in candle_data.values() if df is not None and not df.empty
+    )
+    anchor = _last_dates.most_common(1)[0][0] if _last_dates else None
     prepared: dict[str, pd.DataFrame] = {}
     short_history = 0
     for symbol, raw_df in candle_data.items():
@@ -165,6 +173,7 @@ def _evaluate_all(
     candle_data: dict[str, pd.DataFrame],
     weekly_status: dict[str, bool | None],
     progress=None,
+    cancel=None,
 ) -> tuple[dict[str, dict], list[dict], list[dict], dict[str, int], dict[str, int], list[dict]]:
     results: dict[str, dict] = {}
     signals: list[dict] = []
@@ -177,10 +186,13 @@ def _evaluate_all(
         progress.begin_analyse(len(candle_data))
 
     for eval_idx, (symbol, raw) in enumerate(candle_data.items()):
+        check_cancel(cancel)
         if progress is not None:
             progress.analyse_done(eval_idx)   # symbols fully evaluated so far
         try:
             res = evaluate_debug(symbol, raw, weekly_rising=weekly_status.get(symbol))
+        except ScanCancelled:
+            raise
         except Exception as exc:
             tag = (
                 symbol.replace("NSE:", "")
@@ -193,6 +205,15 @@ def _evaluate_all(
             status_counts["error"] += 1
             stage_counts["error"] += 1
             evaluation_errors.append({"symbol": tag, "error": str(exc)})
+            # Never let a stock vanish from the results: show it with the reason.
+            err_row = no_data_result(
+                symbol,
+                reason=f"Evaluation error: {type(exc).__name__}: {exc}",
+                category="Not analysed — internal evaluation error",
+                explanation=(f"The scanner hit an internal error while evaluating this stock "
+                             f"({type(exc).__name__}: {exc}). Not a judgement on the chart."),
+            )
+            results[err_row["symbol"]] = err_row
             continue
 
         results[res["symbol"]] = res
@@ -244,6 +265,7 @@ def run_historical_scan(
     json_output: str | None = None,
     quiet_mode: bool = True,
     progress=None,
+    cancel=None,
 ) -> dict[str, Any]:
     """
     Run the debug_run.py historical execution flow without mutating live
@@ -263,6 +285,7 @@ def run_historical_scan(
         range_to=target_date,
         verbose=False,
         progress=progress,
+        cancel=cancel,
     )
     print(
         "🧪  Backtest fetch complete: "
@@ -363,7 +386,7 @@ def run_historical_scan(
         status_counts,
         stage_counts,
         evaluation_errors,
-    ) = _evaluate_all(prepared, weekly_status, progress=progress)
+    ) = _evaluate_all(prepared, weekly_status, progress=progress, cancel=cancel)
 
     # ── Symbols with no usable data: list them so the full universe is visible ─
     # They are NOT counted as evaluated and are never mistaken for rejections.
@@ -373,14 +396,32 @@ def run_historical_scan(
         and (not QUALITY_STOCK_WHITELIST or sym in QUALITY_STOCK_WHITELIST)
     ]
     no_data_count = 0
+    _ledger = fetch_report.get("ledger", {})
     for sym in unusable:
-        row = no_data_result(sym)
+        _entry = _ledger.get(sym.replace("NSE:", "").replace("-EQ", ""))
+        if _entry:
+            row = no_data_result(sym, reason=_entry["detail"], category=_entry["category"],
+                                 explanation=_entry["detail"])
+        else:
+            row = no_data_result(sym)
         if row["symbol"] not in results:
             results[row["symbol"]] = row
             no_data_count += 1
     if no_data_count:
         status_counts["no_data"] = no_data_count
         stage_counts["no_data"] = no_data_count
+
+    _min_raw = SMA_PERIOD + SMA_SLOPE_LOOKBACK
+    for _sym, _df in prepared.items():
+        if len(_df) < _min_raw:
+            _ledger.setdefault(_sym.replace("NSE:", "").replace("-EQ", ""), {
+                "status": "insufficient_history", "bars": len(_df),
+                "category": "Not evaluated — not enough price history",
+                "detail": f"{len(_df)} daily candles; {_min_raw} are needed for the SMA44 trend check.",
+            })
+    for _e in evaluation_errors:
+        _ledger[_e["symbol"]] = {"status": "eval_error", "category": "Not evaluated — internal error",
+                                 "detail": _e["error"]}
 
     if quiet_mode:
         print("\n" + "=" * 70)
@@ -398,8 +439,9 @@ def run_historical_scan(
         {
             "daily_valid": fetch_report.get("valid", 0),
             "prepared": len(prepared),
-            "evaluated": len(results) - no_data_count,
+            "evaluated": len(results) - no_data_count - len(evaluation_errors),
             "universe_total": len(symbols),
+            "ledger": _ledger,
             "no_data_symbols": no_data_count,
             "dropped_short": dropped_short,
             "quality_filtered": quality_filtered,

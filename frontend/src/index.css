@@ -534,6 +534,14 @@ tbody tr:hover td {
   background: var(--red-dim);
 }
 
+.notice-bar {
+  padding: 0.75rem 1rem; margin-bottom: 2rem;
+  border: 1px solid var(--border-hover); border-radius: 4px;
+  color: var(--text-muted); font-family: var(--mono); font-size: 0.78rem;
+}
+
+.rescan-btn.stop-btn { background: var(--red-dim); color: var(--red); border: 1px solid var(--red); }
+
 /* Forms */
 .debug-form {
   display: flex; align-items: flex-end; gap: 1rem; flex-wrap: wrap;

@@ -17,7 +17,7 @@ const STEPS: { key: ScanProgressStage; label: string }[] = [
   { key: 'analyse', label: 'Evaluate' },
 ]
 const STAGE_ORDER: Record<string, number> = {
-  idle: -1, fetch: 0, retry: 1, analyse: 2, done: 3, error: 3,
+  idle: -1, fetch: 0, retry: 1, analyse: 2, done: 3, error: 3, cancelled: 3,
 }
 
 function fmtElapsed(seconds: number): string {
@@ -112,7 +112,7 @@ export default function ScanProgress({ progress, kind }: Props) {
     <div className="sp-panel" role="status">
       <div className="sp-head">
         <span className="sp-title"><span className="sp-dot" />{title}</span>
-        <span className="sp-elapsed">{p.stage_label} · {fmtElapsed(p.elapsed_seconds)}</span>
+        <span className="sp-elapsed">{p.stopping ? 'Stopping…' : p.stage_label} · {fmtElapsed(p.elapsed_seconds)}</span>
       </div>
 
       <div className="sp-headline">

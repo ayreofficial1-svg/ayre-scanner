@@ -45,6 +45,8 @@ from fyers_apiv3 import fyersModel
 
 from config.settings import (
     QUALITY_STOCK_WHITELIST,
+    SMA_PERIOD,
+    SMA_SLOPE_LOOKBACK,
     WEEKLY_C1A_LOOKBACK,
     WEEKLY_FILTER_EXCLUDES,
     WEEKLY_RISING_FILTER,
@@ -66,6 +68,7 @@ from scanner.watchlist import (
 )
 from alerts.notify import fire_alert
 from utils.logger import log_signal
+from utils.scan_control import ScanCancelled
 
 
 # ── Weekly pre-filter helper ─────────────────────────────────────────────────
@@ -214,6 +217,7 @@ def run_scan(
     alert_log : dict,
     verbose   : bool = False,
     progress  = None,
+    cancel    = None,
 ) -> tuple[list[dict], list[dict], dict, dict]:
     """
     Execute a full scan across all symbols.
@@ -226,6 +230,8 @@ def run_scan(
     watchlist   : mutable dict loaded from watchlist.json
     alert_log   : mutable dict loaded from alert_log.json
     verbose     : if True, print per-symbol results
+    cancel      : optional threading.Event; when set the scan stops safely and
+                  raises utils.scan_control.ScanCancelled.
     progress    : optional utils.scan_progress.ScanProgress. Fed from counters
                   the scan already keeps (in-memory only — no extra Fyers calls)
                   so the website can show live progress.
@@ -254,7 +260,7 @@ def run_scan(
     weekly_report: dict = {"valid": 0, "no_data": 0, "failed": 0, "attempted": 0}
 
     candle_data, fetch_report = fetch_candles_bulk_persistent(
-        fyers, symbols, interval, verbose, progress=progress
+        fyers, symbols, interval, verbose, progress=progress, cancel=cancel
     )
     if WEEKLY_RISING_FILTER:
         weekly_data, weekly_report = weekly_candles_from_daily(candle_data)
@@ -324,6 +330,15 @@ def run_scan(
     fetch_report["weekly_filtered"] = weekly_filtered
     fetch_report["weekly_not_rising"] = weekly_not_rising
     fetch_report["evaluated"] = len(candle_data)
+    fetch_report["evaluation_errors"] = []
+    _min_raw_bars = SMA_PERIOD + SMA_SLOPE_LOOKBACK   # bars needed before C1 can be judged
+    for _sym, _df in candle_data.items():
+        if len(_df) < _min_raw_bars:
+            fetch_report["ledger"].setdefault(_sym.replace("NSE:", "").replace("-EQ", ""), {
+                "status": "insufficient_history", "bars": len(_df),
+                "category": "Not evaluated — not enough price history",
+                "detail": f"{len(_df)} daily candles; {_min_raw_bars} are needed for the SMA44 trend check.",
+            })
 
     if accounted != attempted:
         gap = attempted - accounted
@@ -332,10 +347,10 @@ def run_scan(
             f"This is a bug — check fetch_candles_bulk classification logic."
         )
     elif fetch_report["failed"] > 0:
-        failed_syms = fetch_report["missing"][: fetch_report["failed"]]
+        failed_syms = fetch_report.get("failed_symbols", [])
         print(
-            f"   ⚠️   {fetch_report['failed']} symbols failed after retry "
-            f"(transient / rate-limit): "
+            f"   ⚠️   {fetch_report['failed']} symbols still failing after all retry waves "
+            f"(Fyers-side errors, codes in the ledger): "
             f"{failed_syms[:5]}" + (" …" if len(failed_syms) > 5 else "")
         )
 
@@ -356,6 +371,9 @@ def run_scan(
         progress.begin_analyse(len(candle_data))
 
     for eval_idx, (symbol, raw) in enumerate(candle_data.items()):
+        if cancel is not None and cancel.is_set():
+            save_watchlist(watchlist)      # keep watchlist consistent with alerts already sent
+            raise ScanCancelled()
         if progress is not None:
             progress.analyse_done(eval_idx)   # symbols fully evaluated so far
         try:
@@ -456,15 +474,28 @@ def run_scan(
                     f"[{result['status'].upper()} / {d['cross_type']}]"
                 )
 
+        except ScanCancelled:
+            raise
         except Exception as e:
-            if verbose:
-                print(f"   ⚠️  {symbol}: {e}")
+            # Never silent: an evaluation error is OUR problem, so it is logged,
+            # reported, and excluded from the "evaluated" count.
+            print(f"   ⚠️  {symbol}: evaluation error — {type(e).__name__}: {e}")
+            fetch_report["evaluation_errors"].append(
+                {"symbol": symbol.replace("NSE:", "").replace("-EQ", ""), "error": f"{type(e).__name__}: {e}"}
+            )
+            fetch_report["ledger"][symbol.replace("NSE:", "").replace("-EQ", "")] = {
+                "status": "eval_error", "category": "Not evaluated — internal error",
+                "detail": f"{type(e).__name__}: {e}",
+            }
             continue
 
     if progress is not None:
         progress.analyse_done(len(candle_data))
 
     save_watchlist(watchlist)
+    fetch_report["evaluated"] = len(candle_data) - len(fetch_report["evaluation_errors"])
+    if fetch_report["evaluation_errors"]:
+        print(f"   ❌  {len(fetch_report['evaluation_errors'])} symbol(s) raised evaluation errors (see above)")
 
     t_total = time.time() - t_start
     print(

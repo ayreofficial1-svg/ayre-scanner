@@ -74,6 +74,7 @@ interface BacktestServerState {
   result?:           ScanState | null
   result_unchanged?: boolean
   error?:            string | null
+  notice?:           string | null
 }
 
 const todayIso = () => new Date().toISOString().slice(0, 10)
@@ -248,6 +249,16 @@ export default function App() {
     })
   }, [state.scan_time, state.signals])
 
+  const stopLiveScan = async () => {
+    try { await fetch('/api/scan/stop', { method: 'POST' }) } catch { /* next poll reconciles */ }
+    setTimeout(() => { pollProgress() }, 300)
+  }
+
+  const stopBacktest = async () => {
+    try { await fetch('/api/backtest/stop', { method: 'POST' }) } catch { /* next poll reconciles */ }
+    setTimeout(() => { pollProgress() }, 300)
+  }
+
   const triggerRescan = async () => {
     const res = await fetch('/api/rescan', { method: 'POST' })
     if (!res.ok) {
@@ -297,6 +308,7 @@ export default function App() {
             scanning:  true,
             scan_time: `Running backtest for ${data.running_job.date}…`,
             error:     null,
+            notice:    null,
           },
         }
       }
@@ -308,6 +320,7 @@ export default function App() {
           ...base,
           scanning: false,
           error:    data.error ?? base.error ?? null,
+          notice:   data.notice ?? null,
         },
       }
     })
@@ -392,7 +405,9 @@ export default function App() {
 
   const changeBacktestDate = (value: string) => {
     setBacktestDate(value)
-    if (value) saveBacktestSetting({ date: value })   // '' = mid-edit, don't persist
+    // '' = mid-edit, don't persist. After saving, re-sync so a previously saved
+    // result for that date appears straight away (no scan, no Fyers calls).
+    if (value) saveBacktestSetting({ date: value }).then(() => syncBacktest())
   }
 
   const changeBacktestFilter = (value: BacktestFilter) => {
@@ -400,15 +415,17 @@ export default function App() {
     saveBacktestSetting({ filter: value })
   }
 
-  const submitBacktest = async (event: FormEvent) => {
-    event.preventDefault()
+  // force=false: reuse a saved result for this date if one exists.
+  // force=true : Rescan — ignore the saved result and scan again.
+  const submitBacktest = async (event: FormEvent | null, force = false) => {
+    event?.preventDefault()
     if (backtest.loading) return
 
     try {
       const res = await fetch('/api/backtest/scan', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ date: backtestDate }),
+        body:    JSON.stringify({ date: backtestDate, force }),
       })
       if (res.status === 401) { setAuth('login'); return }
 
@@ -420,6 +437,13 @@ export default function App() {
           return
         }
         throw new Error(data?.error ?? 'Backtest failed')
+      }
+
+      // A saved result was loaded server-side: just show it, nothing is running.
+      if (data?.cached) {
+        setBacktestFilter('all')
+        syncBacktest()
+        return
       }
 
       // Show "running" right away; the shared sync loop delivers the result
@@ -529,9 +553,20 @@ export default function App() {
               <button className="theme-btn" onClick={toggleTheme}>{theme === 'dark' ? 'Light' : 'Dark'}</button>
               <button className="theme-btn" onClick={logout}>Logout</button>
               {view === 'scanner' && (
-                <button className="rescan-btn" onClick={triggerRescan} disabled={scanning}>
-                  {scanning ? 'Scanning...' : 'Rescan'}
-                </button>
+                <>
+                  <button className="rescan-btn" onClick={triggerRescan} disabled={scanning}>
+                    {scanning ? 'Scanning...' : 'Rescan'}
+                  </button>
+                  {(scanning || state.scan_waiting) && (
+                    <button
+                      className="rescan-btn stop-btn"
+                      onClick={stopLiveScan}
+                      disabled={!!progress?.live.stopping}
+                    >
+                      {progress?.live.stopping ? 'Stopping…' : 'Stop'}
+                    </button>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -559,7 +594,7 @@ export default function App() {
         {view === 'weeklyReport' && <WeeklyReportPanel />}
 
         {view === 'backtest' && (
-          <form className="debug-form" onSubmit={submitBacktest}>
+          <form className="debug-form" onSubmit={e => submitBacktest(e)}>
             <DatePicker
               label="Date"
               value={backtestDate}
@@ -570,6 +605,25 @@ export default function App() {
             <button className="rescan-btn" type="submit" disabled={backtestLoading}>
               {backtestLoading ? 'Running...' : 'Run Backtest'}
             </button>
+            <button
+              className="rescan-btn"
+              type="button"
+              disabled={backtestLoading}
+              title="Ignore the saved result for this date and scan again"
+              onClick={() => submitBacktest(null, true)}
+            >
+              Rescan
+            </button>
+            {backtestLoading && (
+              <button
+                className="rescan-btn stop-btn"
+                type="button"
+                disabled={!!progress?.backtest.stopping}
+                onClick={stopBacktest}
+              >
+                {progress?.backtest.stopping ? 'Stopping…' : 'Stop'}
+              </button>
+            )}
           </form>
         )}
 
@@ -591,6 +645,15 @@ export default function App() {
             </div>
 
             {error && <div className="error-bar">{error}</div>}
+            {!error && activeState.notice && <div className="notice-bar">{activeState.notice}</div>}
+            {view === 'backtest' && !scanning && activeState.saved_at && (activeState.backtest_results?.length ?? 0) > 0 && (
+              <div className="notice-bar">
+                Saved result · scanned {new Date(activeState.saved_at).toLocaleString('en-IN', {
+                  day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit',
+                })}. Press Rescan to scan this date again.
+                {activeState.partial && ' Some stocks could not be fetched from Fyers at that time — Rescan will retry them.'}
+              </div>
+            )}
 
             {/* ── Backtest summary bar: show once results are available. ─────── */}
             {view === 'backtest' && (activeState.backtest_results?.length ?? 0) > 0 && activeState.debug && (
@@ -601,6 +664,15 @@ export default function App() {
                 <span>{activeState.debug.status_counts?.none ?? 0} rejected</span>
                 {(activeState.debug.no_data_symbols ?? 0) > 0 && (
                   <span>{activeState.debug.no_data_symbols} no data</span>
+                )}
+                {(activeState.debug.failed ?? 0) > 0 && (
+                  <span>{activeState.debug.failed} Fyers failures</span>
+                )}
+                {(activeState.debug.short_history ?? 0) > 0 && (
+                  <span>{activeState.debug.short_history} short history</span>
+                )}
+                {(activeState.debug.stale ?? 0) > 0 && (
+                  <span>{activeState.debug.stale} stale</span>
                 )}
                 {activeState.debug.resolved_date && activeState.debug.requested_date !== activeState.debug.resolved_date && (
                   <span className="resolved-note">

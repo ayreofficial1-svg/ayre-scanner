@@ -273,3 +273,16 @@ PUSH_ANDROID_CHANNEL_ID = "ayre_signals"
 # file without bound.
 PUSH_MAX_DEVICES = 50000
 
+
+# ── Scan completeness / persistence ──────────────────────────────────────────
+# Per-symbol Fyers resolution cache (which suffix worked; confirmed "no data").
+SYMBOL_CACHE_FILE = "symbol_cache.json"
+# A live scan re-verifies a confirmed "no Fyers data" symbol after this many
+# days. Kept short on purpose so a symbol Fyers adds later is never skipped
+# for long. (Backtests never read this cache.)
+SYMBOL_NO_DATA_TTL_DAYS = 1
+# Saved scan results (one JSON file per scanned date).
+SCAN_RESULTS_DIR = "scan_results"
+# A stock whose newest candle is older than this many calendar days before the
+# scan date is treated as stale (suspended / halted), not evaluated on old prices.
+STALE_BAR_MAX_DAYS = 10

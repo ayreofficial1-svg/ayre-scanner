@@ -45,6 +45,7 @@ def _empty() -> dict:
         "running_job": None,
         "result": None,
         "error": None,
+        "notice": None,
     }
 
 

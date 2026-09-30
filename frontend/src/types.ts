@@ -167,6 +167,10 @@ export interface ScanState {
   watchlist_items: Signal[]
   backtest_results?: BacktestDebugResult[]
   error: string | null
+  notice?: string | null          // non-error message, e.g. "Scan stopped"
+  scan_waiting?: boolean         // scheduled scan is waiting for a running backtest
+  saved_at?: string              // when this (saved) backtest result was produced
+  partial?: boolean              // some stocks could not be fetched from Fyers
   debug?: {
     requested_date?: string
     resolved_date?: string
@@ -191,13 +195,18 @@ export interface ScanState {
     persistent_retries?: number
     evaluation_errors?: Array<{ symbol: string; error: string }>
     debug_outputs?: Record<string, string>
+    attempted?: number
+    failed_symbols?: string[]
+    short_history?: number
+    stale?: number
+    skipped?: Record<string, { status: string; category: string; detail: string }>
   }
 }
 
 // ── Live scan progress ───────────────────────────────────────────────────────
 // Served by GET /api/scan/progress. Every number is a real counter fed by the
 // scan loops (the same counts shown in the Railway logs) — nothing estimated.
-export type ScanProgressStage = 'idle' | 'fetch' | 'retry' | 'analyse' | 'done' | 'error'
+export type ScanProgressStage = 'idle' | 'fetch' | 'retry' | 'analyse' | 'done' | 'error' | 'cancelled'
 
 export interface ScanProgressInfo {
   kind: 'live' | 'backtest'
@@ -224,6 +233,8 @@ export interface ScanProgressInfo {
   finished_at: string | null
   elapsed_seconds: number
   error: string | null
+  stopping?: boolean       // Stop pressed, the scan is winding down
+  cancelled?: boolean      // the last run was stopped by the user
 }
 
 export interface ScanProgressResponse {

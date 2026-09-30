@@ -68,6 +68,7 @@ STAGE_LABELS = {
     "analyse": "Evaluating setups",
     "done":    "Scan complete",
     "error":   "Scan stopped",
+    "cancelled": "Scan stopped by user",
 }
 
 _IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -97,6 +98,7 @@ class ScanProgress:
         self._started_at: float | None = None
         self._finished_at: float | None = None
         self._error: str | None = None
+        self._stopping = False
 
     def _set_state_locked(self, symbol: str, state: str) -> None:
         old = self._states.get(symbol)
@@ -130,7 +132,17 @@ class ScanProgress:
         except Exception:
             pass
 
-    def finish(self, error: str | None = None, run_id: int | None = None) -> None:
+    def request_stop(self) -> None:
+        """Mark the active run as stopping (shown in the UI until it winds down)."""
+        try:
+            with self._lock:
+                if self._active:
+                    self._stopping = True
+        except Exception:
+            pass
+
+    def finish(self, error: str | None = None, run_id: int | None = None,
+               cancelled: bool = False) -> None:
         """
         End the run. If `run_id` is given and a newer run has since started,
         this is a no-op so a late finish can never close a fresh run.
@@ -144,17 +156,28 @@ class ScanProgress:
                 self._active = False
                 self._finished_at = time.time()
                 self._error = str(error) if error else None
-                self._stage = "error" if error else "done"
+                self._stopping = False
+                self._stage = "cancelled" if cancelled else ("error" if error else "done")
         except Exception:
             pass
 
     # ── stage 1: first pass ──────────────────────────────────────────────────
-    def fetch_result(self, symbol: str, ok: bool) -> None:
-        """One symbol finished the first pass (ok = usable candles returned)."""
+    def fetch_result(self, symbol: str, ok: bool, outcome: str | None = None) -> None:
+        """
+        One symbol finished the first pass (ok = usable candles returned).
+        outcome "no_data" marks a symbol Fyers definitively has nothing for, so it
+        is final immediately instead of being queued for a pointless retry.
+        """
         try:
             with self._lock:
                 self._stage = "fetch"
-                self._set_state_locked(symbol, VALID if ok else RETRY)
+                if ok:
+                    state = VALID
+                elif outcome == NO_DATA:
+                    state = NO_DATA
+                else:
+                    state = RETRY
+                self._set_state_locked(symbol, state)
         except Exception:
             pass
 
@@ -218,7 +241,7 @@ class ScanProgress:
             stage_done, stage_total = self._retry_done, self._retry_total
         elif self._stage == "analyse":
             stage_done, stage_total = self._analyse_done, self._analyse_total
-        elif self._stage in ("done", "error"):
+        elif self._stage in ("done", "error", "cancelled"):
             stage_done, stage_total = processed, self._total or processed
         else:
             stage_done, stage_total = processed, self._total
@@ -271,6 +294,8 @@ class ScanProgress:
             "finished_at": _iso(self._finished_at),
             "elapsed_seconds": round(elapsed, 1),
             "error": self._error,
+            "stopping": self._stopping and active,
+            "cancelled": self._stage == "cancelled",
         }
 
 

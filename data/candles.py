@@ -4,79 +4,72 @@ data/candles.py
 Fetches daily OHLCV candle data from Fyers API v3.
 
 Key facts about Fyers daily data:
-  - Hard cap: 366 calendar days per request
-  - Returns: ~249 trading days per window
-  - We make TWO sequential requests (windows W1 + W2) to build a
-    ~500-bar history, then concatenate and deduplicate before returning.
+  - Hard cap: 366 calendar days per request (~249 trading days).
+  - Two windows per symbol (W2 = recent, W1 = older warm-up) give ~500 bars so
+    EMA/MACD values match TradingView.
 
-Why two windows?
-  MACD is built from three EMAs (12, 26, and 9-bar Signal).  EMA is
-  recursive — every value depends on every prior value.  With only 249
-  bars, EMA(26) still carries ~0.15% seed drift from its initialisation
-  point.  That sounds small, but the MACD histogram is the *difference*
-  of two EMAs, so errors compound: a stock near a crossover (histogram
-  near zero) can show MACD above or below Signal depending entirely on
-  how many warmup bars were provided.  This causes false misses and
-  false triggers on near-cross detection.
+Completeness rules (why a stock can be left out — and ONLY these reasons)
+─────────────────────────────────────────────────────────────────────────
+Every symbol of the universe ends in exactly one bucket, with a recorded reason:
 
-  With ~500 bars (two 366-day windows), EMA(26) seed influence decays
-  to < 0.001% — negligible for any practical decision.  MACD values
-  then match TradingView to within normal rounding differences.
+    valid          usable candles were received (includes short-history stocks,
+                   which are evaluated and reported as "not enough history")
+    no_data        Fyers confirmed it has no history: every series
+                   (-EQ/-BE/-BZ/-SM/-ST) answered "invalid symbol", or the
+                   requested period is empty; OR the newest candle is older
+                   than STALE_BAR_MAX_DAYS (suspended / halted stock)
+    failed         Fyers kept returning errors (rate limit / 5xx / network /
+                   auth) through every retry wave.  The Fyers code + message are
+                   recorded per symbol as evidence that the failure is Fyers-side.
 
-Fetch layout (calendar days, counting back from today / range_to):
-  W2  days 0   → 366   (recent window — contains today / target date)
-  W1  days 366 → 732   (older window — pure EMA warmup)
+valid + no_data + failed == attempted (always).
 
-  The two windows are concatenated, sorted, and deduplicated.  The
-  combined DataFrame is what conditions.py receives.  The older bars
-  (W1) will have valid SMA44 and MACD columns after compute_indicators
-  runs, ensuring the EMA is fully warmed up by the time the scanner
-  evaluates the recent bars.
-
-Other fetch details:
-  - Sequential, one symbol at a time, 0.12 s sleep per request
-    (2 requests per symbol → 0.24 s effective rate per symbol)
-  - Single retry for failed symbols after 3 s pause
-  - Alternate suffixes tried if -EQ fails (-BE, -BZ, -SM, -ST)
-  - ~94 stocks in Nifty 500 have no Fyers data — skipped silently
-  - Minimum bars returned: 80 (handles newly listed stocks)
-    SMA200 will be NaN for stocks with < 200 bars (handled gracefully)
-
-Completeness guarantee:
-  fetch_candles_bulk() returns a (results, report) tuple.  Every symbol
-  in the input list lands in exactly one of three buckets:
-    valid    — usable DataFrame returned
-    no_data  — Fyers has no history (invalid symbol / newly listed / suspended)
-    failed   — transient error that survived both passes
-  valid + no_data + failed == attempted (always).  The engine uses this
-  report to assert and log full coverage on every run.
+What changed vs. the old pipeline (all of it REDUCES Fyers calls)
+──────────────────────────────────────────────────────────────────
+  * The recent window (W2) is fetched FIRST.  A stock is never evaluated on
+    year-old data because W2 failed silently.
+  * W1 is skipped when it cannot contain data (stock listed inside W2, or W2 empty).
+  * Alternate suffixes (-BE/-BZ/-SM/-ST) are probed only after Fyers DEFINITIVELY
+    said the symbol is invalid/empty — never after a transient error.
+  * A transient failure keeps its already-fetched W2 frame, so a retry re-requests
+    only the window that failed.
+  * Unified retry waves with growing pauses; a global pacer slows down after a
+    429 instead of hammering the same limit.
+  * Short-history stocks are kept and evaluated instead of being retried.
+  * Live scans may skip a symbol already CONFIRMED invalid within the last day
+    (symbol_cache.py); backtests never do.
 """
 
 import datetime
 import time
+import threading
+
 import pandas as pd
 from fyers_apiv3 import fyersModel
 
+from config.settings import STALE_BAR_MAX_DAYS
+from data.symbol_cache import SYMBOL_CACHE
+from utils.scan_control import (
+    FyersAuthError, ScanCancelled, check_cancel, sleep_cancellable,
+)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
-#
-# Fyers hard cap per request for 1D resolution.
-# We issue two consecutive requests to reach ~500 trading bars total.
 _WINDOW_DAYS   = 366          # calendar days per Fyers request (hard cap)
-_NUM_WINDOWS   = 2            # number of sequential windows to fetch
-_MIN_BARS      = 80           # minimum usable bars (handles newly listed stocks)
-_SLEEP         = 0.12         # 120 ms between requests (~8 req/s; Fyers limit: 10)
-_RETRY_PAUSE   = 3.0          # seconds before retrying failed symbols (first retry)
+_NUM_WINDOWS   = 2            # kept for callers that size their look-back from it
+_MIN_BARS      = 80           # below this a stock is "short history" (still evaluated)
+_SLEEP         = 0.12         # minimum pause between requests (~8 req/s; Fyers limit: 10)
 _ALT_SUFFIXES  = ["-BE", "-BZ", "-SM", "-ST"]   # fallback suffixes for -EQ
-_RATE_LIMIT_RETRIES = 3
-_RATE_LIMIT_PAUSE = 1.5
+_RATE_LIMIT_RETRIES = 6       # in-request retries on HTTP 429 only
+_RATE_LIMIT_PAUSE = 2.0       # grows linearly: 2, 4, 6 … seconds
 _INVALID_SYMBOL_CODE = -300
 _RATE_LIMIT_CODE = 429
+_AUTH_CODES = {-8, -15, -16, -17, 401, 403}
+_AUTH_ABORT_AFTER = 8         # consecutive auth rejections before the scan aborts
 
-# ── Persistent retry configuration ────────────────────────────────────────────
-_PERSISTENT_RETRY_ENABLED = True       # Enable persistent retry for failed symbols
-_PERSISTENT_MAX_RETRIES = 2            # Max retry attempts per symbol (0 = infinite)
-_PERSISTENT_RETRY_INTERVAL = 5.0       # Seconds between persistent retry attempts
-_PERSISTENT_BACKOFF_MULTIPLIER = 1.5   # Exponential backoff: interval *= multiplier
+# Retry waves for transient failures (Fyers errors / rate limits).
+_PERSISTENT_MAX_RETRIES = 6
+_PERSISTENT_RETRY_INTERVAL = 3.0       # pause before wave 1, then × multiplier
+_PERSISTENT_BACKOFF_MULTIPLIER = 1.6
 
 
 def _response_code(resp: dict | None) -> int | None:
@@ -86,130 +79,409 @@ def _response_code(resp: dict | None) -> int | None:
         return None
 
 
-def _request_history_window(
+# ── Pacing (adaptive, global) ─────────────────────────────────────────────────
+class _Pacer:
+    """Spaces requests; widens the gap after a 429 and relaxes again when calm."""
+
+    def __init__(self, base: float):
+        self._base = base
+        self._interval = base
+        self._next = 0.0
+        self._streak = 0
+        self._lock = threading.Lock()
+
+    def before(self, cancel=None) -> None:
+        with self._lock:
+            wait = self._next - time.monotonic()
+        if wait > 0:
+            sleep_cancellable(wait, cancel)
+
+    def after(self) -> None:
+        with self._lock:
+            self._next = max(self._next, time.monotonic() + self._interval)
+
+    def rate_limited(self, pause: float) -> None:
+        with self._lock:
+            self._interval = min(self._interval * 1.5, 1.0)
+            self._next = max(self._next, time.monotonic() + pause)
+            self._streak = 0
+
+    def ok(self) -> None:
+        with self._lock:
+            self._streak += 1
+            if self._streak >= 25 and self._interval > self._base:
+                self._interval = max(self._base, self._interval * 0.9)
+                self._streak = 0
+
+
+_PACER = _Pacer(_SLEEP)
+_auth_fail_streak = 0
+
+
+class _Win:
+    __slots__ = ("df", "status", "code", "message")
+
+    def __init__(self, df=None, status="failed", code=None, message=""):
+        self.df, self.status, self.code, self.message = df, status, code, message
+
+
+def _request_window(
     fyers: fyersModel.FyersModel,
     symbol: str,
     range_from: datetime.date,
     range_to: datetime.date,
-) -> tuple[pd.DataFrame | None, str]:
+    cancel: threading.Event | None = None,
+) -> _Win:
     """
-    Fetch one window of daily candles.
+    One Fyers history request.  status: ok | empty | invalid_symbol | failed.
+    Retries only on HTTP 429.  Raises ScanCancelled / FyersAuthError.
+    """
+    global _auth_fail_streak
+    payload = {
+        "symbol": symbol,
+        "resolution": "1D",
+        "date_format": "1",
+        "range_from": range_from.strftime("%Y-%m-%d"),
+        "range_to": range_to.strftime("%Y-%m-%d"),
+        "cont_flag": "1",
+    }
+    last = _Win(status="failed", message="no response")
 
-    Returns (dataframe, status) where status is one of:
-    - "ok"
-    - "empty"
-    - "invalid_symbol"
-    - "failed"
-    """
     for attempt in range(_RATE_LIMIT_RETRIES + 1):
+        check_cancel(cancel)
+        _PACER.before(cancel)
         try:
-            resp = fyers.history(
-                data={
-                    "symbol": symbol,
-                    "resolution": "D",
-                    "date_format": "1",
-                    "range_from": range_from.strftime("%Y-%m-%d"),
-                    "range_to": range_to.strftime("%Y-%m-%d"),
-                    "cont_flag": "1",
-                }
-            )
-        except Exception:
-            resp = None
-
-        time.sleep(_SLEEP)
-
-        if resp and resp.get("s") == "ok":
-            candles = resp.get("candles", [])
-            if not candles:
-                return None, "empty"
-
-            df = pd.DataFrame(
-                candles,
-                columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
-            )
-            df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="s")
-            df.set_index("Timestamp", inplace=True)
-            df = df[["Open", "High", "Low", "Close", "Volume"]].astype(float)
-            return df, "ok"
+            resp = fyers.history(data=payload)
+        except Exception as exc:          # network / SDK failure
+            _PACER.after()
+            return _Win(status="failed", message=f"{type(exc).__name__}: {exc}"[:200])
+        _PACER.after()
 
         code = _response_code(resp)
-        if code == _INVALID_SYMBOL_CODE:
-            return None, "invalid_symbol"
+        msg = str((resp or {}).get("message", "") or "")[:200] if isinstance(resp, dict) else "bad response"
 
-        if code == _RATE_LIMIT_CODE and attempt < _RATE_LIMIT_RETRIES:
-            time.sleep(_RATE_LIMIT_PAUSE * (attempt + 1))
+        if code == _RATE_LIMIT_CODE:
+            _PACER.rate_limited(_RATE_LIMIT_PAUSE * (attempt + 1))
+            last = _Win(status="failed", code=code, message=msg or "rate limited (429)")
             continue
 
-        return None, "failed"
+        if code == _INVALID_SYMBOL_CODE:
+            _auth_fail_streak = 0
+            return _Win(status="invalid_symbol", code=code, message=msg)
 
-    return None, "failed"
+        if code in _AUTH_CODES:
+            _auth_fail_streak += 1
+            if _auth_fail_streak >= _AUTH_ABORT_AFTER:
+                raise FyersAuthError(f"Fyers rejected the session (code {code}: {msg})")
+            return _Win(status="failed", code=code, message=msg or "auth rejected")
+        _auth_fail_streak = 0
+
+        if not isinstance(resp, dict):
+            return _Win(status="failed", message="bad response")
+
+        status_txt = resp.get("s")
+        if status_txt == "no_data":
+            _PACER.ok()
+            return _Win(status="empty", code=code, message=msg)
+        if status_txt != "ok":
+            return _Win(status="failed", code=code, message=msg or str(resp)[:160])
+
+        candles = resp.get("candles")
+        _PACER.ok()
+        if not candles:
+            return _Win(status="empty", code=code, message=msg)
+
+        df = pd.DataFrame(candles, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="s", utc=True)
+        df["Timestamp"] = df["Timestamp"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None).dt.normalize()
+        df.set_index("Timestamp", inplace=True)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        return _Win(df=df, status="ok", code=code, message=msg)
+
+    return last
 
 
-def _fetch_windows(
-    fyers     : fyersModel.FyersModel,
-    symbol    : str,
-    range_to  : datetime.date,
-) -> pd.DataFrame | None:
+def _request_history_window(fyers, symbol, range_from, range_to):
+    """Compatibility wrapper → (df | None, status)."""
+    w = _request_window(fyers, symbol, range_from, range_to)
+    return w.df, w.status
+
+
+# ── One symbol, one suffix ────────────────────────────────────────────────────
+class _Fetch:
+    __slots__ = ("status", "df", "code", "message", "last_bar")
+
+    def __init__(self, status, df=None, code=None, message="", last_bar=None):
+        self.status, self.df, self.code, self.message, self.last_bar = status, df, code, message, last_bar
+
+
+def _fetch_history(fyers, symbol, range_to, partial, cancel, allow_w2_only=False) -> _Fetch:
     """
-    Fetch _NUM_WINDOWS consecutive 366-day windows ending on range_to
-    and return a single cleaned, concatenated DataFrame.
-
-    Windows are non-overlapping and laid out like this (for 2 windows):
-      W1: [range_to − 732d, range_to − 366d)   — older, EMA warmup
-      W2: [range_to − 366d, range_to]           — recent, evaluation target
-
-    Each window is fetched with a separate Fyers API call.  Failed
-    windows are skipped silently; as long as the combined DataFrame has
-    ≥ _MIN_BARS rows the result is usable (the EMA will be less well
-    warmed up but still functional).
-
-    Parameters
-    ----------
-    range_to : datetime.date
-        The end date of the most recent window.
-        Live mode  → today.
-        Historical → the target backtest date.
+    status: ok | empty | invalid | stale | failed
+    `partial` maps symbol → already-fetched W2 frame (kept across retries).
+    With allow_w2_only a failed W1 no longer fails the stock (last-resort wave).
     """
-    frames: list[pd.DataFrame] = []
+    w2_from = range_to - datetime.timedelta(days=_WINDOW_DAYS)
+    w2df = partial.get(symbol)
+    if w2df is None:
+        w2 = _request_window(fyers, symbol, w2_from, range_to, cancel)
+        if w2.status == "invalid_symbol":
+            return _Fetch("invalid", code=w2.code, message=w2.message)
+        if w2.status == "failed":
+            return _Fetch("failed", code=w2.code, message=w2.message)
+        if w2.status == "empty":
+            return _Fetch("empty", code=w2.code, message=w2.message)
+        w2df = w2.df
+        partial[symbol] = w2df
 
-    for w in range(_NUM_WINDOWS - 1, -1, -1):
-        # w = 1 (oldest) … 0 (most recent)
-        w_to   = range_to  - datetime.timedelta(days=w * _WINDOW_DAYS)
-        w_from = w_to      - datetime.timedelta(days=_WINDOW_DAYS)
-        df, status = _request_history_window(fyers, symbol, w_from, w_to)
-        if status == "invalid_symbol":
-            return None
-        if df is not None:
-            frames.append(df)
+    frames = [w2df]
+    # W1 can only hold data if W2 already reaches back to (almost) its own start.
+    needs_w1 = w2df.index.min() <= pd.Timestamp(w2_from) + pd.Timedelta(days=10)
+    if needs_w1 and _NUM_WINDOWS > 1:
+        w1_to = w2_from
+        w1_from = w1_to - datetime.timedelta(days=_WINDOW_DAYS)
+        w1 = _request_window(fyers, symbol, w1_from, w1_to, cancel)
+        if w1.status == "ok":
+            frames.append(w1.df)
+        elif w1.status == "failed" and not allow_w2_only:
+            return _Fetch("failed", code=w1.code, message=f"older window: {w1.message}")
+        # invalid/empty W1 → no older history exists; W2 alone is all there is.
 
-    if not frames:
-        return None
+    df = pd.concat(frames).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df = df[df.index >= pd.Timestamp(range_to - datetime.timedelta(days=_WINDOW_DAYS * _NUM_WINDOWS))]
+    df = df[df.index <= pd.Timestamp(range_to)]
+    if df.empty:
+        return _Fetch("empty")
 
-    combined = pd.concat(frames)
-    combined.sort_index(inplace=True)
+    last_bar = df.index[-1].date()
+    if (range_to - last_bar).days > STALE_BAR_MAX_DAYS:
+        return _Fetch("stale", last_bar=last_bar,
+                      message=f"newest candle is {last_bar.isoformat()}")
+    return _Fetch("ok", df=df, last_bar=last_bar)
 
-    # ── Last record per calendar date ─────────────────────────────────────────
-    # Fyers occasionally returns more than one row for the same date (e.g. a
-    # partial intraday bar alongside the completed EOD bar).  Keep only the
-    # final row per date so every bar represents a fully formed session.
-    dates    = combined.index.normalize()
-    combined = combined[~dates.duplicated(keep="last")]
 
-    combined.dropna(inplace=True)
+# ── One symbol, all suffixes ─────────────────────────────────────────────────
+class _Outcome:
+    __slots__ = ("status", "df", "code", "message", "last_bar", "resolved", "cached", "degraded")
 
-    # ── Rolling-window clip: [range_to − _LOOKBACK_DAYS + 1 … range_to] ──────
-    # Trims the combined DataFrame to exactly _NUM_WINDOWS × _WINDOW_DAYS
-    # calendar days ending on range_to.  This prevents future bars from leaking
-    # in when Fyers rounds a window boundary forward, and ensures production and
-    # debug see identical data for the same date.  MACD accuracy is unaffected:
-    # EMA(26) converges within ~200 bars; the clipped window still contains
-    # ~500 trading bars — well past the convergence point.
-    _lookback    = _NUM_WINDOWS * _WINDOW_DAYS
-    cutoff_start = pd.Timestamp(range_to) - pd.Timedelta(days=_lookback - 1)
-    cutoff_end   = pd.Timestamp(range_to) + pd.Timedelta(days=1)   # exclusive
-    combined     = combined[(combined.index >= cutoff_start) & (combined.index < cutoff_end)]
+    def __init__(self, status, df=None, code=None, message="", last_bar=None,
+                 resolved=None, cached=False, degraded=False):
+        self.status, self.df, self.code, self.message = status, df, code, message
+        self.last_bar, self.resolved, self.cached, self.degraded = last_bar, resolved, cached, degraded
 
-    return combined if len(combined) >= _MIN_BARS else None
+
+def _candidates(symbol: str) -> list[str]:
+    if symbol.endswith("-EQ"):
+        base = symbol[:-3]
+        cands = [symbol] + [base + s for s in _ALT_SUFFIXES]
+    else:
+        cands = [symbol]
+    hint = SYMBOL_CACHE.hint(symbol)
+    if hint and hint in cands:
+        cands.remove(hint)
+        cands.insert(0, hint)
+    return cands
+
+
+def _fetch_symbol(fyers, symbol, range_to, partial, cancel, live, allow_w2_only=False) -> _Outcome:
+    """status: ok | no_data | stale | failed"""
+    if live:
+        cached = SYMBOL_CACHE.no_data_entry(symbol)
+        if cached:
+            return _Outcome("no_data", cached=True,
+                            message=f"Fyers confirmed no data within the last day ({cached.get('detail', '')})")
+
+    cands = _candidates(symbol)
+    invalid = 0
+    stale: _Fetch | None = None
+    for cand in cands:
+        r = _fetch_history(fyers, cand, range_to, partial, cancel, allow_w2_only)
+        if r.status == "ok":
+            SYMBOL_CACHE.record_resolved(symbol, cand)
+            return _Outcome("ok", df=r.df, last_bar=r.last_bar, resolved=cand)
+        if r.status == "failed":
+            # Transient Fyers problem: never probe alternates, retry later.
+            return _Outcome("failed", code=r.code, message=r.message)
+        if r.status == "invalid":
+            invalid += 1
+        elif r.status == "stale" and stale is None:
+            stale = r
+
+    if stale is not None:
+        return _Outcome("stale", last_bar=stale.last_bar, message=stale.message)
+    if invalid == len(cands):
+        detail = f"code {_INVALID_SYMBOL_CODE} on {', '.join(c.split('-')[-1] for c in cands)}"
+        if live:
+            SYMBOL_CACHE.record_no_data(symbol, detail)
+        return _Outcome("no_data", message=f"Fyers reports this symbol as invalid ({detail})")
+    return _Outcome("no_data", message="Fyers returned no candles for the requested period")
+
+
+# ── Whole universe ───────────────────────────────────────────────────────────
+def _bare(symbol: str) -> str:
+    return symbol.replace("NSE:", "").replace("-EQ", "")
+
+
+def _fetch_universe(
+    fyers, symbols, range_to, *, live, progress=None, cancel=None, verbose=False,
+) -> tuple[dict[str, pd.DataFrame], dict]:
+    global _auth_fail_streak
+    _auth_fail_streak = 0
+
+    unique = list(dict.fromkeys(symbols))
+    total = len(unique)
+    results: dict[str, pd.DataFrame] = {}
+    no_data: dict[str, _Outcome] = {}
+    failed: dict[str, _Outcome] = {}
+    partial: dict[str, pd.DataFrame] = {}
+    degraded: list[str] = []
+    ledger: dict[str, dict] = {}
+    recovered = 0
+    waves = 0
+
+    if progress:
+        try:
+            progress.set_total(total)
+        except Exception:
+            pass
+
+    def _settle(sym: str, out: _Outcome) -> str:
+        if out.status == "ok":
+            results[sym] = out.df
+            failed.pop(sym, None)
+            partial.pop(out.resolved, None)
+            return "valid"
+        if out.status in ("no_data", "stale"):
+            no_data[sym] = out
+            failed.pop(sym, None)
+            return "no_data"
+        failed[sym] = out
+        return "failed"
+
+    # ── pass 1 ────────────────────────────────────────────────────────────────
+    for i, sym in enumerate(unique, 1):
+        check_cancel(cancel)
+        out = _fetch_symbol(fyers, sym, range_to, partial, cancel, live)
+        bucket = _settle(sym, out)
+        if progress:
+            try:
+                progress.fetch_result(sym, bucket == "valid", outcome=bucket)
+            except Exception:
+                pass
+        if verbose and i % 50 == 0:
+            print(f"  📥  {i}/{total} processed — {len(results)} valid, {len(failed)} to retry")
+
+    # ── retry waves (transient Fyers failures only) ──────────────────────────
+    interval = _PERSISTENT_RETRY_INTERVAL
+    while failed and waves < _PERSISTENT_MAX_RETRIES:
+        waves += 1
+        pending = list(failed)
+        if progress:
+            try:
+                progress.begin_retry(len(pending), waves)
+            except Exception:
+                pass
+        if verbose:
+            print(f"  🔁  Retry wave {waves}: {len(pending)} symbols (pause {interval:.0f}s)")
+        sleep_cancellable(interval, cancel)
+        last_wave = waves == _PERSISTENT_MAX_RETRIES
+        for sym in pending:
+            check_cancel(cancel)
+            out = _fetch_symbol(fyers, sym, range_to, partial, cancel, live, allow_w2_only=last_wave)
+            bucket = _settle(sym, out)
+            if bucket == "valid":
+                recovered += 1
+            if progress:
+                try:
+                    progress.retry_result(sym, bucket)
+                except Exception:
+                    pass
+        interval *= _PERSISTENT_BACKOFF_MULTIPLIER
+
+    # ── ledger ────────────────────────────────────────────────────────────────
+    for sym, df in results.items():
+        bars = len(df)
+        if bars < _MIN_BARS:
+            ledger[_bare(sym)] = {
+                "status": "short_history", "bars": bars,
+                "category": "Not evaluated — not enough price history",
+                "detail": f"Only {bars} daily candles exist (need at least {_MIN_BARS}); recently listed.",
+            }
+    for sym, out in no_data.items():
+        if out.status == "stale":
+            ledger[_bare(sym)] = {
+                "status": "stale_data", "last_bar": out.last_bar.isoformat() if out.last_bar else None,
+                "category": "Not analysed — price data is stale",
+                "detail": (f"Newest candle is {out.last_bar.isoformat() if out.last_bar else 'unknown'}, more than "
+                           f"{STALE_BAR_MAX_DAYS} days before the scan date (suspended or halted). "
+                           "Not evaluated so old prices cannot produce a false signal."),
+            }
+        else:
+            ledger[_bare(sym)] = {
+                "status": "no_data",
+                "category": "Not analysed — no price data from Fyers",
+                "detail": out.message + ". Not a judgement on the stock's chart.",
+            }
+    for sym, out in failed.items():
+        ledger[_bare(sym)] = {
+            "status": "fetch_failed", "code": out.code,
+            "category": "Not analysed — Fyers did not return data",
+            "detail": (f"Fyers kept failing after {1 + waves} attempts "
+                       f"(code {out.code}: {out.message or 'no message'}). Fyers-side failure; "
+                       "press Rescan to try again."),
+        }
+
+    SYMBOL_CACHE.save()
+
+    report = {
+        "attempted": total,
+        "duplicates_removed": len(symbols) - total,
+        "valid": len(results),
+        "no_data": len(no_data),
+        "failed": len(failed),
+        "recovered": recovered,
+        "persistent_retries": waves,
+        "persistent_recovered": recovered,
+        "missing": sorted(_bare(s) for s in list(no_data) + list(failed)),
+        "failed_symbols": sorted(_bare(s) for s in failed),
+        "short_history": sum(1 for v in ledger.values() if v["status"] == "short_history"),
+        "stale": sum(1 for v in ledger.values() if v["status"] == "stale_data"),
+        "cached_no_data": sum(1 for o in no_data.values() if o.cached),
+        "ledger": ledger,
+    }
+    assert report["valid"] + report["no_data"] + report["failed"] == total
+    return results, report
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+def fetch_candles_bulk_persistent(fyers, symbols, interval="1D", verbose=False, progress=None, cancel=None):
+    """Live scan fetch (range_to = today).  Returns (results, report)."""
+    return _fetch_universe(
+        fyers, symbols, datetime.date.today(),
+        live=True, progress=progress, cancel=cancel, verbose=verbose,
+    )
+
+
+def fetch_candles_bulk(fyers, symbols, interval="1D", verbose=False, progress=None, cancel=None):
+    return fetch_candles_bulk_persistent(fyers, symbols, interval, verbose, progress, cancel)
+
+
+def fetch_candles_bulk_at_date(
+    fyers, symbols, range_to, interval="1D", verbose=False, progress=None, cancel=None,
+):
+    """Backtest fetch for a past date.  Never reads/writes the no-data cache."""
+    return _fetch_universe(
+        fyers, symbols, range_to,
+        live=False, progress=progress, cancel=cancel, verbose=verbose,
+    )
+
+
+def fetch_candles(fyers: fyersModel.FyersModel, symbol: str) -> pd.DataFrame | None:
+    """Single-symbol convenience wrapper (used by ad-hoc tools)."""
+    out = _fetch_symbol(fyers, symbol, datetime.date.today(), {}, None, live=False)
+    return out.df if out.status == "ok" else None
 
 
 def fetch_intraday_candles(
@@ -282,56 +554,6 @@ def fetch_intraday_candles(
 
     return None
 
-
-def _fetch_one(fyers: fyersModel.FyersModel, symbol: str) -> pd.DataFrame | None:
-    """
-    Fetch daily candles for one symbol ending today (live mode).
-
-    Calls _fetch_windows with range_to = today.  The returned DataFrame
-    spans approximately two calendar years (~500 trading bars), which
-    provides sufficient EMA warmup for MACD to match TradingView values.
-    """
-    return _fetch_windows(fyers, symbol, range_to=datetime.date.today())
-
-
-def fetch_candles(fyers: fyersModel.FyersModel, symbol: str) -> pd.DataFrame | None:
-    """
-    Fetch daily candles for one symbol (live mode).
-    Tries alternate suffixes if the primary -EQ symbol fails.
-    """
-    df = _fetch_one(fyers, symbol)
-    if df is not None:
-        return df
-
-    base = symbol.replace("-EQ", "")
-    for suffix in _ALT_SUFFIXES:
-        df = _fetch_one(fyers, base + suffix)
-        if df is not None:
-            return df
-
-    return None
-
-
-def _fetch_at_date_with_alternates(
-    fyers: fyersModel.FyersModel,
-    symbol: str,
-    range_to: datetime.date,
-) -> pd.DataFrame | None:
-    """
-    Fetch daily candles ending at range_to, using the same suffix fallback
-    contract as live fetch_candles().
-    """
-    df = _fetch_windows(fyers, symbol, range_to)
-    if df is not None:
-        return df
-
-    base = symbol.replace("-EQ", "")
-    for suffix in _ALT_SUFFIXES:
-        df = _fetch_windows(fyers, base + suffix, range_to)
-        if df is not None:
-            return df
-
-    return None
 
 
 def _request_history_window_weekly(
@@ -569,519 +791,3 @@ def weekly_candles_from_daily(
     }
     return results, report
 
-
-def _classify_symbol(
-    fyers: fyersModel.FyersModel,
-    symbol: str,
-    range_to: datetime.date | None = None,
-) -> str:
-    """
-    Probe Fyers with a single recent window to classify why a symbol failed.
-
-    Returns "no_data" if Fyers has no history for this symbol (invalid,
-    suspended, newly listed), or "failed" if the error was transient.
-
-    This is called only for symbols that returned None from fetch_candles,
-    so the extra API call is limited to the failure set (~94 expected).
-    """
-    if range_to is None:
-        range_to = datetime.date.today()
-
-    _, status = _request_history_window(
-        fyers,
-        symbol,
-        range_from=range_to - datetime.timedelta(days=_WINDOW_DAYS),
-        range_to=range_to,
-    )
-    return "no_data" if status in ("invalid_symbol", "empty") else "failed"
-
-
-def fetch_candles_bulk(
-    fyers   : fyersModel.FyersModel,
-    symbols : list[str],
-    interval: str = "D",
-    verbose : bool = False,
-    progress=None,
-) -> tuple[dict[str, pd.DataFrame], dict]:
-    """
-    Fetch daily candles for all symbols sequentially (live mode).
-
-    Returns
-    -------
-    (results, report)
-
-    results : dict[symbol → DataFrame]
-        Only symbols with usable data (≥ _MIN_BARS rows).
-
-    report : dict with keys:
-        attempted  int   — len(symbols) — the immutable ground truth
-        valid      int   — symbols with a usable DataFrame
-        no_data    int   — symbols Fyers has no history for (expected ~94)
-        failed     int   — symbols that errored and were not recovered
-        recovered  int   — symbols that failed pass-1 but succeeded on retry
-        missing    list  — symbols in `symbols` but absent from `results`
-                           (no_data + failed combined; for completeness logging)
-
-    Completeness guarantee
-    ----------------------
-    After both passes, every symbol in `symbols` falls into exactly one
-    bucket: valid, no_data, or failed.
-      valid + no_data + failed == attempted   (always true)
-
-    The caller (engine.py) uses `report` to assert this invariant and log
-    any symbols that fall through the cracks.
-
-    Classification logic
-    --------------------
-    Pass 1 — fetch all symbols.  Failures are tentatively labelled as
-    needing retry.  No classification probe is fired yet (saves API calls
-    for the expected ~94 no-data symbols that will be consistently empty).
-
-    Pass 2 — retry tentative failures after _RETRY_PAUSE seconds.  For
-    each symbol that still returns None we fire a lightweight single-window
-    probe to determine whether the failure is structural (no_data) or
-    transient (failed).  This means the classification probe runs only for
-    the true failure set, not all 498 symbols.
-    """
-    results      : dict[str, pd.DataFrame] = {}
-    no_data      : list[str] = []   # Fyers has no history — expected, not retried
-    to_retry     : list[str] = []   # transient failures from pass-1
-    total        = len(symbols)
-
-    # ── Pass 1 ────────────────────────────────────────────────────────────────
-    for i, sym in enumerate(symbols, 1):
-        df = fetch_candles(fyers, sym)
-        if df is not None:
-            results[sym] = df
-        else:
-            to_retry.append(sym)   # classify after pass-2
-        if progress is not None:
-            progress.fetch_result(sym, df is not None)   # in-memory only
-
-        if i % 50 == 0 or i == total:
-            print(
-                f"   📥  {i}/{total} processed — "
-                f"{len(results)} valid, {len(to_retry)} to retry …",
-                end="\r",
-            )
-    print()
-
-    # ── Pass 2 — retry once, then classify each remaining failure ─────────────
-    recovered_count  = 0
-    still_failed     : list[str] = []
-
-    if to_retry:
-        print(f"   🔄  Retrying {len(to_retry)} failed symbols …")
-        if progress is not None:
-            progress.begin_retry(len(to_retry), retry_pass=1)
-        time.sleep(_RETRY_PAUSE)
-
-        for sym in to_retry:
-            df = fetch_candles(fyers, sym)
-            if df is not None:
-                results[sym] = df
-                recovered_count += 1
-                outcome = "valid"
-            else:
-                # Classify: structural missing vs transient error
-                bucket = _classify_symbol(fyers, sym)
-                if bucket == "no_data":
-                    no_data.append(sym)
-                    outcome = "no_data"
-                else:
-                    still_failed.append(sym)
-                    outcome = "failed"
-            if progress is not None:
-                progress.retry_result(sym, outcome)
-
-        if recovered_count:
-            print(f"   ✅  Recovered {recovered_count} on retry")
-        reclassified = len(to_retry) - recovered_count - len(still_failed)
-        if reclassified:
-            print(f"   ℹ️   {reclassified} reclassified as no-data after retry")
-        if still_failed:
-            print(
-                f"   ⚠️   {len(still_failed)} symbols failed both passes: "
-                f"{still_failed[:5]}" + (" …" if len(still_failed) > 5 else "")
-            )
-
-    if no_data:
-        print(f"   ℹ️   {len(no_data)} symbols skipped (no Fyers history — expected)")
-
-    # ── Completeness report ───────────────────────────────────────────────────
-    missing   = [s for s in symbols if s not in results]
-    accounted = len(results) + len(no_data) + len(still_failed)
-
-    if accounted != total:
-        # Defensive: catch any symbol that slipped through classification.
-        # This should never happen, but if it does we surface it clearly.
-        unaccounted = [
-            s for s in symbols
-            if s not in results and s not in no_data and s not in still_failed
-        ]
-        print(
-            f"   ❌  COMPLETENESS BUG: {total - accounted} symbols unaccounted for "
-            f"after both passes: {unaccounted[:10]}"
-            + (" …" if len(unaccounted) > 10 else "")
-        )
-        # Force them into still_failed so the report is always consistent
-        still_failed.extend(unaccounted)
-
-    report = {
-        "attempted" : total,
-        "valid"     : len(results),
-        "no_data"   : len(no_data),
-        "failed"    : len(still_failed),
-        "recovered" : recovered_count,
-        "missing"   : missing,   # valid + no_data + failed == attempted
-        # Only the symbols that failed for transient reasons (excludes
-        # no_data). fetch_candles_bulk_persistent() retries exactly these.
-        "failed_symbols": list(still_failed),
-    }
-
-    return results, report
-
-
-def fetch_candles_bulk_persistent(
-    fyers   : fyersModel.FyersModel,
-    symbols : list[str],
-    interval: str = "D",
-    verbose : bool = False,
-    progress=None,
-) -> tuple[dict[str, pd.DataFrame], dict]:
-    """
-    Fetch candles with persistent retry logic for failed symbols.
-
-    This wrapper calls fetch_candles_bulk() and then keeps retrying any
-    symbols that failed due to transient errors (not no_data symbols).
-    Uses exponential backoff between attempts.
-
-    Parameters
-    ----------
-    fyers   : authenticated FyersModel instance
-    symbols : list of Fyers-formatted symbols
-    interval: data resolution (always "D" for daily)
-    verbose : if True, print per-symbol results
-
-    Returns
-    -------
-    (results, report) — same format as fetch_candles_bulk()
-        report additionally includes:
-        "persistent_retries" : int — number of persistent retry attempts made
-        "persistent_recovered" : int — symbols recovered during persistent retries
-
-    Configuration
-    ──────────────
-    Controlled by module-level constants:
-        _PERSISTENT_RETRY_ENABLED      — Enable/disable this feature
-        _PERSISTENT_MAX_RETRIES        — Max retries per symbol (0 = unlimited)
-        _PERSISTENT_RETRY_INTERVAL     — Wait time between retry waves (seconds)
-        _PERSISTENT_BACKOFF_MULTIPLIER — Exponential backoff factor (1.0 = no backoff)
-
-    Behavior
-    ────────
-    1. Run standard fetch_candles_bulk() — two-pass fetch with classification
-    2. If failed count > 0 and persistent retry is enabled:
-       a. Extract failed symbol list
-       b. Retry each failed symbol with exponential backoff
-       c. After each retry wave, re-classify any remaining failures
-       d. Stop when: failed count = 0, max retries reached, or user interruption
-    3. Merge results from persistent retries into final report
-    """
-    if not _PERSISTENT_RETRY_ENABLED:
-        # Persistent retry disabled — just run standard fetch
-        return fetch_candles_bulk(fyers, symbols, interval, verbose, progress=progress)
-
-    # ── Step 1: Standard two-pass fetch and classification ──────────────────
-    results, report = fetch_candles_bulk(fyers, symbols, interval, verbose, progress=progress)
-
-    # ── Step 2: Persistent retry loop for failed symbols ────────────────────
-    # Retry ONLY symbols that failed for transient reasons. Symbols already
-    # classified as no_data (Fyers has no history) are final: re-fetching them
-    # wastes ~6 Fyers requests each per wave and double-counts them below.
-    failed_symbols = list(report.get("failed_symbols", []))
-    no_data_set = set()
-    retry_attempt = 0
-    retry_interval = _PERSISTENT_RETRY_INTERVAL
-    persistent_recovered = 0
-    persistent_retries = 0
-
-    while failed_symbols and (
-        _PERSISTENT_MAX_RETRIES == 0 or retry_attempt < _PERSISTENT_MAX_RETRIES
-    ):
-        retry_attempt += 1
-        failed_count = len(failed_symbols)
-
-        print(
-            f"   🔄  Persistent retry attempt {retry_attempt}/{_PERSISTENT_MAX_RETRIES if _PERSISTENT_MAX_RETRIES > 0 else '∞'} "
-            f"({failed_count} symbols) — waiting {retry_interval:.1f}s …"
-        )
-        if progress is not None:
-            progress.begin_retry(failed_count, retry_pass=retry_attempt + 1)
-        time.sleep(retry_interval)
-
-        # Retry all currently-failed symbols
-        newly_recovered = []
-        still_failed = []
-
-        for sym in failed_symbols:
-            df = fetch_candles(fyers, sym)
-            if df is not None:
-                results[sym] = df
-                newly_recovered.append(sym)
-                persistent_recovered += 1
-                outcome = "valid"
-            else:
-                # Classify this symbol to decide if it's no_data or still failing
-                bucket = _classify_symbol(fyers, sym)
-                if bucket == "no_data":
-                    no_data_set.add(sym)
-                    outcome = "no_data"
-                else:
-                    still_failed.append(sym)
-                    outcome = "failed"
-            if progress is not None:
-                progress.retry_result(sym, outcome)
-
-        persistent_retries += 1
-
-        if newly_recovered:
-            print(
-                f"   ✅  Persistent retry: recovered {len(newly_recovered)} symbols"
-            )
-
-        # Update state for next iteration
-        failed_symbols = still_failed
-        retry_interval *= _PERSISTENT_BACKOFF_MULTIPLIER
-
-        if not failed_symbols:
-            print(f"   ✅  All symbols recovered after {retry_attempt} persistent retries!")
-            break
-        else:
-            print(f"   ⏳  {len(failed_symbols)} symbols still failing, will retry …")
-
-    # ── Step 3: Generate updated report ────────────────────────────────────
-    # Update the original report with persistent retry results
-    # valid + no_data + failed == attempted must still hold after recoveries,
-    # so valid is refreshed from the final results. no_data_set only holds
-    # symbols reclassified during these waves (they were counted as "failed"
-    # before), so adding it here does not double-count.
-    report["valid"] = len(results)
-    report["failed"] = len(failed_symbols)
-    report["no_data"] += len(no_data_set)
-    report["failed_symbols"] = list(failed_symbols)
-    report["persistent_retries"] = persistent_retries
-    report["persistent_recovered"] = persistent_recovered
-    report["missing"] = [s for s in symbols if s not in results]
-
-    if persistent_recovered > 0:
-        print(
-            f"\n   📊  Persistent retry summary: "
-            f"{persistent_recovered} recovered across {persistent_retries} retry attempt(s)"
-        )
-
-    return results, report
-
-
-def fetch_candles_bulk_at_date(
-    fyers   : fyersModel.FyersModel,
-    symbols : list[str],
-    range_to: datetime.date | None = None,
-    verbose : bool = False,
-    progress=None,
-) -> tuple[dict[str, pd.DataFrame], dict]:
-    """
-    Fetch candles for all symbols at a specific date (or today if range_to=None).
-
-    This is a unified interface for both live and historical fetches.
-    Uses the same persistent retry logic as fetch_candles_bulk_persistent().
-
-    Parameters
-    ----------
-    fyers   : authenticated FyersModel instance
-    symbols : list of Fyers-formatted symbols
-    range_to: target date (None = today for live mode)
-    verbose : if True, print per-symbol results
-
-    Returns
-    -------
-    (results, report) — same format as fetch_candles_bulk()
-        - "attempted"  : total symbols requested
-        - "valid"      : symbols with usable data
-        - "no_data"    : symbols with no Fyers history
-        - "failed"     : symbols still failing after retries
-        - "recovered"  : symbols recovered in standard 2-pass
-        - "persistent_recovered" : additional recovered during persistent retries
-        - "persistent_retries"   : number of persistent retry attempts
-        - "missing"    : symbols not in results (no_data + failed)
-
-    Usage
-    ─────
-    Live mode (today):
-        results, report = fetch_candles_bulk_at_date(fyers, symbols)
-
-    Historical mode (specific date):
-        results, report = fetch_candles_bulk_at_date(fyers, symbols, range_to=datetime.date(2024, 11, 15))
-    """
-    if range_to is None:
-        range_to = datetime.date.today()
-
-    results      : dict[str, pd.DataFrame] = {}
-    no_data      : list[str] = []
-    to_retry     : list[str] = []
-    total        = len(symbols)
-
-    # ── Pass 1 ────────────────────────────────────────────────────────────────
-    for i, sym in enumerate(symbols, 1):
-        df = _fetch_at_date_with_alternates(fyers, sym, range_to)
-        if df is not None:
-            results[sym] = df
-        else:
-            to_retry.append(sym)
-        if progress is not None:
-            progress.fetch_result(sym, df is not None)   # in-memory only
-
-        if i % 50 == 0 or i == total:
-            print(
-                f"   📥  {i}/{total} processed — "
-                f"{len(results)} valid, {len(to_retry)} to retry …",
-                end="\r",
-            )
-    print()
-
-    # ── Pass 2 — retry once, then classify each remaining failure ─────────────
-    recovered_count  = 0
-    still_failed     : list[str] = []
-
-    if to_retry:
-        print(f"   🔄  Retrying {len(to_retry)} failed symbols …")
-        if progress is not None:
-            progress.begin_retry(len(to_retry), retry_pass=1)
-        time.sleep(_RETRY_PAUSE)
-
-        for sym in to_retry:
-            df = _fetch_at_date_with_alternates(fyers, sym, range_to)
-            if df is not None:
-                results[sym] = df
-                recovered_count += 1
-                outcome = "valid"
-            else:
-                # Classify: structural missing vs transient error
-                bucket = _classify_symbol(fyers, sym, range_to)
-                if bucket == "no_data":
-                    no_data.append(sym)
-                    outcome = "no_data"
-                else:
-                    still_failed.append(sym)
-                    outcome = "failed"
-            if progress is not None:
-                progress.retry_result(sym, outcome)
-
-        if recovered_count:
-            print(f"   ✅  Recovered {recovered_count} on retry")
-        reclassified = len(to_retry) - recovered_count - len(still_failed)
-        if reclassified:
-            print(f"   ℹ️   {reclassified} reclassified as no-data after retry")
-        if still_failed:
-            print(
-                f"   ⚠️   {len(still_failed)} symbols failed both passes: "
-                f"{still_failed[:5]}" + (" …" if len(still_failed) > 5 else "")
-            )
-
-    if no_data:
-        print(f"   ℹ️   {len(no_data)} symbols skipped (no Fyers history — expected)")
-
-    # ── Completeness report ───────────────────────────────────────────────────
-    missing   = [s for s in symbols if s not in results]
-    accounted = len(results) + len(no_data) + len(still_failed)
-
-    if accounted != total:
-        unaccounted = [
-            s for s in symbols
-            if s not in results and s not in no_data and s not in still_failed
-        ]
-        print(
-            f"   ❌  COMPLETENESS BUG: {total - accounted} symbols unaccounted for "
-            f"after both passes: {unaccounted[:10]}"
-            + (" …" if len(unaccounted) > 10 else "")
-        )
-        still_failed.extend(unaccounted)
-
-    # ── Step 2: Persistent retry loop for failed symbols ────────────────────
-    failed_symbols = still_failed.copy()
-    no_data_set = set(no_data)
-    retry_attempt = 0
-    retry_interval = _PERSISTENT_RETRY_INTERVAL
-    persistent_recovered = 0
-    persistent_retries = 0
-
-    while failed_symbols and _PERSISTENT_RETRY_ENABLED and (
-        _PERSISTENT_MAX_RETRIES == 0 or retry_attempt < _PERSISTENT_MAX_RETRIES
-    ):
-        retry_attempt += 1
-        failed_count = len(failed_symbols)
-
-        print(
-            f"   🔄  Persistent retry attempt {retry_attempt}/{_PERSISTENT_MAX_RETRIES if _PERSISTENT_MAX_RETRIES > 0 else '∞'} "
-            f"({failed_count} symbols) — waiting {retry_interval:.1f}s …"
-        )
-        if progress is not None:
-            progress.begin_retry(failed_count, retry_pass=retry_attempt + 1)
-        time.sleep(retry_interval)
-
-        newly_recovered = []
-        still_failed_after = []
-
-        for sym in failed_symbols:
-            df = _fetch_at_date_with_alternates(fyers, sym, range_to)
-            if df is not None:
-                results[sym] = df
-                newly_recovered.append(sym)
-                persistent_recovered += 1
-                outcome = "valid"
-            else:
-                bucket = _classify_symbol(fyers, sym, range_to)
-                if bucket == "no_data":
-                    no_data_set.add(sym)
-                    outcome = "no_data"
-                else:
-                    still_failed_after.append(sym)
-                    outcome = "failed"
-            if progress is not None:
-                progress.retry_result(sym, outcome)
-
-        persistent_retries += 1
-
-        if newly_recovered:
-            print(
-                f"   ✅  Persistent retry: recovered {len(newly_recovered)} symbols"
-            )
-
-        failed_symbols = still_failed_after
-        retry_interval *= _PERSISTENT_BACKOFF_MULTIPLIER
-
-        if not failed_symbols:
-            print(f"   ✅  All symbols recovered after {retry_attempt} persistent retries!")
-            break
-        else:
-            print(f"   ⏳  {len(failed_symbols)} symbols still failing, will retry …")
-
-    # ── Final report ──────────────────────────────────────────────────────────
-    report = {
-        "attempted" : total,
-        "valid"     : len(results),
-        "no_data"   : len(no_data_set),
-        "failed"    : len(failed_symbols),
-        "recovered" : recovered_count,
-        "persistent_recovered": persistent_recovered,
-        "persistent_retries": persistent_retries,
-        "missing"   : [s for s in symbols if s not in results],
-    }
-
-    if persistent_recovered > 0:
-        print(
-            f"\n   📊  Persistent retry summary: "
-            f"{persistent_recovered} recovered across {persistent_retries} retry attempt(s)"
-        )
-
-    return results, report
