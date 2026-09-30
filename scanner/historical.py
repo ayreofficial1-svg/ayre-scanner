@@ -50,6 +50,92 @@ def _format_date_ordinal(d: datetime.date) -> str:
     return f"{day}{suffix} {d.strftime('%B')}, {d.strftime('%Y')}"
 
 
+def _tag(symbol: str) -> str:
+    """Result-row key for a Fyers symbol. Mirrors evaluate_debug()/no_data_result()."""
+    return (
+        symbol.replace("NSE:", "")
+        .replace("BSE:", "")
+        .replace("-EQ", "")
+        .replace("-BE", "")
+        .strip()
+        or symbol
+    )
+
+
+def _rows_for_unanalysed(
+    symbols: list[str],
+    results: dict[str, dict],
+    ledger: dict[str, dict],
+    weekly_status: dict[str, bool | None],
+    candle_data: dict[str, pd.DataFrame],
+) -> int:
+    """
+    Guarantee: every symbol of the universe ends with a visible result row.
+
+    Any symbol that has no row yet gets a "not analysed" row that carries the
+    real reason (Fyers ledger entry, weekly filter, ...) instead of silently
+    vanishing. Returns how many rows were added.
+    """
+    added = 0
+    for sym in dict.fromkeys(symbols):
+        if QUALITY_STOCK_WHITELIST and sym not in QUALITY_STOCK_WHITELIST:
+            continue
+        tag = _tag(sym)
+        if tag in results:
+            continue
+        entry = ledger.get(sym.replace("NSE:", "").replace("-EQ", ""))
+        if entry:
+            row = no_data_result(
+                sym, reason=entry["detail"], category=entry["category"],
+                explanation=entry["detail"],
+            )
+        elif WEEKLY_FILTER_EXCLUDES and weekly_status.get(sym) is False:
+            detail = ("Excluded by the weekly SMA44-rising filter "
+                      "(WEEKLY_FILTER_EXCLUDES is on).")
+            row = no_data_result(
+                sym, reason=detail,
+                category="Not analysed — excluded by weekly filter", explanation=detail,
+            )
+        elif _prepare_df(candle_data.get(sym)) is not None:
+            detail = ("Candles were received but the stock produced no result row. "
+                      "This is an internal gap, not a judgement on the chart.")
+            row = no_data_result(
+                sym, reason=detail,
+                category="Not analysed — internal evaluation error", explanation=detail,
+            )
+        else:
+            row = no_data_result(sym)
+        results[tag] = row
+        added += 1
+    return added
+
+
+def _universe_audit(
+    symbols: list[str],
+    results: dict[str, dict],
+    universe_meta: dict | None,
+) -> dict[str, Any]:
+    """Proof that the whole universe is accounted for, plus where the list came from."""
+    tags = [_tag(s) for s in dict.fromkeys(symbols)
+            if not QUALITY_STOCK_WHITELIST or s in QUALITY_STOCK_WHITELIST]
+    counts = Counter(tags)
+    meta = universe_meta or {}
+    return {
+        "total": len(tags),
+        "with_result_row": sum(1 for t in tags if t in results),
+        "missing_result_rows": sorted(t for t in tags if t not in results),
+        "tag_collisions": sorted(t for t, c in counts.items() if c > 1),
+        "symbols": tags,
+        "index": meta.get("index", "NIFTY 500"),
+        "source": meta.get("source"),
+        "complete": meta.get("complete"),
+        "built_at": meta.get("built_at"),
+        "list_saved_at": meta.get("list_saved_at"),
+        "nifty50_source": meta.get("nifty50_source"),
+        "error": meta.get("error"),
+    }
+
+
 def _prepare_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
     """
     Safety-net deduplication from debug_run.py: keep only the last record per
@@ -70,10 +156,13 @@ def _empty_result(
     fetch_report: dict[str, Any],
     started: float,
     message: str,
+    results: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     report = dict(fetch_report)
+    results = results if results is not None else {}
     report.update(
         {
+            "no_data_symbols": len(results),
             "evaluated": 0,
             "prepared": 0,
             "dropped_short": report.get("dropped_short", 0),
@@ -88,7 +177,7 @@ def _empty_result(
     return {
         "signals": [],
         "watchlist_items": [],
-        "results": {},
+        "results": results,
         "report": report,
         "requested_date": target_date.isoformat(),
         "resolved_date": None,
@@ -266,10 +355,14 @@ def run_historical_scan(
     quiet_mode: bool = True,
     progress=None,
     cancel=None,
+    universe_meta: dict | None = None,
 ) -> dict[str, Any]:
     """
     Run the debug_run.py historical execution flow without mutating live
     watchlist, alert log, notifications, or signal logs.
+
+    Every symbol passed in ends with a result row (evaluated, or "not analysed"
+    with the real reason) — see _rows_for_unanalysed().
     """
     started = time.time()
     print(f"\n🧪  Backtest requested for {target_date.isoformat()} ({len(symbols)} symbols)")
@@ -296,11 +389,16 @@ def run_historical_scan(
     )
 
     if not candle_data:
+        _early: dict[str, dict] = {}
+        _rows_for_unanalysed(symbols, _early, fetch_report.get("ledger", {}), {}, {})
+        fetch_report["universe_total"] = len(symbols)
+        fetch_report["universe"] = _universe_audit(symbols, _early, universe_meta)
         return _empty_result(
             target_date,
             fetch_report,
             started,
             "No candle data returned. Check symbols and Fyers connection.",
+            results=_early,
         )
 
     prepared, dropped_short, anchor = _prepare_candle_data(candle_data)
@@ -311,11 +409,16 @@ def run_historical_scan(
         )
     if not prepared:
         fetch_report["dropped_short"] = dropped_short
+        _early = {}
+        _rows_for_unanalysed(symbols, _early, fetch_report.get("ledger", {}), {}, candle_data)
+        fetch_report["universe_total"] = len(symbols)
+        fetch_report["universe"] = _universe_audit(symbols, _early, universe_meta)
         return _empty_result(
             target_date,
             fetch_report,
             started,
             "All DataFrames dropped after preparation. Check connection.",
+            results=_early,
         )
 
     prepared, quality_filtered = _apply_quality_filter(prepared)
@@ -324,11 +427,16 @@ def run_historical_scan(
     if not prepared:
         fetch_report["dropped_short"] = dropped_short
         fetch_report["quality_filtered"] = quality_filtered
+        _early = {}
+        _rows_for_unanalysed(symbols, _early, fetch_report.get("ledger", {}), {}, candle_data)
+        fetch_report["universe_total"] = len(symbols)
+        fetch_report["universe"] = _universe_audit(symbols, _early, universe_meta)
         return _empty_result(
             target_date,
             fetch_report,
             started,
             "No symbols remain after quality whitelist filtering.",
+            results=_early,
         )
 
     weekly_status: dict[str, bool | None] = {}
@@ -360,11 +468,17 @@ def run_historical_scan(
             fetch_report["quality_filtered"] = quality_filtered
             fetch_report["weekly_valid"] = weekly_report.get("valid", 0)
             fetch_report["weekly_filtered"] = weekly_report.get("filtered", 0)
+            _early = {}
+            _rows_for_unanalysed(symbols, _early, fetch_report.get("ledger", {}),
+                                 weekly_status, candle_data)
+            fetch_report["universe_total"] = len(symbols)
+            fetch_report["universe"] = _universe_audit(symbols, _early, universe_meta)
             return _empty_result(
                 target_date,
                 fetch_report,
                 started,
                 "No symbols remain after weekly rising filter.",
+                results=_early,
             )
 
     resolved_date = anchor
@@ -388,25 +502,12 @@ def run_historical_scan(
         evaluation_errors,
     ) = _evaluate_all(prepared, weekly_status, progress=progress, cancel=cancel)
 
-    # ── Symbols with no usable data: list them so the full universe is visible ─
-    # They are NOT counted as evaluated and are never mistaken for rejections.
-    unusable = [
-        sym for sym in symbols
-        if (sym not in candle_data or _prepare_df(candle_data.get(sym)) is None)
-        and (not QUALITY_STOCK_WHITELIST or sym in QUALITY_STOCK_WHITELIST)
-    ]
-    no_data_count = 0
+    # ── Every universe symbol must have a row ────────────────────────────────
+    # Symbols with no usable data (and anything else that has no row) get a
+    # "not analysed" row carrying the real reason. They are NOT counted as
+    # evaluated and are never mistaken for rejections.
     _ledger = fetch_report.get("ledger", {})
-    for sym in unusable:
-        _entry = _ledger.get(sym.replace("NSE:", "").replace("-EQ", ""))
-        if _entry:
-            row = no_data_result(sym, reason=_entry["detail"], category=_entry["category"],
-                                 explanation=_entry["detail"])
-        else:
-            row = no_data_result(sym)
-        if row["symbol"] not in results:
-            results[row["symbol"]] = row
-            no_data_count += 1
+    no_data_count = _rows_for_unanalysed(symbols, results, _ledger, weekly_status, candle_data)
     if no_data_count:
         status_counts["no_data"] = no_data_count
         stage_counts["no_data"] = no_data_count
@@ -441,6 +542,7 @@ def run_historical_scan(
             "prepared": len(prepared),
             "evaluated": len(results) - no_data_count - len(evaluation_errors),
             "universe_total": len(symbols),
+            "universe": _universe_audit(symbols, results, universe_meta),
             "ledger": _ledger,
             "no_data_symbols": no_data_count,
             "dropped_short": dropped_short,
@@ -473,5 +575,186 @@ def run_historical_scan(
         "requested_date": target_date.isoformat(),
         "resolved_date": resolved_date.isoformat() if resolved_date else None,
         "window_start": window_start.isoformat() if window_start else None,
+        "error": None,
+    }
+
+
+# ── Saved-result universe top-up ─────────────────────────────────────────────
+def backtest_universe_gap(
+    payload: dict[str, Any],
+    symbols: list[str],
+) -> tuple[list[str], list[str]]:
+    """
+    Compare a saved backtest payload with the current Nifty 500 universe.
+
+    Returns (missing_symbols, removed_tags):
+      missing_symbols  Fyers symbols of the universe that have NO result row in
+                       the saved payload (e.g. added to the index after it was saved).
+      removed_tags     result rows whose stock is no longer in the universe.
+    Works for old saves too (it only needs payload["backtest_results"]).
+    """
+    rows = payload.get("backtest_results") or []
+    have = {r.get("symbol") for r in rows if isinstance(r, dict) and r.get("symbol")}
+    universe = list(dict.fromkeys(symbols))
+    uni_tags = {_tag(s) for s in universe}
+    missing = [s for s in universe if _tag(s) not in have]
+    removed = sorted(t for t in have if t not in uni_tags)
+    return missing, removed
+
+
+def topup_historical_scan(
+    fyers,
+    symbols: list[str],
+    target_date: datetime.date,
+    base_payload: dict[str, Any],
+    *,
+    universe_meta: dict | None = None,
+    prune_removed: bool = True,
+    progress=None,
+    cancel=None,
+) -> dict[str, Any]:
+    """
+    Bring a saved backtest in line with the current universe WITHOUT rescanning it.
+
+    Only the symbols that have no row in the saved payload are fetched from
+    Fyers (typically one or a handful). Every other row is reused untouched.
+    Stocks that have left the Nifty 500 are dropped (only when prune_removed).
+
+    Returns a dict shaped like run_historical_scan()'s result so the caller's
+    normal payload/saving code works unchanged.
+    """
+    started = time.time()
+    base_dbg = base_payload.get("debug") or {}
+    by_tag: dict[str, dict] = {
+        r["symbol"]: r
+        for r in (base_payload.get("backtest_results") or [])
+        if isinstance(r, dict) and r.get("symbol")
+    }
+    universe = list(dict.fromkeys(symbols))
+    missing, removed = backtest_universe_gap(base_payload, universe)
+    if not prune_removed:
+        removed = []
+
+    print(
+        f"\n🧪  Backtest top-up for {target_date.isoformat()}: "
+        f"{len(missing)} stock(s) to add, {len(removed)} to remove, "
+        f"{len(by_tag) - len(removed)} reused as saved"
+    )
+
+    sub: dict[str, Any] = {}
+    sub_report: dict[str, Any] = {}
+    if missing:
+        sub = run_historical_scan(
+            fyers, missing, target_date,
+            quiet_mode=True, progress=progress, cancel=cancel,
+            universe_meta=universe_meta,
+        )
+        sub_report = sub.get("report") or {}
+
+    for tag in removed:
+        by_tag.pop(tag, None)
+    added_tags = []
+    for tag, row in (sub.get("results") or {}).items():
+        by_tag[tag] = row
+        added_tags.append(tag)
+
+    # ── rebuild derived lists / counters from the merged rows ────────────────
+    def _chg(v: dict) -> float:
+        try:
+            return float(v.get("change_pct", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    signals = sorted(
+        [r["values"] for r in by_tag.values()
+         if r.get("status") == "signal" and isinstance(r.get("values"), dict)],
+        key=_chg, reverse=True,
+    )
+    watchlist_items = sorted(
+        [r["values"] for r in by_tag.values()
+         if r.get("status") == "watchlist" and isinstance(r.get("values"), dict)],
+        key=_chg, reverse=True,
+    )
+    status_counts: Counter[str] = Counter({"signal": 0, "watchlist": 0, "none": 0, "error": 0})
+    stage_counts: Counter[str] = Counter()
+    for r in by_tag.values():
+        st = r.get("status", "none")
+        if st == "no_data":
+            if str(r.get("category", "")).startswith("Not analysed — internal"):
+                status_counts["error"] += 1
+                stage_counts["error"] += 1
+            else:
+                status_counts["no_data"] += 1
+                stage_counts["no_data"] += 1
+        else:
+            status_counts[st] += 1
+            stage_counts[r.get("stage", "unknown")] += 1
+    evaluated = sum(status_counts.get(k, 0) for k in ("signal", "watchlist", "none"))
+
+    uni_tags = {_tag(s) for s in universe}
+    ledger = {k: v for k, v in (base_dbg.get("skipped") or {}).items() if k in uni_tags}
+    for k in removed:
+        ledger.pop(k, None)
+    for tag in added_tags:
+        ledger.pop(tag, None)
+    ledger.update(sub_report.get("ledger") or {})
+
+    failed_symbols = sorted(
+        {t for t in (base_dbg.get("failed_symbols") or []) if t in uni_tags}
+        | set(sub_report.get("failed_symbols") or [])
+    )
+    eval_errors = [e for e in (base_dbg.get("evaluation_errors") or [])
+                   if e.get("symbol") in uni_tags and e.get("symbol") not in added_tags]
+    eval_errors += list(sub_report.get("evaluation_errors") or [])
+
+    def _n(key: str) -> int:
+        return int(base_dbg.get(key) or 0) + int(sub_report.get(key) or 0)
+
+    report: dict[str, Any] = {
+        "attempted": len(universe),
+        "universe_total": len(universe),
+        "evaluated": evaluated,
+        "valid": _n("daily_valid"),
+        "daily_valid": _n("daily_valid"),
+        "prepared": _n("prepared"),
+        "runtime_seconds": round(time.time() - started, 1),
+        "status_counts": dict(status_counts),
+        "stage_counts": dict(stage_counts),
+        "dropped_short": _n("dropped_short"),
+        "quality_filtered": int(base_dbg.get("quality_filtered") or 0),
+        "weekly_valid": _n("weekly_valid"),
+        "weekly_no_data": _n("weekly_no_data"),
+        "weekly_filtered": int(base_dbg.get("weekly_filtered") or 0),
+        "failed": len(failed_symbols),
+        "no_data": status_counts.get("no_data", 0),
+        "no_data_symbols": status_counts.get("no_data", 0),
+        "recovered": int(base_dbg.get("recovered") or 0) + int(sub_report.get("recovered") or 0),
+        "persistent_recovered": _n("persistent_recovered"),
+        "persistent_retries": _n("persistent_retries"),
+        "evaluation_errors": eval_errors,
+        "debug_outputs": {},
+        "failed_symbols": failed_symbols,
+        "short_history": sum(1 for v in ledger.values() if v.get("status") == "short_history"),
+        "stale": sum(1 for v in ledger.values() if v.get("status") == "stale_data"),
+        "ledger": ledger,
+        "topup": {
+            "added": sorted(added_tags),
+            "removed": removed,
+            "fyers_symbols_requested": len(missing),
+        },
+        "universe": _universe_audit(universe, by_tag, universe_meta),
+    }
+    print(
+        f"🧪  Top-up done: added {sorted(added_tags)} | removed {removed} | "
+        f"{len(by_tag)} rows total"
+    )
+    return {
+        "signals": signals,
+        "watchlist_items": watchlist_items,
+        "results": by_tag,
+        "report": report,
+        "requested_date": base_dbg.get("requested_date") or target_date.isoformat(),
+        "resolved_date": base_dbg.get("resolved_date"),
+        "window_start": base_dbg.get("window_start"),
         "error": None,
     }

@@ -13,6 +13,12 @@ even if the scan is interrupted or rate-limited midway.
 All symbols returned in Fyers format: NSE:SYMBOL-EQ
 """
 
+import datetime
+import io
+import json
+import os
+import threading
+
 import requests
 import pandas as pd
 
@@ -100,33 +106,67 @@ def _to_fyers(symbol: str) -> str:
     return f"NSE:{symbol.strip()}-EQ"
 
 
+_INDEX_ROW_NAMES = {"NIFTY 50", "NIFTY 500", "NIFTY50", "NIFTY500"}
+
+
+def _clean_symbols(raw) -> list[str]:
+    """Strip, drop blanks / index rows / NSE dummy placeholders, de-duplicate (order kept)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw or []:
+        if item is None:
+            continue
+        sym = str(item).strip()
+        up = sym.upper()
+        if not sym or up in ("NAN", "NONE"):
+            continue
+        # Index rows of the NSE JSON ("NIFTY 500") always contain a space; equities never do.
+        if " " in sym or up in _INDEX_ROW_NAMES:
+            continue
+        # NSE index CSVs pad some lists with DUMMY placeholder rows — not real stocks.
+        if up.startswith("DUMMY"):
+            continue
+        if sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out
+
+
 def _fetch_from_api(url: str, session: requests.Session) -> list[str]:
     """Fetches symbols from NSE API. Returns [] on failure."""
     try:
         resp = session.get(url, headers=NSE_HEADERS, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        return [
-            d["symbol"] for d in data.get("data", [])
-            if d.get("symbol")
-            # Case-insensitive filter — NSE returns index names in mixed case
-            # e.g. 'Nifty 50', 'Nifty Bank' — startswith('NIFTY') misses these.
-            and d["symbol"].upper() not in ("NIFTY 50", "NIFTY 500", "NIFTY50", "NIFTY500")
-            and not d["symbol"].upper().startswith("NIFTY")
-            and " " not in d["symbol"]   # all index names have spaces; equities don't
-        ]
+        return _clean_symbols(d.get("symbol") for d in data.get("data", []))
     except Exception:
         return []
 
 
-def _fetch_from_csv(url: str) -> list[str]:
-    """Fetches symbols from NSE CSV fallback. Returns [] on failure."""
+def _fetch_from_csv(url: str, session: requests.Session | None = None) -> list[str]:
+    """
+    Fetches symbols from the NSE archive CSV. Returns [] on failure.
+
+    The request is sent WITH the NSE browser headers: archives.nseindia.com
+    rejects the bare urllib user-agent that pd.read_csv(url) uses, which made
+    this fallback silently return [] before.
+    """
     try:
-        df  = pd.read_csv(url)
-        col = next(c for c in df.columns if "symbol" in c.lower())
-        return df[col].dropna().str.strip().tolist()
+        if session is None:
+            session = requests.Session()
+        resp = session.get(url, headers=NSE_HEADERS, timeout=20)
+        resp.raise_for_status()
+        df = pd.read_csv(io.StringIO(resp.text))
+        col = next(c for c in df.columns if "symbol" in str(c).lower())
+        return _clean_symbols(df[col].dropna().astype(str).tolist())
     except Exception:
-        return []
+        try:
+            df = pd.read_csv(url)
+            col = next(c for c in df.columns if "symbol" in str(c).lower())
+            return _clean_symbols(df[col].dropna().astype(str).tolist())
+        except Exception:
+            return []
 
 
 def plain_constituents_for_market(
@@ -175,7 +215,7 @@ def plain_constituents_for_market(
     if len(symbols) >= (8 if market_key == "bank_nifty" else 40):
         return symbols[:50]
 
-    csv_syms = _fetch_from_csv(csv_url)
+    csv_syms = _fetch_from_csv(csv_url, session)
     if len(csv_syms) >= (8 if market_key == "bank_nifty" else 40):
         return csv_syms[:50]
 
@@ -194,20 +234,66 @@ def fetch_nifty50() -> list[str]:
     if len(symbols) >= 45:
         return [_to_fyers(s) for s in symbols]
 
-    symbols = _fetch_from_csv(_CSV_NIFTY50)
+    symbols = _fetch_from_csv(_CSV_NIFTY50, session)
     if len(symbols) >= 45:
         return [_to_fyers(s) for s in symbols]
 
     return [_to_fyers(s) for s in _NIFTY50_FALLBACK]
 
 
-def fetch_nifty500() -> list[str]:
-    """
-    Returns all Nifty 500 symbols in Fyers format,
-    with Nifty 50 stocks placed FIRST in the list.
+# ── Nifty 500 universe ───────────────────────────────────────────────────────
+NIFTY500_CACHE_FILE = "nifty500_universe.json"   # last successfully fetched official list
+_N500_MIN_USABLE = 450          # below this the fetched list is treated as truncated
+_N500_COMPLETE_RANGE = (490, 510)
+_IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+_meta_lock = threading.Lock()
+_UNIVERSE_META: dict = {}
 
-    Order: [Nifty 50 (50)] + [Nifty 500 remainder (450)]
-    Total: up to 500 symbols
+
+def get_universe_meta() -> dict:
+    """Provenance of the most recently built Nifty 500 universe (copy)."""
+    with _meta_lock:
+        return dict(_UNIVERSE_META)
+
+
+def _save_universe_cache(symbols: list[str], source: str) -> None:
+    try:
+        tmp = NIFTY500_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({
+                "saved_at": datetime.datetime.now(_IST).isoformat(),
+                "source": source,
+                "symbols": symbols,
+            }, f)
+        os.replace(tmp, NIFTY500_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _load_universe_cache() -> tuple[list[str], str | None]:
+    try:
+        with open(NIFTY500_CACHE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        syms = _clean_symbols(data.get("symbols"))
+        return syms, data.get("saved_at")
+    except Exception:
+        return [], None
+
+
+def fetch_nifty500_with_meta() -> tuple[list[str], dict]:
+    """
+    Build the Nifty 500 universe (Fyers format) and report exactly where it came from.
+
+    Source order (all NSE / local — none of this touches Fyers):
+        1. NSE live JSON  (equity-stockIndices?index=NIFTY 500)
+        2. NSE archive CSV (ind_nifty500list.csv, fetched with NSE headers)
+        3. last successfully fetched list stored on disk
+    The Nifty-50-only list is used ONLY when all three fail, and the returned
+    meta then says complete=False so callers can warn instead of silently
+    scanning a truncated universe.
+
+    Order: Nifty 50 first (only members that are really in the Nifty 500 list),
+    then the remainder. Nothing outside the Nifty 500 list is ever added.
     """
     session = requests.Session()
     try:
@@ -216,29 +302,79 @@ def fetch_nifty500() -> list[str]:
         pass
 
     print("\n📡  Fetching Nifty 50 …")
+    n50_source = "nse_api"
     n50 = _fetch_from_api(_URL_NIFTY50, session)
     if len(n50) < 45:
-        n50 = _fetch_from_csv(_CSV_NIFTY50)
+        n50_source = "nse_csv"
+        n50 = _fetch_from_csv(_CSV_NIFTY50, session)
     if len(n50) < 45:
-        n50 = _NIFTY50_FALLBACK
-    print(f"   ✅  {len(n50)} Nifty 50 symbols loaded")
+        n50_source = "hardcoded_fallback"
+        n50 = list(_NIFTY50_FALLBACK)
+    print(f"   ✅  {len(n50)} Nifty 50 symbols loaded ({n50_source})")
 
     print("📡  Fetching Nifty 500 …")
-    # Use CSV as primary for Nifty 500 — more reliable for getting all 500
-    n500 = _fetch_from_csv(_CSV_NIFTY500)
-    if len(n500) < 400:
-        n500 = _fetch_from_api(_URL_NIFTY500, session)
+    source = "nse_api"
+    n500 = _fetch_from_api(_URL_NIFTY500, session)
+    if len(n500) < _N500_MIN_USABLE:
+        source = "nse_csv"
+        n500 = _fetch_from_csv(_CSV_NIFTY500, session)
+    cache_saved_at = None
+    if len(n500) < _N500_MIN_USABLE:
+        cached, cache_saved_at = _load_universe_cache()
+        if len(cached) >= _N500_MIN_USABLE:
+            source = "last_good_cache"
+            n500 = cached
+            print(f"   ⚠️   NSE unreachable — using last good Nifty 500 list saved {cache_saved_at}")
 
-    if len(n500) >= 400:
-        print(f"   ✅  {len(n500)} Nifty 500 symbols loaded")
-        # Build ordered list: Nifty 50 first, then remaining 450
-        n50_set      = set(n50)
-        n500_set     = set(n500)
-        remainder    = [s for s in n500 if s not in n50_set]
-        ordered      = list(n50) + remainder
-        print(f"   📊  Scan order: {len(n50)} Nifty 50 → {len(remainder)} remainder")
-        return [_to_fyers(s) for s in ordered]
+    meta: dict = {
+        "index": "NIFTY 500",
+        "built_at": datetime.datetime.now(_IST).isoformat(),
+        "nifty50_source": n50_source,
+    }
+
+    if len(n500) >= _N500_MIN_USABLE:
+        if source != "last_good_cache":
+            _save_universe_cache(n500, source)
+        n500_set = set(n500)
+        n50_in = [s for s in n50 if s in n500_set]
+        n50_set = set(n50_in)
+        remainder = [s for s in n500 if s not in n50_set]
+        ordered = n50_in + remainder
+        lo, hi = _N500_COMPLETE_RANGE
+        meta.update({
+            "source": source,
+            "count": len(ordered),
+            "complete": lo <= len(ordered) <= hi,
+            "list_saved_at": cache_saved_at,
+            "nifty50_not_in_nifty500": sorted(s for s in n50 if s not in n500_set),
+            "error": None,
+        })
+        print(f"   ✅  {len(n500)} Nifty 500 symbols loaded ({source})")
+        print(f"   📊  Scan order: {len(n50_in)} Nifty 50 → {len(remainder)} remainder")
+        result = ordered
     else:
-        # Fallback — just return Nifty 50
-        print("   ⚠️   Nifty 500 fetch failed. Scanning Nifty 50 only.")
-        return [_to_fyers(s) for s in n50]
+        print("   ⚠️   Nifty 500 list unavailable from every source. Universe is Nifty 50 ONLY.")
+        meta.update({
+            "source": "nifty50_only_fallback",
+            "count": len(n50),
+            "complete": False,
+            "list_saved_at": None,
+            "nifty50_not_in_nifty500": [],
+            "error": "Nifty 500 constituents could not be fetched from NSE (API, CSV) "
+                     "and no saved copy exists; the universe is incomplete.",
+        })
+        result = list(n50)
+
+    with _meta_lock:
+        _UNIVERSE_META.clear()
+        _UNIVERSE_META.update(meta)
+    return [_to_fyers(s) for s in result], meta
+
+
+def fetch_nifty500() -> list[str]:
+    """
+    Returns all Nifty 500 symbols in Fyers format, Nifty 50 first.
+    Provenance of the list is available from get_universe_meta().
+    """
+    symbols, _meta = fetch_nifty500_with_meta()
+    return symbols
