@@ -220,6 +220,13 @@ PASSIVE_CHECK_INTERVAL = 3600
 # Insights charts until the next scan.
 APP_UNIVERSE_STATS_FILE = "universe_stats.json"
 
+# ── Shared Backtest state ✅ ───────────────────────────────────────────────────
+# One backtest state for the whole website (selected date, filter, running
+# status, last completed results). Written by main.py's backtest endpoints,
+# read back on page load / after a restart. Zero Fyers cost — see
+# data/backtest_store.py.
+BACKTEST_STATE_FILE = "backtest_state.json"
+
 # ── Full Nifty-500 breadth poller ✅ ───────────────────────────────────────────
 # Fixed hourly slots, offset 15 minutes after each scanner slot (HH:30) so
 # the two schedules are visibly independent. No 15 — market closes 15:30,

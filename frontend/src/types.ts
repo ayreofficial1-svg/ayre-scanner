@@ -157,6 +157,8 @@ export interface BacktestDebugResult {
 }
 
 export interface ScanState {
+  job_id?: string
+  status?: string
   scanning: boolean
   scan_time: string | null
   total_scanned: number

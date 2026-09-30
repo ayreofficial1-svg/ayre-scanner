@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SECRETS & CREDENTIALS — never commit these
+# ─────────────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# Fyers login token (and the temp files the auth code writes beside it)
+.fyers_token
+.fyers_token.*
+
+# Firebase / Google Cloud service-account key (lets anyone send push
+# notifications as you). Lives ONLY in Railway variables, never in the repo.
+*service-account*.json
+*firebase-adminsdk*.json
+firebase*.json
+google-services.json
+GoogleService-Info.plist
+*.pem
+*.key
+*.p8
+*.p12
+
+# Session cookies saved by curl tests
+cookies.txt
+*.cookies
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUNTIME DATA — created by the running server, differs per environment
+# ─────────────────────────────────────────────────────────────────────────────
+logs/
+*.log
+fyersRequests.log
+fyersApi.log
+
+# Scanner state
+watchlist.json
+alert_log.json
+universe_stats.json
+breadth_full.json
+market_close.json
+market_close.json.tmp
+backtest_state.json
+backtest_state.json.tmp
+
+# Consumer-app content (edited from the website, lives on the server)
+app_signals.json
+app_learn.json
+app_insights.json
+app_sentiment.json
+
+# Push notifications: registered phones' FCM tokens (personal device data)
+app_devices.json
+app_devices.json.tmp
+
+# Images uploaded through the website admin panel
+static/uploads/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local / debug output
+# ─────────────────────────────────────────────────────────────────────────────
+debug_out.csv
+debug_out.json
+debug_report.html
+debug_run.py
+nifty_and_sensex.txt
+backend_documentation.md
+*.zip
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+ENV/
+dist/
+build/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Frontend (website)
+# ─────────────────────────────────────────────────────────────────────────────
+node_modules/
+frontend/node_modules
+frontend/.vite/
+*.tsbuildinfo
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stray Flutter files that ended up in this repo (they belong to the app repo)
+# ─────────────────────────────────────────────────────────────────────────────
+.dart_tool/
+.flutter-plugins-dependencies
+flutter_app/
+ayre_scanner/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Editor / OS
+# ─────────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+*.bak
+*.cache

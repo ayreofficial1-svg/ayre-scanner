@@ -87,6 +87,9 @@ from data.app_insights import load_insights, add_insight, update_insight, delete
 from data.app_weekly_report import load_reports, add_report, update_report, delete_report
 from data.app_sentiment import compute_sentiment
 from data.universe_stats import load_universe_stats, save_universe_stats
+from data.backtest_store import (
+    load_backtest_state, save_backtest_state, now_iso as _bt_now_iso, VALID_FILTERS as _BT_FILTERS,
+)
 from data.breadth import load_full_breadth, save_full_breadth
 from data.market_close import load_close_snapshot, save_close_snapshot
 from config.settings import APP_ASSET_DIR
@@ -279,6 +282,37 @@ _quotes_updated_at: str | None = None
 
 _backtest_lock = threading.Lock()
 _backtest_jobs: dict[str, dict] = {}
+
+# Shared, persisted backtest page state (selected date, filter, running job,
+# last completed result). Guarded by _backtest_lock; always write to disk via
+# _bt_commit_locked() so every change bumps `revision`.
+_backtest_state: dict = load_backtest_state()
+
+
+def _bt_commit_locked() -> None:
+    """Bump revision + timestamp and persist. Caller must hold _backtest_lock."""
+    _backtest_state["revision"] = int(_backtest_state.get("revision") or 0) + 1
+    _backtest_state["updated_at"] = _bt_now_iso()
+    try:
+        save_backtest_state(_backtest_state)
+    except Exception as exc:  # persistence is best-effort; never break a run
+        print(f"🧪  WARNING: could not persist backtest state: {exc}")
+
+
+def _bt_public_state_locked() -> dict:
+    """Shape served to clients. Caller must hold _backtest_lock."""
+    st = _backtest_state
+    running = st.get("running_job")
+    return {
+        "revision": st.get("revision", 0),
+        "updated_at": st.get("updated_at"),
+        "selected_date": st.get("selected_date"),
+        "filter": st.get("filter", "all"),
+        "running": bool(running),
+        "running_job": running,
+        "result": st.get("result"),
+        "error": st.get("error"),
+    }
 
 
 # ── Session authentication ───────────────────────────────────────────────────
@@ -485,14 +519,36 @@ def api_backtest_scan():
 
     job_id = uuid.uuid4().hex
     with _backtest_lock:
+        # One backtest at a time for the whole site. A second request while
+        # one is running is refused (no duplicate Fyers traffic); the caller
+        # just joins the running job through /api/backtest/state.
+        existing = _backtest_state.get("running_job")
+        if existing and any(j.get("status") == "running" for j in _backtest_jobs.values()):
+            return jsonify({
+                "error": f"A backtest for {existing.get('date')} is already running. "
+                         "Its results will appear here when it finishes.",
+                "running_job": existing,
+                "state": _bt_public_state_locked(),
+            }), 409
+
+        created_at = datetime.datetime.now(_IST).isoformat()
         _backtest_jobs[job_id] = {
             "job_id": job_id,
             "status": "running",
             "date": target_date.isoformat(),
-            "created_at": datetime.datetime.now(_IST).isoformat(),
+            "created_at": created_at,
             "result": None,
             "error": None,
         }
+        _backtest_state["running_job"] = {
+            "job_id": job_id,
+            "date": target_date.isoformat(),
+            "created_at": created_at,
+        }
+        _backtest_state["selected_date"] = target_date.isoformat()
+        _backtest_state["filter"] = "all"
+        _backtest_state["error"] = None
+        _bt_commit_locked()
 
     threading.Thread(
         target=_run_backtest_job,
@@ -550,6 +606,64 @@ def api_backtest_status(job_id: str):
             "watchlist_items": [],
             "backtest_results": [],
             "error": None,
+        })
+
+
+@app.route("/api/backtest/state", methods=["GET"])
+def api_backtest_state_get():
+    """
+    Shared Backtest page state: selected date, filter, running job and the
+    last completed result. Served from memory/disk — no Fyers calls.
+
+    `?since=<revision>` lets clients poll cheaply: when nothing changed the
+    response is just {"unchanged": true, "revision": N}.
+    """
+    since = request.args.get("since", type=int)
+    have_result_job = request.args.get("result_job", "").strip()
+    with _backtest_lock:
+        revision = int(_backtest_state.get("revision") or 0)
+        if since is not None and since == revision:
+            return jsonify({"unchanged": True, "revision": revision})
+        state = _bt_public_state_locked()
+        result = state.get("result")
+        # Client already holds this exact result (e.g. only the filter or date
+        # changed) — don't resend the large results payload.
+        if have_result_job and isinstance(result, dict) and result.get("job_id") == have_result_job:
+            state["result"] = None
+            state["result_unchanged"] = True
+        return jsonify(_json_safe(state))
+
+
+@app.route("/api/backtest/state", methods=["POST", "PUT"])
+def api_backtest_state_set():
+    """
+    Explicitly change the shared page state (date picker / result filter).
+    Does not run a backtest and never touches Fyers.
+    """
+    payload = request.get_json(silent=True) or {}
+    changed = False
+    with _backtest_lock:
+        if "date" in payload:
+            try:
+                new_date = datetime.date.fromisoformat(str(payload["date"]).strip()).isoformat()
+            except ValueError:
+                return jsonify({"error": "Enter a valid date in YYYY-MM-DD format."}), 400
+            if new_date != _backtest_state.get("selected_date"):
+                _backtest_state["selected_date"] = new_date
+                changed = True
+        if "filter" in payload:
+            new_filter = str(payload["filter"]).strip()
+            if new_filter not in _BT_FILTERS:
+                return jsonify({"error": "Invalid filter."}), 400
+            if new_filter != _backtest_state.get("filter"):
+                _backtest_state["filter"] = new_filter
+                changed = True
+        if changed:
+            _bt_commit_locked()
+        return jsonify({
+            "revision": int(_backtest_state.get("revision") or 0),
+            "selected_date": _backtest_state.get("selected_date"),
+            "filter": _backtest_state.get("filter", "all"),
         })
 
 
@@ -637,12 +751,21 @@ def _run_backtest_job(job_id: str, target_date: datetime.date) -> None:
                 _backtest_jobs[job_id]["status"] = "done"
                 _backtest_jobs[job_id]["result"] = payload
                 print(f"🧪  Backtest job stored: id={job_id} backtest_results={n_results}")
+            # Persist as the shared result (even if the job entry vanished).
+            _backtest_state["result"] = payload
+            _backtest_state["running_job"] = None
+            _backtest_state["error"] = payload.get("error")
+            _bt_commit_locked()
     except Exception as e:
         print(f"🧪  Backtest job failed: id={job_id} error={e}")
         with _backtest_lock:
             if job_id in _backtest_jobs:
                 _backtest_jobs[job_id]["status"] = "error"
                 _backtest_jobs[job_id]["error"] = str(e)
+            # Keep the previous completed result; just record the failure.
+            _backtest_state["running_job"] = None
+            _backtest_state["error"] = str(e)
+            _bt_commit_locked()
     finally:
         # §3: marks "a heavy Fyers op just finished" for the breadth
         # poller's busy-guard cooldown — set regardless of success/failure.
@@ -3515,6 +3638,19 @@ def main():
     _state["universe_stats_as_of"] = loaded_stats["as_of"]
     _breadth_full_cache = load_full_breadth()
     _close_snapshot     = load_close_snapshot()
+
+    # A backtest that was running when the server stopped can never finish —
+    # clear it so every user sees the last completed result instead of a
+    # spinner that never ends. The previous results are kept untouched.
+    with _backtest_lock:
+        if _backtest_state.get("running_job"):
+            interrupted = _backtest_state["running_job"].get("date")
+            _backtest_state["running_job"] = None
+            _backtest_state["error"] = (
+                f"The backtest for {interrupted} was interrupted by a server restart. "
+                "Run it again if you need it; the previous results are shown."
+            )
+            _bt_commit_locked()
 
     summary = get_log_summary()
     print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")

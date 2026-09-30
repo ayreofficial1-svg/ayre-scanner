@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import type { BacktestDebugResult, DebugStatus, ScanState } from './types'
 import Clock from './components/Clock'
@@ -46,15 +46,31 @@ const DEFAULT_STATE: ScanState = {
 // Keeps backtest lifecycle fields from bleeding into ScanState.
 // ─────────────────────────────────────────────────────────────────────────────
 interface BacktestUIState {
-  loading: boolean          // true while job is queued or polling
-  jobId:   string | null    // current async job id
-  state:   ScanState        // the scan payload (same shape as live scanner)
+  loading: boolean          // true while a backtest is running on the server (shared by all users)
+  jobId:   string | null    // running job id (if any)
+  state:   ScanState        // what the page shows (last result, or a "running" overlay)
+  result:  ScanState | null // last completed result, kept so "running" never wipes it
 }
 
+// scanning:true until the first load from the server finishes, so the page
+// shows the loading ring instead of flashing an empty "no results" prompt.
 const DEFAULT_BACKTEST_UI: BacktestUIState = {
   loading: false,
   jobId:   null,
-  state:   DEFAULT_STATE,
+  state:   { ...DEFAULT_STATE, scanning: true },
+  result:  null,
+}
+
+interface BacktestServerState {
+  unchanged?:        boolean
+  revision:          number
+  selected_date?:    string | null
+  filter?:           BacktestFilter
+  running?:          boolean
+  running_job?:      { job_id: string; date: string; created_at: string } | null
+  result?:           ScanState | null
+  result_unchanged?: boolean
+  error?:            string | null
 }
 
 const todayIso = () => new Date().toISOString().slice(0, 10)
@@ -68,8 +84,6 @@ async function readJsonResponse(res: Response) {
     throw new Error(text.slice(0, 240) || `HTTP ${res.status}`)
   }
 }
-
-const wait = (ms: number) => new Promise(resolve => window.setTimeout(resolve, ms))
 
 function loadTradeReadyTimes(): TradeReadyTimes {
   try {
@@ -240,62 +254,114 @@ export default function App() {
     poll()
   }
 
-  // ── Merge a partial scan-state update into the backtest ui state.
-  //    This ensures intermediate poll responses never wipe completed results. ─
-  const mergeBacktestState = (patch: Partial<ScanState>) => {
-    setBacktest(prev => ({
-      ...prev,
-      state: { ...prev.state, ...patch },
-    }))
+  // ─────────────────────────────────────────────────────────────────────────
+  // Shared Backtest state.
+  //
+  // The server holds ONE backtest state for every user (selected date, filter,
+  // running job, last completed result) and persists it to disk. The page
+  // simply mirrors it: load on login / refresh, then poll cheaply
+  // (?since=<revision>) so other people's runs and changes show up here.
+  // Nothing in this flow calls Fyers.
+  // ─────────────────────────────────────────────────────────────────────────
+  const btRevision  = useRef(-1)
+  const btResultJob = useRef<string | null>(null)
+
+  const applyBacktestServerState = useCallback((data: BacktestServerState) => {
+    btRevision.current = data.revision
+    if (data.selected_date) setBacktestDate(data.selected_date)
+    if (data.filter)        setBacktestFilter(data.filter)
+    if (data.result?.job_id) btResultJob.current = String(data.result.job_id)
+
+    setBacktest(prev => {
+      const result: ScanState | null = data.result_unchanged
+        ? prev.result
+        : (data.result ?? null)
+      const base = result ?? DEFAULT_STATE
+
+      if (data.running && data.running_job) {
+        return {
+          loading: true,
+          jobId:   data.running_job.job_id,
+          result,
+          state: {
+            ...base,
+            scanning:  true,
+            scan_time: `Running backtest for ${data.running_job.date}…`,
+            error:     null,
+          },
+        }
+      }
+      return {
+        loading: false,
+        jobId:   null,
+        result,
+        state: {
+          ...base,
+          scanning: false,
+          error:    data.error ?? base.error ?? null,
+        },
+      }
+    })
+  }, [])
+
+  const syncBacktest = useCallback(async () => {
+    if (auth !== 'authenticated') return
+    try {
+      const qs = new URLSearchParams()
+      if (btRevision.current >= 0) qs.set('since', String(btRevision.current))
+      if (btResultJob.current)     qs.set('result_job', btResultJob.current)
+      const res = await fetch(`/api/backtest/state?${qs.toString()}`)
+      if (res.status === 401) { setAuth('login'); return }
+      const data = await readJsonResponse(res) as BacktestServerState | null
+      if (!res.ok || !data) return
+      if (data.unchanged) return
+      applyBacktestServerState(data)
+    } catch {
+      // Keep whatever is on screen; if the very first load failed, stop the spinner.
+      if (btRevision.current < 0) {
+        setBacktest(prev => (
+          prev.state.scanning && !prev.loading
+            ? { ...prev, state: { ...prev.state, scanning: false } }
+            : prev
+        ))
+      }
+    }
+  }, [auth, applyBacktestServerState])
+
+  // Load on login/refresh, then poll: fast while a backtest is running, slow otherwise.
+  const backtestRunning = backtest.loading
+  useEffect(() => {
+    if (auth !== 'authenticated') return
+    syncBacktest()
+    const id = setInterval(syncBacktest, backtestRunning ? 3_000 : 10_000)
+    return () => clearInterval(id)
+  }, [auth, syncBacktest, backtestRunning])
+
+  // Explicit, shared changes to the page state (persisted on the server).
+  const saveBacktestSetting = async (patch: { date?: string; filter?: BacktestFilter }) => {
+    try {
+      const res = await fetch('/api/backtest/state', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(patch),
+      })
+      if (res.status === 401) { setAuth('login'); return }
+    } catch { /* next sync reconciles with the server */ }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Core polling loop for async backtest jobs.
-  // Accepts a stable setState setter so it can be called from submitBacktest.
-  // Returns the final ScanState payload so the caller can apply it in one shot.
-  // ─────────────────────────────────────────────────────────────────────────
-  const pollBacktestJob = async (jobId: string): Promise<ScanState> => {
-    while (true) {
-      await wait(2_000)
-      const res = await fetch(`/api/backtest/status/${jobId}`)
-      if (res.status === 401) {
-        setAuth('login')
-        throw new Error('Session expired')
-      }
-      const data = await readJsonResponse(res)
-      if (!res.ok) throw new Error(data?.error ?? 'Backtest status check failed')
+  const changeBacktestDate = (value: string) => {
+    setBacktestDate(value)
+    if (value) saveBacktestSetting({ date: value })   // '' = mid-edit, don't persist
+  }
 
-      const isRunning = data?.scanning === true || data?.status === 'running'
-      if (!isRunning) {
-        // Job finished — return the final payload so submitBacktest can apply
-        // it in a single setState call, avoiding a partial-state flash.
-        return data as ScanState
-      }
-
-      // Still running — update only the progress fields; don't clobber results.
-      mergeBacktestState({
-        scanning:  true,
-        scan_time: data.scan_time ?? null,
-        error:     null,
-      })
-    }
+  const changeBacktestFilter = (value: BacktestFilter) => {
+    setBacktestFilter(value)
+    saveBacktestSetting({ filter: value })
   }
 
   const submitBacktest = async (event: FormEvent) => {
     event.preventDefault()
-
-    // Reset to loading state, keeping the date label visible.
-    setBacktest({
-      loading: true,
-      jobId:   null,
-      state: {
-        ...DEFAULT_STATE,
-        scanning:  true,
-        scan_time: `Running backtest for ${backtestDate}…`,
-        error:     null,
-      },
-    })
-    setBacktestFilter('all')
+    if (backtest.loading) return
 
     try {
       const res = await fetch('/api/backtest/scan', {
@@ -306,48 +372,33 @@ export default function App() {
       if (res.status === 401) { setAuth('login'); return }
 
       const data = await readJsonResponse(res)
-      if (!res.ok) throw new Error(data?.error ?? 'Backtest failed')
-
-      // Backend acknowledged and queued an async job.
-      if (data?.job_id && (data?.status === 'running' || data?.scanning === true)) {
-        setBacktest(prev => ({
-          ...prev,
-          jobId: data.job_id,
-          state: { ...prev.state, scan_time: data.scan_time ?? prev.state.scan_time },
-        }))
-
-        // Block here until the job completes; get the final result in one shot.
-        const finalResult = await pollBacktestJob(data.job_id)
-
-        // Apply the complete result atomically — no partial-state flash.
-        setBacktest({
-          loading: false,
-          jobId:   data.job_id,
-          state:   finalResult as ScanState,
-        })
-
-        console.info('Backtest complete', {
-          total_scanned:    finalResult.total_scanned,
-          signals:          Array.isArray(finalResult.signals)         ? finalResult.signals.length         : 'missing',
-          watchlist_items:  Array.isArray(finalResult.watchlist_items) ? finalResult.watchlist_items.length : 'missing',
-          backtest_results: Array.isArray(finalResult.backtest_results)? finalResult.backtest_results.length: 'missing',
-          debug:            finalResult.debug,
-        })
-        return
+      if (!res.ok) {
+        // 409 = someone else's backtest is already running: join it instead.
+        if (res.status === 409 && data?.state) {
+          applyBacktestServerState(data.state as BacktestServerState)
+          return
+        }
+        throw new Error(data?.error ?? 'Backtest failed')
       }
 
-      // Synchronous (legacy) response path — backend returned results directly.
-      setBacktest({ loading: false, jobId: null, state: data as ScanState })
-      console.info('Backtest complete (sync)', {
-        total_scanned:    data.total_scanned,
-        signals:          Array.isArray(data.signals)         ? data.signals.length         : 'missing',
-        watchlist_items:  Array.isArray(data.watchlist_items) ? data.watchlist_items.length : 'missing',
-        backtest_results: Array.isArray(data.backtest_results)? data.backtest_results.length: 'missing',
-      })
+      // Show "running" right away; the shared sync loop delivers the result
+      // (to this user and everyone else) when the job finishes.
+      setBacktest(prev => ({
+        ...prev,
+        loading: true,
+        jobId:   data?.job_id ?? null,
+        state: {
+          ...(prev.result ?? DEFAULT_STATE),
+          scanning:  true,
+          scan_time: `Running backtest for ${backtestDate}…`,
+          error:     null,
+        },
+      }))
+      setBacktestFilter('all')
+      syncBacktest()
     } catch (error) {
       setBacktest(prev => ({
         ...prev,
-        loading: false,
         state: {
           ...prev.state,
           scanning: false,
@@ -465,7 +516,7 @@ export default function App() {
             <DatePicker
               label="Date"
               value={backtestDate}
-              onChange={setBacktestDate}
+              onChange={changeBacktestDate}
               max={todayIso()}
               required
             />
@@ -517,7 +568,7 @@ export default function App() {
               view={view}
               tradeReadyTimes={tradeReadyTimes}
               backtestFilter={backtestFilter}
-              onBacktestFilter={setBacktestFilter}
+              onBacktestFilter={changeBacktestFilter}
             />
           </>
         )}
