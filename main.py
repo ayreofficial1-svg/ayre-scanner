@@ -75,7 +75,8 @@ from scanner.watchlist import (
 )
 from scanner.engine import run_scan
 from scanner.historical import (
-    run_historical_scan, topup_historical_scan, backtest_universe_gap, _tag as _universe_tag,
+    run_historical_scan, topup_historical_scan, backtest_universe_gap, backtest_retry_symbols,
+    _tag as _universe_tag,
 )
 from utils.logger import get_log_summary
 from utils.scan_progress import LIVE_PROGRESS, BACKTEST_PROGRESS
@@ -365,11 +366,20 @@ def _set_universe(symbols: list[str], meta: dict) -> None:
     _symbols_meta = dict(meta or {})
 
 
-def _refresh_symbols() -> None:
+def _refresh_symbols(force_if_incomplete: bool = False) -> None:
     """
     Re-read the Nifty 500 list once per day (and retry every 10 min while the
-    list looks truncated, e.g. after the Nifty-50 fallback). A worse/shorter
-    list never replaces a good one.
+    list looks truncated, e.g. after the Nifty-50 fallback).
+
+    force_if_incomplete — used by scans and backtests: when the current universe
+    is incomplete the 10-minute throttle is skipped, so a scan never runs on a
+    truncated list if NSE has become reachable again in the meantime.
+
+    Replacement rule (a worse list never replaces a good one):
+      * a COMPLETE fresh list always replaces the current one (index changes);
+      * an incomplete fresh list replaces the current one only when the current
+        one is incomplete too and the fresh one is larger;
+      * an incomplete fresh list NEVER replaces a complete one.
     """
     global _symbols_ok_on, _symbols_last_try
     today = datetime.datetime.now(_IST).date()
@@ -377,7 +387,7 @@ def _refresh_symbols() -> None:
         full = _symbols_complete()
         if full and _symbols_ok_on == today:
             return
-        if not full and _symbols and time.time() - _symbols_last_try < 600:
+        if _symbols and not (force_if_incomplete and not full) and time.time() - _symbols_last_try < 600:
             return
         _symbols_last_try = time.time()
         try:
@@ -385,17 +395,29 @@ def _refresh_symbols() -> None:
         except Exception as exc:
             print(f"⚠️   Symbol list refresh failed ({exc}); keeping the current list.")
             return
-        if fresh and (not _symbols or len(fresh) >= 0.9 * len(_symbols)):
+        fresh_complete = bool(fresh_meta.get("complete")) and len(fresh) >= _MIN_FULL_UNIVERSE
+        if not fresh:
+            accept = False
+        elif not _symbols:
+            accept = True
+        elif fresh_complete:
+            accept = True
+        elif not full:
+            accept = len(fresh) >= len(_symbols)
+        else:
+            accept = False
+        if accept:
             if _symbols and set(fresh) != set(_symbols):
                 added = sorted(set(fresh) - set(_symbols))
                 dropped = sorted(set(_symbols) - set(fresh))
                 print(f"🔄  Symbol universe updated: {len(_symbols)} → {len(fresh)} stocks "
                       f"(added {added[:15]}, removed {dropped[:15]})")
             _set_universe(fresh, fresh_meta)
-            if fresh_meta.get("complete"):
+            if fresh_complete:
                 _symbols_ok_on = today
         else:
-            print(f"⚠️   Symbol refresh returned {len(fresh or [])} stocks; keeping {len(_symbols or [])}.")
+            print(f"⚠️   Symbol refresh returned {len(fresh or [])} stocks "
+                  f"(complete={fresh_meta.get('complete')}); keeping {len(_symbols or [])}.")
 
 
 def _saved_universe_gap(saved: dict | None) -> tuple[list[str], list[str]] | None:
@@ -408,6 +430,16 @@ def _saved_universe_gap(saved: dict | None) -> tuple[list[str], list[str]] | Non
         return None
     missing, removed = backtest_universe_gap(saved.get("payload") or {}, _symbols)
     return (missing, removed) if (missing or removed) else None
+
+
+def _saved_retry_symbols(saved: dict | None) -> list[str]:
+    """
+    Stocks of the current universe whose saved backtest row says Fyers failed to
+    answer (transient). They are re-requested alone — never a full rescan.
+    """
+    if not saved or not _symbols:
+        return []
+    return backtest_retry_symbols(saved.get("payload") or {}, _symbols)
 
 
 # Shared, persisted backtest page state (selected date, filter, running job,
@@ -775,18 +807,21 @@ def api_backtest_scan():
     if not force:
         saved = _load_scan_result("backtest", day_key)
         gap = None
+        retry: list[str] = []
         if saved and saved.get("session_final"):
             try:
                 _refresh_symbols()      # NSE list only — no Fyers call
             except Exception as exc:
                 print(f"⚠️   Universe refresh before backtest failed: {exc}")
             gap = _saved_universe_gap(saved)
-            if gap:
+            retry = _saved_retry_symbols(saved)
+            if gap or retry:
                 topup_base = saved["payload"]
-                print(f"🧪  Backtest {day_key}: saved result is missing {len(gap[0])} stock(s) "
-                      f"of the current Nifty 500 ({gap[0][:10]}) and holds {len(gap[1])} "
-                      f"that left it — topping up only the difference.")
-        if saved and saved.get("session_final") and not gap:
+                print(f"🧪  Backtest {day_key}: saved result is missing {len(gap[0]) if gap else 0} stock(s) "
+                      f"of the current Nifty 500 ({(gap[0] if gap else [])[:10]}), holds "
+                      f"{len(gap[1]) if gap else 0} that left it and has {len(retry)} stock(s) "
+                      f"Fyers failed to answer ({retry[:10]}) — re-requesting only those.")
+        if saved and saved.get("session_final") and not (gap or retry):
             with _backtest_lock:
                 if _backtest_state.get("running_job"):
                     return jsonify({
@@ -965,11 +1000,14 @@ def api_backtest_state_set():
                         _backtest_state["error"] = None
                         _backtest_state["notice"] = None
                         _gap = _saved_universe_gap(saved)
-                        if _gap:
+                        _retry = _saved_retry_symbols(saved)
+                        if _gap or _retry:
                             _backtest_state["notice"] = (
-                                f"This saved backtest does not match the current Nifty 500 "
-                                f"({len(_gap[0])} stock(s) missing, {len(_gap[1])} no longer in the index). "
-                                "Press Backtest for this date to top up only the difference."
+                                f"This saved backtest is not complete for the current Nifty 500 "
+                                f"({len(_gap[0]) if _gap else 0} stock(s) missing, "
+                                f"{len(_gap[1]) if _gap else 0} no longer in the index, "
+                                f"{len(_retry)} that Fyers failed to answer last time). "
+                                "Press Backtest for this date to request only those again."
                             )
         if "filter" in payload:
             new_filter = str(payload["filter"]).strip()
@@ -997,7 +1035,7 @@ def _run_backtest_job(job_id: str, target_date: datetime.date, topup_base: dict 
     )
     try:
         print(f"🧪  Backtest API request: date={target_date.isoformat()}")
-        _refresh_symbols()
+        _refresh_symbols(force_if_incomplete=True)
         if _symbols is None:
             _set_universe(*fetch_nifty500_with_meta())
         if _fyers is None:
@@ -1136,7 +1174,8 @@ def _run_backtest_job(job_id: str, target_date: datetime.date, topup_base: dict 
             _tu = report.get("topup") or {}
             _backtest_state["notice"] = _uni_warn or (
                 f"Saved backtest updated to the current Nifty 500: added "
-                f"{', '.join(_tu.get('added') or []) or 'none'}; removed "
+                f"{', '.join(_tu.get('added') or []) or 'none'}; re-requested from Fyers "
+                f"{', '.join(_tu.get('retried') or []) or 'none'}; removed "
                 f"{', '.join(_tu.get('removed') or []) or 'none'}."
                 if topup_base is not None else None
             )
@@ -2436,7 +2475,7 @@ def _scan_report_summary(fetch_report: dict) -> dict:
     keys = (
         "attempted", "valid", "no_data", "failed", "recovered", "persistent_retries",
         "short_history", "stale", "cached_no_data", "evaluated", "failed_symbols",
-        "evaluation_errors", "ledger",
+        "evaluation_errors", "ledger", "universe_total", "universe",
     )
     return _json_safe({k: fetch_report.get(k) for k in keys if k in fetch_report})
 
@@ -2478,8 +2517,15 @@ def _do_scan(lock_held: bool = False):
             _state["error"] = "Scan skipped because the market is not source-confirmed open."
             return
 
-        _refresh_symbols()
+        _refresh_symbols(force_if_incomplete=True)
         LIVE_PROGRESS.set_total(len(_symbols or []))
+        _uni_warn = None
+        if not _symbols_complete():
+            _uni_warn = (
+                (_symbols_meta.get("error") or "The Nifty 500 list could not be fully loaded.")
+                + f" This scan covers only {len(_symbols or [])} stocks; the list is retried on every scan."
+            )
+            print(f"⚠️   {_uni_warn}")
 
         watchlist = clean_watchlist(load_watchlist())
         alert_log = clean_alert_log(load_alert_log())
@@ -2512,13 +2558,31 @@ def _do_scan(lock_held: bool = False):
         # total_attempted = ground truth len(symbols) — never varies.
         _state["total_scanned"]   = fetch_report.get("evaluated", fetch_report["valid"])
         _state["total_attempted"] = fetch_report["attempted"]
+        fetch_report["universe_total"] = len(_symbols or [])
+        fetch_report["universe"] = {
+            "index": "NIFTY 500",
+            "source": _symbols_meta.get("source"),
+            "count": len(_symbols or []),
+            "complete": _symbols_complete(),
+            "built_at": _symbols_meta.get("built_at"),
+            "sources_tried": _symbols_meta.get("sources_tried"),
+            "fyers_master": {
+                k: v for k, v in (_symbols_meta.get("fyers_master") or {}).items()
+                if k in ("loaded", "source", "listed_on_fyers", "remapped", "not_in_master")
+            },
+        }
         _state["scan_report"]     = _scan_report_summary(fetch_report)
 
+        _notices = []
+        if _uni_warn:
+            _notices.append(_uni_warn)
         if fetch_report.get("failed"):
-            _state["notice"] = (
+            _notices.append(
                 f"{fetch_report['failed']} stock(s) could not be fetched from Fyers after all retries "
                 "(see /api/scan/skipped). Rescan to try them again."
             )
+        if _notices:
+            _state["notice"] = " ".join(_notices)
 
         # Insights (spec §2) — persist so a restart doesn't blank the charts
         # until the next scan, and update the in-memory copy the

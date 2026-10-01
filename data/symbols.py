@@ -43,6 +43,8 @@ _CSV_NIFTY50      = "https://archives.nseindia.com/content/indices/ind_nifty50li
 _CSV_NIFTY500     = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
 _CSV_NIFTY_BANK   = "https://archives.nseindia.com/content/indices/ind_niftybanklist.csv"
 _CSV_NIFTY_NEXT50 = "https://archives.nseindia.com/content/indices/ind_niftynext50list.csv"
+# Third, independent host for the same official Nifty 500 CSV (NSE Indices' own site).
+_CSV_NIFTY500_ALT = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
 
 # Hardcoded Nifty 50 fallback (always up to date enough for daily swing scanning)
 _NIFTY50_FALLBACK = [
@@ -133,40 +135,72 @@ def _clean_symbols(raw) -> list[str]:
     return out
 
 
-def _fetch_from_api(url: str, session: requests.Session) -> list[str]:
-    """Fetches symbols from NSE API. Returns [] on failure."""
+def _clean_pairs(pairs) -> dict[str, str | None]:
+    """{symbol: isin|None} after the same cleaning rules as _clean_symbols (order kept)."""
+    raw: dict[str, str | None] = {}
+    for sym, isin in pairs or []:
+        if sym is None:
+            continue
+        key = str(sym).strip()
+        isin = str(isin).strip().upper() if isin else None
+        if isin in ("", "NAN", "NONE"):
+            isin = None
+        if key not in raw or (raw[key] is None and isin):
+            raw[key] = isin
+    return {s: raw[s] for s in _clean_symbols(list(raw))}
+
+
+def _fetch_rows_from_api(url: str, session: requests.Session) -> dict[str, str | None]:
+    """NSE JSON → {symbol: isin|None}. Empty dict on failure."""
     try:
         resp = session.get(url, headers=NSE_HEADERS, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        return _clean_symbols(d.get("symbol") for d in data.get("data", []))
+        pairs = []
+        for d in data.get("data", []):
+            meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
+            pairs.append((d.get("symbol"), meta.get("isin")))
+        return _clean_pairs(pairs)
     except Exception:
-        return []
+        return {}
 
 
-def _fetch_from_csv(url: str, session: requests.Session | None = None) -> list[str]:
+def _fetch_rows_from_csv(url: str, session: requests.Session | None = None) -> dict[str, str | None]:
     """
-    Fetches symbols from the NSE archive CSV. Returns [] on failure.
+    Index CSV → {symbol: isin|None}. Empty dict on failure.
 
     The request is sent WITH the NSE browser headers: archives.nseindia.com
-    rejects the bare urllib user-agent that pd.read_csv(url) uses, which made
-    this fallback silently return [] before.
+    rejects the bare urllib user-agent that pd.read_csv(url) uses.
     """
+    def _parse(df: pd.DataFrame) -> dict[str, str | None]:
+        col = next(c for c in df.columns if "symbol" in str(c).lower())
+        icol = next((c for c in df.columns if "isin" in str(c).lower()), None)
+        syms = df[col].astype(str).tolist()
+        isins = df[icol].astype(str).tolist() if icol is not None else [None] * len(syms)
+        keep = [(a, b) for a, b in zip(syms, isins) if str(a).strip().upper() not in ("NAN", "NONE", "")]
+        return _clean_pairs(keep)
+
     try:
         if session is None:
             session = requests.Session()
         resp = session.get(url, headers=NSE_HEADERS, timeout=20)
         resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-        col = next(c for c in df.columns if "symbol" in str(c).lower())
-        return _clean_symbols(df[col].dropna().astype(str).tolist())
+        return _parse(pd.read_csv(io.StringIO(resp.text)))
     except Exception:
         try:
-            df = pd.read_csv(url)
-            col = next(c for c in df.columns if "symbol" in str(c).lower())
-            return _clean_symbols(df[col].dropna().astype(str).tolist())
+            return _parse(pd.read_csv(url))
         except Exception:
-            return []
+            return {}
+
+
+def _fetch_from_api(url: str, session: requests.Session) -> list[str]:
+    """Fetches symbols from NSE API. Returns [] on failure."""
+    return list(_fetch_rows_from_api(url, session))
+
+
+def _fetch_from_csv(url: str, session: requests.Session | None = None) -> list[str]:
+    """Fetches symbols from an NSE index CSV. Returns [] on failure."""
+    return list(_fetch_rows_from_csv(url, session))
 
 
 def plain_constituents_for_market(
@@ -242,8 +276,8 @@ def fetch_nifty50() -> list[str]:
 
 
 # ── Nifty 500 universe ───────────────────────────────────────────────────────
-NIFTY500_CACHE_FILE = "nifty500_universe.json"   # last successfully fetched official list
-_N500_MIN_USABLE = 450          # below this the fetched list is treated as truncated
+NIFTY500_CACHE_FILE = "nifty500_universe.json"   # last COMPLETE official list
+_N500_MIN_USABLE = 450          # below this a fetched list is ignored entirely
 _N500_COMPLETE_RANGE = (490, 510)
 _IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 _meta_lock = threading.Lock()
@@ -256,44 +290,110 @@ def get_universe_meta() -> dict:
         return dict(_UNIVERSE_META)
 
 
-def _save_universe_cache(symbols: list[str], source: str) -> None:
+def _is_complete(n: int) -> bool:
+    lo, hi = _N500_COMPLETE_RANGE
+    return lo <= n <= hi
+
+
+def _save_universe_cache(rows: dict[str, str | None], source: str) -> None:
+    """Only ever called with a COMPLETE list, so a truncated fetch can never poison the fallback."""
     try:
         tmp = NIFTY500_CACHE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({
                 "saved_at": datetime.datetime.now(_IST).isoformat(),
                 "source": source,
-                "symbols": symbols,
+                "symbols": list(rows),
+                "isins": {k: v for k, v in rows.items() if v},
             }, f)
         os.replace(tmp, NIFTY500_CACHE_FILE)
     except Exception:
         pass
 
 
-def _load_universe_cache() -> tuple[list[str], str | None]:
+def _load_universe_cache() -> tuple[dict[str, str | None], str | None]:
     try:
         with open(NIFTY500_CACHE_FILE, encoding="utf-8") as f:
             data = json.load(f)
+        isins = data.get("isins") or {}
         syms = _clean_symbols(data.get("symbols"))
-        return syms, data.get("saved_at")
+        return {s: isins.get(s) for s in syms}, data.get("saved_at")
     except Exception:
-        return [], None
+        return {}, None
+
+
+def _fetch_n500_rows(session: requests.Session) -> tuple[dict[str, str | None], str, list[dict], str | None]:
+    """
+    Fetch the Nifty 500 from the official sources and pick the most complete result.
+
+    Sources are tried in order and the first COMPLETE answer (490–510 symbols) is
+    used immediately, so a healthy NSE costs exactly one request.  Only when no
+    source is complete are the others fetched and combined — a list that NSE
+    truncated can no longer be accepted as if it were the whole index.
+
+    Returns (rows, source, tried, cache_saved_at).
+    """
+    sources = [
+        ("nse_api", lambda: _fetch_rows_from_api(_URL_NIFTY500, session)),
+        ("nse_csv", lambda: _fetch_rows_from_csv(_CSV_NIFTY500, session)),
+        ("niftyindices_csv", lambda: _fetch_rows_from_csv(_CSV_NIFTY500_ALT, session)),
+    ]
+    tried: list[dict] = []
+    got: list[tuple[str, dict[str, str | None]]] = []
+    for name, fn in sources:
+        rows = fn()
+        tried.append({"source": name, "count": len(rows)})
+        if rows:
+            got.append((name, rows))
+        if _is_complete(len(rows)):
+            return rows, name, tried, None
+
+    # Nobody was complete. Add the last good copy to the pool and merge.
+    cached, cache_saved_at = _load_universe_cache()
+    if cached:
+        tried.append({"source": "last_good_cache", "count": len(cached)})
+        got.append(("last_good_cache", cached))
+    if not got:
+        return {}, "none", tried, cache_saved_at
+
+    merged: dict[str, str | None] = {}
+    for _name, rows in got:
+        for sym, isin in rows.items():
+            if sym not in merged or (merged[sym] is None and isin):
+                merged[sym] = isin
+    names = "+".join(n for n, _ in got)
+    if _is_complete(len(merged)):
+        return merged, f"merged({names})", tried, cache_saved_at
+
+    # Merge overshot or is still short: prefer a complete cached list, else the
+    # largest single answer, else the merge if it is the biggest usable thing we have.
+    if cached and _is_complete(len(cached)):
+        return cached, "last_good_cache", tried, cache_saved_at
+    biggest_name, biggest = max(got, key=lambda g: len(g[1]))
+    if len(merged) <= _N500_COMPLETE_RANGE[1] and len(merged) >= len(biggest):
+        return merged, f"merged({names})", tried, cache_saved_at
+    return biggest, biggest_name, tried, cache_saved_at
 
 
 def fetch_nifty500_with_meta() -> tuple[list[str], dict]:
     """
     Build the Nifty 500 universe (Fyers format) and report exactly where it came from.
 
-    Source order (all NSE / local — none of this touches Fyers):
+    Source order (all NSE / local — none of this touches the Fyers API):
         1. NSE live JSON  (equity-stockIndices?index=NIFTY 500)
         2. NSE archive CSV (ind_nifty500list.csv, fetched with NSE headers)
-        3. last successfully fetched list stored on disk
-    The Nifty-50-only list is used ONLY when all three fail, and the returned
+        3. niftyindices.com CSV (same official file, independent host)
+        4. If none of them is complete: the sources combined with the last
+           complete list saved on disk.
+    The Nifty-50-only list is used ONLY when everything fails, and the returned
     meta then says complete=False so callers can warn instead of silently
     scanning a truncated universe.
 
     Order: Nifty 50 first (only members that are really in the Nifty 500 list),
     then the remainder. Nothing outside the Nifty 500 list is ever added.
+
+    After the list is built, Fyers' public symbol master is used to map each NSE
+    symbol to its exact Fyers ticker (see data/fyers_master.py).
     """
     session = requests.Session()
     try:
@@ -313,45 +413,53 @@ def fetch_nifty500_with_meta() -> tuple[list[str], dict]:
     print(f"   ✅  {len(n50)} Nifty 50 symbols loaded ({n50_source})")
 
     print("📡  Fetching Nifty 500 …")
-    source = "nse_api"
-    n500 = _fetch_from_api(_URL_NIFTY500, session)
-    if len(n500) < _N500_MIN_USABLE:
-        source = "nse_csv"
-        n500 = _fetch_from_csv(_CSV_NIFTY500, session)
-    cache_saved_at = None
-    if len(n500) < _N500_MIN_USABLE:
-        cached, cache_saved_at = _load_universe_cache()
-        if len(cached) >= _N500_MIN_USABLE:
-            source = "last_good_cache"
-            n500 = cached
-            print(f"   ⚠️   NSE unreachable — using last good Nifty 500 list saved {cache_saved_at}")
+    rows, source, tried, cache_saved_at = _fetch_n500_rows(session)
+    n500 = list(rows)
+    if source == "last_good_cache":
+        print(f"   ⚠️   NSE unreachable/incomplete — using last good Nifty 500 list saved {cache_saved_at}")
 
     meta: dict = {
         "index": "NIFTY 500",
         "built_at": datetime.datetime.now(_IST).isoformat(),
         "nifty50_source": n50_source,
+        "sources_tried": tried,
     }
 
     if len(n500) >= _N500_MIN_USABLE:
-        if source != "last_good_cache":
-            _save_universe_cache(n500, source)
+        complete = _is_complete(len(n500))
+        # ISINs: needed only for the Fyers ticker mapping. Fetch the CSV once if the list has few.
+        if sum(1 for v in rows.values() if v) < 0.9 * len(rows):
+            for url in (_CSV_NIFTY500, _CSV_NIFTY500_ALT):
+                extra = _fetch_rows_from_csv(url, session)
+                if extra:
+                    for sym in rows:
+                        if not rows[sym] and extra.get(sym):
+                            rows[sym] = extra[sym]
+                    if sum(1 for v in rows.values() if v) >= 0.9 * len(rows):
+                        break
+        if complete and source != "last_good_cache":
+            _save_universe_cache(rows, source)
         n500_set = set(n500)
         n50_in = [s for s in n50 if s in n500_set]
         n50_set = set(n50_in)
         remainder = [s for s in n500 if s not in n50_set]
         ordered = n50_in + remainder
-        lo, hi = _N500_COMPLETE_RANGE
         meta.update({
             "source": source,
             "count": len(ordered),
-            "complete": lo <= len(ordered) <= hi,
+            "complete": complete,
             "list_saved_at": cache_saved_at,
             "nifty50_not_in_nifty500": sorted(s for s in n50 if s not in n500_set),
-            "error": None,
+            "error": None if complete else (
+                f"Only {len(ordered)} Nifty 500 symbols could be assembled from NSE "
+                f"(expected {_N500_COMPLETE_RANGE[0]}–{_N500_COMPLETE_RANGE[1]}); the list is incomplete."
+            ),
         })
-        print(f"   ✅  {len(n500)} Nifty 500 symbols loaded ({source})")
+        print(f"   ✅  {len(n500)} Nifty 500 symbols loaded ({source}"
+              f"{'' if complete else ' — INCOMPLETE'})")
         print(f"   📊  Scan order: {len(n50_in)} Nifty 50 → {len(remainder)} remainder")
         result = ordered
+        isin_map = {s: rows.get(s) for s in ordered}
     else:
         print("   ⚠️   Nifty 500 list unavailable from every source. Universe is Nifty 50 ONLY.")
         meta.update({
@@ -360,10 +468,25 @@ def fetch_nifty500_with_meta() -> tuple[list[str], dict]:
             "complete": False,
             "list_saved_at": None,
             "nifty50_not_in_nifty500": [],
-            "error": "Nifty 500 constituents could not be fetched from NSE (API, CSV) "
+            "error": "Nifty 500 constituents could not be fetched from NSE (API, CSV, niftyindices) "
                      "and no saved copy exists; the universe is incomplete.",
         })
         result = list(n50)
+        isin_map = {s: None for s in result}
+
+    # Exact Fyers ticker per stock (zero Fyers API calls). Never raises.
+    try:
+        from data.fyers_master import build_hints
+        fm = build_hints(isin_map)
+        meta["fyers_master"] = fm
+        if fm.get("loaded"):
+            print(f"   🧭  Fyers symbol master ({fm.get('source')}): {fm['listed_on_fyers']}/{fm['universe']} "
+                  f"listed, {len(fm['remapped'])} on a non-EQ/renamed ticker, "
+                  f"{len(fm['not_in_master'])} not in master")
+        else:
+            print("   ⚠️   Fyers symbol master unavailable — falling back to -EQ/-BE/-BZ/-SM/-ST probing")
+    except Exception as exc:
+        meta["fyers_master"] = {"loaded": False, "error": f"{type(exc).__name__}: {exc}"}
 
     with _meta_lock:
         _UNIVERSE_META.clear()

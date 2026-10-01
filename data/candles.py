@@ -36,18 +36,33 @@ What changed vs. the old pipeline (all of it REDUCES Fyers calls)
   * Unified retry waves with growing pauses; a global pacer slows down after a
     429 instead of hammering the same limit.
   * Short-history stocks are kept and evaluated instead of being retried.
-  * Live scans may skip a symbol already CONFIRMED invalid within the last day
-    (symbol_cache.py); backtests never do.
+  * A symbol already CONFIRMED invalid is never skipped outright: a live scan
+    re-verifies it with at most two requests, so a transient Fyers "invalid
+    symbol" cannot hide a stock for a day.  Backtests never read that cache.
+  * The exact Fyers ticker comes from Fyers' public symbol master
+    (data/fyers_master.py) — no -BE/-BZ/-SM/-ST probing for stocks it maps.
+  * The older window (W1) of a live scan is identical for every scan of the
+    day, so it is requested once per day and reused (halves the request count
+    of every scan after the first).
+  * The pacer enforces BOTH Fyers limits (10/s and 200/min) so a full scan does
+    not run into 429s; a 429 costs a request and delays a stock.
+  * If Fyers rejects the session mid-scan, everything already fetched is kept
+    for a few minutes so the automatic reconnect only fetches the remainder.
 """
 
 import datetime
 import time
 import threading
+from collections import deque
 
 import pandas as pd
 from fyers_apiv3 import fyersModel
 
-from config.settings import STALE_BAR_MAX_DAYS
+from config.settings import (
+    FYERS_MAX_REQUESTS_PER_MINUTE,
+    SCAN_RESUME_MAX_AGE_SECONDS,
+    STALE_BAR_MAX_DAYS,
+)
 from data.symbol_cache import SYMBOL_CACHE
 from utils.scan_control import (
     FyersAuthError, ScanCancelled, check_cancel, sleep_cancellable,
@@ -66,10 +81,24 @@ _RATE_LIMIT_CODE = 429
 _AUTH_CODES = {-8, -15, -16, -17, 401, 403}
 _AUTH_ABORT_AFTER = 8         # consecutive auth rejections before the scan aborts
 
-# Retry waves for transient failures (Fyers errors / rate limits).
-_PERSISTENT_MAX_RETRIES = 6
+# Retry waves for transient failures (Fyers errors / rate limits).  Only the
+# symbols that are still failing are requested again, so extra waves cost almost
+# nothing — but they let a stock survive a Fyers outage of a few minutes.
+_PERSISTENT_MAX_RETRIES = 8
 _PERSISTENT_RETRY_INTERVAL = 3.0       # pause before wave 1, then × multiplier
 _PERSISTENT_BACKOFF_MULTIPLIER = 1.6
+_PERSISTENT_MAX_PAUSE = 60.0           # pause between waves never exceeds this
+
+# Category written into the ledger / result row for a stock Fyers kept failing on.
+# scanner/historical.py uses it to retry exactly those stocks (and nothing else).
+CATEGORY_FETCH_FAILED = "Not analysed — Fyers did not return data"
+
+_IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _today_ist() -> datetime.date:
+    """Scan date for live scans. IST, not the server's local (UTC) clock."""
+    return datetime.datetime.now(_IST).date()
 
 
 def _response_code(resp: dict | None) -> int | None:
@@ -81,18 +110,35 @@ def _response_code(resp: dict | None) -> int | None:
 
 # ── Pacing (adaptive, global) ─────────────────────────────────────────────────
 class _Pacer:
-    """Spaces requests; widens the gap after a 429 and relaxes again when calm."""
+    """
+    Spaces requests so BOTH Fyers limits hold: at most one request per
+    `base` seconds (10/s limit) and at most `per_minute` requests in any rolling
+    60 seconds (200/min limit).  A slot is reserved under the lock, so concurrent
+    callers can never jointly exceed either limit.  A 429 widens the gap and
+    lowers the per-minute cap; a long calm streak relaxes both again.
+    """
 
-    def __init__(self, base: float):
+    def __init__(self, base: float, per_minute: int):
         self._base = base
         self._interval = base
+        self._cap_base = max(30, int(per_minute))
+        self._cap = self._cap_base
         self._next = 0.0
         self._streak = 0
+        self._stamps: deque[float] = deque()
         self._lock = threading.Lock()
 
     def before(self, cancel=None) -> None:
         with self._lock:
-            wait = self._next - time.monotonic()
+            now = time.monotonic()
+            slot = max(now, self._next)
+            while self._stamps and self._stamps[0] <= slot - 60.0:
+                self._stamps.popleft()
+            if len(self._stamps) >= self._cap:
+                slot = max(slot, self._stamps[-self._cap] + 60.0)
+            self._stamps.append(slot)
+            self._next = slot + self._interval
+        wait = slot - time.monotonic()
         if wait > 0:
             sleep_cancellable(wait, cancel)
 
@@ -103,18 +149,22 @@ class _Pacer:
     def rate_limited(self, pause: float) -> None:
         with self._lock:
             self._interval = min(self._interval * 1.5, 1.0)
+            self._cap = max(60, int(self._cap * 0.85))
             self._next = max(self._next, time.monotonic() + pause)
             self._streak = 0
 
     def ok(self) -> None:
         with self._lock:
             self._streak += 1
-            if self._streak >= 25 and self._interval > self._base:
-                self._interval = max(self._base, self._interval * 0.9)
+            if self._streak >= 25:
                 self._streak = 0
+                if self._interval > self._base:
+                    self._interval = max(self._base, self._interval * 0.9)
+                if self._cap < self._cap_base:
+                    self._cap = min(self._cap_base, self._cap + 5)
 
 
-_PACER = _Pacer(_SLEEP)
+_PACER = _Pacer(_SLEEP, FYERS_MAX_REQUESTS_PER_MINUTE)
 _auth_fail_streak = 0
 
 
@@ -215,7 +265,40 @@ class _Fetch:
         self.status, self.df, self.code, self.message, self.last_bar = status, df, code, message, last_bar
 
 
-def _fetch_history(fyers, symbol, range_to, partial, cancel, allow_w2_only=False) -> _Fetch:
+# ── Older-window (W1) cache ──────────────────────────────────────────────────
+# For a live scan W1 is [today-732d, today-366d]: the same request for every scan
+# of the day, and it is history that cannot change intraday.  Requested once per
+# day per ticker, reused by every later scan (≈500 fewer Fyers requests per scan).
+# Live scans only; backtests never use it.  Only definitive answers are cached.
+_W1_CACHE: dict[tuple, "_Win"] = {}
+_W1_CACHE_DAY: datetime.date | None = None
+_W1_CACHE_MAX = 6000
+_w1_lock = threading.Lock()
+
+
+def _w1_cache_get(key: tuple, day: datetime.date) -> "_Win | None":
+    global _W1_CACHE_DAY
+    with _w1_lock:
+        if _W1_CACHE_DAY != day:
+            _W1_CACHE.clear()
+            _W1_CACHE_DAY = day
+            return None
+        return _W1_CACHE.get(key)
+
+
+def _w1_cache_put(key: tuple, day: datetime.date, win: "_Win") -> None:
+    global _W1_CACHE_DAY
+    if win.status not in ("ok", "empty", "invalid_symbol"):
+        return
+    with _w1_lock:
+        if _W1_CACHE_DAY != day:
+            _W1_CACHE.clear()
+            _W1_CACHE_DAY = day
+        if len(_W1_CACHE) < _W1_CACHE_MAX:
+            _W1_CACHE[key] = win
+
+
+def _fetch_history(fyers, symbol, range_to, partial, cancel, allow_w2_only=False, live=False) -> _Fetch:
     """
     status: ok | empty | invalid | stale | failed
     `partial` maps symbol → already-fetched W2 frame (kept across retries).
@@ -240,7 +323,12 @@ def _fetch_history(fyers, symbol, range_to, partial, cancel, allow_w2_only=False
     if needs_w1 and _NUM_WINDOWS > 1:
         w1_to = w2_from
         w1_from = w1_to - datetime.timedelta(days=_WINDOW_DAYS)
-        w1 = _request_window(fyers, symbol, w1_from, w1_to, cancel)
+        w1_key = (symbol, w1_from.isoformat(), w1_to.isoformat())
+        w1 = _w1_cache_get(w1_key, range_to) if live else None
+        if w1 is None:
+            w1 = _request_window(fyers, symbol, w1_from, w1_to, cancel)
+            if live:
+                _w1_cache_put(w1_key, range_to, w1)
         if w1.status == "ok":
             frames.append(w1.df)
         elif w1.status == "failed" and not allow_w2_only:
@@ -273,31 +361,42 @@ class _Outcome:
 
 
 def _candidates(symbol: str) -> list[str]:
+    """
+    Fyers tickers to try for one NSE symbol, best first:
+      1. the ticker Fyers' own symbol master lists for it (series / renamed ticker)
+      2. the series that worked last time
+      3. NSE:X-EQ, then -BE/-BZ/-SM/-ST  (only reached if the earlier ones say "invalid")
+    """
     if symbol.endswith("-EQ"):
         base = symbol[:-3]
         cands = [symbol] + [base + s for s in _ALT_SUFFIXES]
     else:
         cands = [symbol]
-    hint = SYMBOL_CACHE.hint(symbol)
-    if hint and hint in cands:
-        cands.remove(hint)
-        cands.insert(0, hint)
-    return cands
+    front = [h for h in (SYMBOL_CACHE.master_hint(symbol), SYMBOL_CACHE.hint(symbol)) if h]
+    out: list[str] = []
+    for c in front + cands:
+        if c not in out:
+            out.append(c)
+    return out
 
 
 def _fetch_symbol(fyers, symbol, range_to, partial, cancel, live, allow_w2_only=False) -> _Outcome:
     """status: ok | no_data | stale | failed"""
+    cands = _candidates(symbol)
+    verifying = False
     if live:
         cached = SYMBOL_CACHE.no_data_entry(symbol)
-        if cached:
-            return _Outcome("no_data", cached=True,
-                            message=f"Fyers confirmed no data within the last day ({cached.get('detail', '')})")
+        # A stock Fyers' symbol master lists is never treated as "no data" from a
+        # cache; for the others the cache only shortens the probe (<= 2 requests
+        # instead of 5).  It can no longer hide a stock for the whole day.
+        if cached and not SYMBOL_CACHE.master_knows(symbol):
+            verifying = True
+            cands = cands[:2]
 
-    cands = _candidates(symbol)
     invalid = 0
     stale: _Fetch | None = None
     for cand in cands:
-        r = _fetch_history(fyers, cand, range_to, partial, cancel, allow_w2_only)
+        r = _fetch_history(fyers, cand, range_to, partial, cancel, allow_w2_only, live)
         if r.status == "ok":
             SYMBOL_CACHE.record_resolved(symbol, cand)
             return _Outcome("ok", df=r.df, last_bar=r.last_bar, resolved=cand)
@@ -313,10 +412,37 @@ def _fetch_symbol(fyers, symbol, range_to, partial, cancel, live, allow_w2_only=
         return _Outcome("stale", last_bar=stale.last_bar, message=stale.message)
     if invalid == len(cands):
         detail = f"code {_INVALID_SYMBOL_CODE} on {', '.join(c.split('-')[-1] for c in cands)}"
-        if live:
+        if live and not verifying:
             SYMBOL_CACHE.record_no_data(symbol, detail)
-        return _Outcome("no_data", message=f"Fyers reports this symbol as invalid ({detail})")
+        return _Outcome("no_data", cached=verifying,
+                        message=f"Fyers reports this symbol as invalid ({detail})")
     return _Outcome("no_data", message="Fyers returned no candles for the requested period")
+
+
+# ── Resume after a dead Fyers session ────────────────────────────────────────
+# When Fyers rejects the session, main.py reconnects and restarts the fetch once.
+# Without this the restart would re-request every stock that had already been
+# fetched.  The settled symbols are parked here (one-shot, short-lived).
+_RESUME: dict | None = None
+_resume_lock = threading.Lock()
+
+
+def _stash_resume(key: tuple, results: dict, no_data: dict, partial: dict) -> None:
+    global _RESUME
+    with _resume_lock:
+        _RESUME = {
+            "key": key, "at": time.monotonic(),
+            "results": dict(results), "no_data": dict(no_data), "partial": dict(partial),
+        }
+
+
+def _take_resume(key: tuple) -> dict | None:
+    global _RESUME
+    with _resume_lock:
+        r, _RESUME = _RESUME, None
+    if not r or r["key"] != key or time.monotonic() - r["at"] > SCAN_RESUME_MAX_AGE_SECONDS:
+        return None
+    return r
 
 
 # ── Whole universe ───────────────────────────────────────────────────────────
@@ -347,6 +473,23 @@ def _fetch_universe(
         except Exception:
             pass
 
+    resume_key = (range_to, bool(live))
+    preloaded: set[str] = set()
+    resume = _take_resume(resume_key)
+    if resume:
+        unique_set = set(unique)
+        for sym, df in resume["results"].items():
+            if sym in unique_set:
+                results[sym] = df
+                preloaded.add(sym)
+        for sym, out in resume["no_data"].items():
+            if sym in unique_set:
+                no_data[sym] = out
+                preloaded.add(sym)
+        partial.update(resume["partial"])
+        if verbose and preloaded:
+            print(f"  ♻️   Resuming: {len(preloaded)} symbols kept from the interrupted fetch")
+
     def _settle(sym: str, out: _Outcome) -> str:
         if out.status == "ok":
             results[sym] = out.df
@@ -360,45 +503,53 @@ def _fetch_universe(
         failed[sym] = out
         return "failed"
 
-    # ── pass 1 ────────────────────────────────────────────────────────────────
-    for i, sym in enumerate(unique, 1):
-        check_cancel(cancel)
-        out = _fetch_symbol(fyers, sym, range_to, partial, cancel, live)
-        bucket = _settle(sym, out)
-        if progress:
-            try:
-                progress.fetch_result(sym, bucket == "valid", outcome=bucket)
-            except Exception:
-                pass
-        if verbose and i % 50 == 0:
-            print(f"  📥  {i}/{total} processed — {len(results)} valid, {len(failed)} to retry")
-
-    # ── retry waves (transient Fyers failures only) ──────────────────────────
-    interval = _PERSISTENT_RETRY_INTERVAL
-    while failed and waves < _PERSISTENT_MAX_RETRIES:
-        waves += 1
-        pending = list(failed)
-        if progress:
-            try:
-                progress.begin_retry(len(pending), waves)
-            except Exception:
-                pass
-        if verbose:
-            print(f"  🔁  Retry wave {waves}: {len(pending)} symbols (pause {interval:.0f}s)")
-        sleep_cancellable(interval, cancel)
-        last_wave = waves == _PERSISTENT_MAX_RETRIES
-        for sym in pending:
+    try:
+        # ── pass 1 ────────────────────────────────────────────────────────────
+        for i, sym in enumerate(unique, 1):
             check_cancel(cancel)
-            out = _fetch_symbol(fyers, sym, range_to, partial, cancel, live, allow_w2_only=last_wave)
-            bucket = _settle(sym, out)
-            if bucket == "valid":
-                recovered += 1
+            if sym in preloaded:
+                bucket = "valid" if sym in results else "no_data"
+            else:
+                out = _fetch_symbol(fyers, sym, range_to, partial, cancel, live)
+                bucket = _settle(sym, out)
             if progress:
                 try:
-                    progress.retry_result(sym, bucket)
+                    progress.fetch_result(sym, bucket == "valid", outcome=bucket)
                 except Exception:
                     pass
-        interval *= _PERSISTENT_BACKOFF_MULTIPLIER
+            if verbose and i % 50 == 0:
+                print(f"  📥  {i}/{total} processed — {len(results)} valid, {len(failed)} to retry")
+
+        # ── retry waves (transient Fyers failures only) ──────────────────────
+        interval = _PERSISTENT_RETRY_INTERVAL
+        while failed and waves < _PERSISTENT_MAX_RETRIES:
+            waves += 1
+            pending = list(failed)
+            if progress:
+                try:
+                    progress.begin_retry(len(pending), waves)
+                except Exception:
+                    pass
+            if verbose:
+                print(f"  🔁  Retry wave {waves}: {len(pending)} symbols (pause {interval:.0f}s)")
+            sleep_cancellable(interval, cancel)
+            last_wave = waves == _PERSISTENT_MAX_RETRIES
+            for sym in pending:
+                check_cancel(cancel)
+                out = _fetch_symbol(fyers, sym, range_to, partial, cancel, live, allow_w2_only=last_wave)
+                bucket = _settle(sym, out)
+                if bucket == "valid":
+                    recovered += 1
+                if progress:
+                    try:
+                        progress.retry_result(sym, bucket)
+                    except Exception:
+                        pass
+            interval = min(interval * _PERSISTENT_BACKOFF_MULTIPLIER, _PERSISTENT_MAX_PAUSE)
+    except FyersAuthError:
+        # Keep what is already fetched for the automatic reconnect-and-restart.
+        _stash_resume(resume_key, results, no_data, partial)
+        raise
 
     # ── ledger ────────────────────────────────────────────────────────────────
     for sym, df in results.items():
@@ -427,10 +578,10 @@ def _fetch_universe(
     for sym, out in failed.items():
         ledger[_bare(sym)] = {
             "status": "fetch_failed", "code": out.code,
-            "category": "Not analysed — Fyers did not return data",
+            "category": CATEGORY_FETCH_FAILED,
             "detail": (f"Fyers kept failing after {1 + waves} attempts "
                        f"(code {out.code}: {out.message or 'no message'}). Fyers-side failure; "
-                       "press Rescan to try again."),
+                       "only these stocks are requested again the next time this scan is run."),
         }
 
     SYMBOL_CACHE.save()
@@ -459,7 +610,7 @@ def _fetch_universe(
 def fetch_candles_bulk_persistent(fyers, symbols, interval="1D", verbose=False, progress=None, cancel=None):
     """Live scan fetch (range_to = today).  Returns (results, report)."""
     return _fetch_universe(
-        fyers, symbols, datetime.date.today(),
+        fyers, symbols, _today_ist(),
         live=True, progress=progress, cancel=cancel, verbose=verbose,
     )
 
@@ -480,7 +631,7 @@ def fetch_candles_bulk_at_date(
 
 def fetch_candles(fyers: fyersModel.FyersModel, symbol: str) -> pd.DataFrame | None:
     """Single-symbol convenience wrapper (used by ad-hoc tools)."""
-    out = _fetch_symbol(fyers, symbol, datetime.date.today(), {}, None, live=False)
+    out = _fetch_symbol(fyers, symbol, _today_ist(), {}, None, live=False)
     return out.df if out.status == "ok" else None
 
 

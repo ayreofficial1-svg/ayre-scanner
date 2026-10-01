@@ -15,6 +15,7 @@ from config.settings import (
     WEEKLY_RISING_FILTER,
 )
 from data.candles import (
+    CATEGORY_FETCH_FAILED,
     _MIN_BARS,
     _NUM_WINDOWS,
     _WINDOW_DAYS,
@@ -132,6 +133,8 @@ def _universe_audit(
         "built_at": meta.get("built_at"),
         "list_saved_at": meta.get("list_saved_at"),
         "nifty50_source": meta.get("nifty50_source"),
+        "sources_tried": meta.get("sources_tried"),
+        "fyers_master": meta.get("fyers_master"),
         "error": meta.get("error"),
     }
 
@@ -602,6 +605,32 @@ def backtest_universe_gap(
     return missing, removed
 
 
+def backtest_retry_symbols(
+    payload: dict[str, Any],
+    symbols: list[str],
+) -> list[str]:
+    """
+    Fyers symbols of the current universe whose saved row is "Fyers did not
+    return data" — i.e. Fyers kept failing for them at the time (rate limit,
+    5xx, network).  That is a transient condition, not a property of the stock,
+    so the saved result must not keep it forever.
+
+    Deliberately NOT included: "no price data" / "stale" / "not enough history"
+    rows (genuine, repeatable Fyers answers for a past date) and internal
+    evaluation errors.  Retrying only the stocks returned here costs a handful
+    of Fyers requests instead of a full rescan.
+    """
+    rows = payload.get("backtest_results") or []
+    failed_tags = {
+        r.get("symbol") for r in rows
+        if isinstance(r, dict) and r.get("symbol")
+        and r.get("status") == "no_data" and r.get("category") == CATEGORY_FETCH_FAILED
+    }
+    if not failed_tags:
+        return []
+    return [s for s in dict.fromkeys(symbols) if _tag(s) in failed_tags]
+
+
 def topup_historical_scan(
     fyers,
     symbols: list[str],
@@ -616,9 +645,11 @@ def topup_historical_scan(
     """
     Bring a saved backtest in line with the current universe WITHOUT rescanning it.
 
-    Only the symbols that have no row in the saved payload are fetched from
-    Fyers (typically one or a handful). Every other row is reused untouched.
-    Stocks that have left the Nifty 500 are dropped (only when prune_removed).
+    Only the symbols that have no row in the saved payload — plus the ones whose
+    saved row says Fyers failed to answer (transient, see backtest_retry_symbols)
+    — are fetched from Fyers (typically one or a handful). Every other row is
+    reused untouched. Stocks that have left the Nifty 500 are dropped (only when
+    prune_removed).
 
     Returns a dict shaped like run_historical_scan()'s result so the caller's
     normal payload/saving code works unchanged.
@@ -632,13 +663,16 @@ def topup_historical_scan(
     }
     universe = list(dict.fromkeys(symbols))
     missing, removed = backtest_universe_gap(base_payload, universe)
+    retry = [s for s in backtest_retry_symbols(base_payload, universe) if s not in missing]
+    retried_tags = sorted(_tag(s) for s in retry)
+    missing = missing + retry
     if not prune_removed:
         removed = []
 
     print(
         f"\n🧪  Backtest top-up for {target_date.isoformat()}: "
-        f"{len(missing)} stock(s) to add, {len(removed)} to remove, "
-        f"{len(by_tag) - len(removed)} reused as saved"
+        f"{len(missing) - len(retry)} stock(s) to add, {len(retry)} to retry (Fyers failed last time), "
+        f"{len(removed)} to remove, {len(by_tag) - len(removed) - len(retry)} reused as saved"
     )
 
     sub: dict[str, Any] = {}
@@ -700,7 +734,8 @@ def topup_historical_scan(
     ledger.update(sub_report.get("ledger") or {})
 
     failed_symbols = sorted(
-        {t for t in (base_dbg.get("failed_symbols") or []) if t in uni_tags}
+        {t for t in (base_dbg.get("failed_symbols") or [])
+         if t in uni_tags and t not in added_tags}
         | set(sub_report.get("failed_symbols") or [])
     )
     eval_errors = [e for e in (base_dbg.get("evaluation_errors") or [])
@@ -738,14 +773,15 @@ def topup_historical_scan(
         "stale": sum(1 for v in ledger.values() if v.get("status") == "stale_data"),
         "ledger": ledger,
         "topup": {
-            "added": sorted(added_tags),
+            "added": sorted(t for t in added_tags if t not in retried_tags),
+            "retried": retried_tags,
             "removed": removed,
             "fyers_symbols_requested": len(missing),
         },
         "universe": _universe_audit(universe, by_tag, universe_meta),
     }
     print(
-        f"🧪  Top-up done: added {sorted(added_tags)} | removed {removed} | "
+        f"🧪  Top-up done: added {sorted(added_tags)} | retried {retried_tags} | removed {removed} | "
         f"{len(by_tag)} rows total"
     )
     return {

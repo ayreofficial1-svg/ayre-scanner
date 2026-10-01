@@ -8,8 +8,13 @@ the same futile calls.  It only ever REDUCES Fyers calls.
               if the hint stops working the full suffix list is tried again).
   no_data   — every series (-EQ/-BE/-BZ/-SM/-ST) answered "invalid symbol".
               Only written/read by LIVE scans and expires after
-              SYMBOL_NO_DATA_TTL_DAYS, so a symbol Fyers adds later is never
-              skipped for long.
+              SYMBOL_NO_DATA_TTL_DAYS.  It is NEVER used to skip a symbol: a
+              live scan always re-verifies it with at most two cheap requests,
+              so a transient Fyers "invalid symbol" can never hide a stock.
+  master    — the exact Fyers ticker for each NSE symbol, taken from Fyers'
+              own public symbol master (data/fyers_master.py).  In-memory only,
+              rebuilt every time the universe is built.  Lets the fetcher call
+              the right ticker first instead of probing -EQ/-BE/-BZ/-SM/-ST.
 """
 
 from __future__ import annotations
@@ -35,6 +40,30 @@ class SymbolCache:
         self._dirty = False
         self._resolved: dict[str, dict] = {}
         self._no_data: dict[str, dict] = {}
+        self._master_hint: dict[str, str] = {}     # NSE key -> Fyers ticker (only when it differs from the key)
+        self._master_known: set[str] = set()       # NSE keys the Fyers master lists at all
+
+    # ── Fyers symbol master (in-memory) ─────────────────────────────────────
+    def update_master(self, universe_keys: set[str], hints: dict[str, str], known: set[str]) -> None:
+        """
+        Apply a fresh master mapping for `universe_keys` only.  Keys outside the
+        universe just built keep their previous mapping, so a rejected or partial
+        universe fetch can never wipe the mapping of the list that stays in use.
+        """
+        with self._lock:
+            for k in universe_keys:
+                self._master_hint.pop(k, None)
+                self._master_known.discard(k)
+            self._master_hint.update(hints or {})
+            self._master_known |= set(known or ())
+
+    def master_hint(self, symbol: str) -> str | None:
+        with self._lock:
+            return self._master_hint.get(symbol)
+
+    def master_knows(self, symbol: str) -> bool:
+        with self._lock:
+            return symbol in self._master_known
 
     def _load(self) -> None:
         if self._loaded:

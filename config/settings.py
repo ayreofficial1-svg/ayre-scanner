@@ -286,3 +286,21 @@ SCAN_RESULTS_DIR = "scan_results"
 # A stock whose newest candle is older than this many calendar days before the
 # scan date is treated as stale (suspended / halted), not evaluated on old prices.
 STALE_BAR_MAX_DAYS = 10
+
+
+# ── Fyers request budget & mapping (data/candles.py, data/fyers_master.py) ───
+# Fyers v3 allows 10 requests/second AND 200 requests/minute.  The fetcher keeps
+# a rolling 60-second window below the per-minute cap so a full-universe scan
+# never runs into 429s (every 429 is a wasted request AND a delayed stock).
+FYERS_MAX_REQUESTS_PER_MINUTE = 190
+# Public Fyers symbol master (static CSV on public.fyers.in — NOT an API call,
+# not counted against the request limits).  Used to map NSE symbols to the exact
+# Fyers ticker (series suffix, renamed tickers).  If it cannot be loaded the
+# scanner falls back to the previous -EQ/-BE/-BZ/-SM/-ST probing.
+FYERS_MASTER_ENABLED = True
+FYERS_MASTER_URL = "https://public.fyers.in/sym_details/NSE_CM.csv"
+FYERS_MASTER_FILE = "fyers_nse_cm_master.csv"
+# If a fetch is aborted by a dead Fyers session, the symbols already fetched are
+# kept for this long so the automatic reconnect-and-restart does not re-request
+# them.
+SCAN_RESUME_MAX_AGE_SECONDS = 600
