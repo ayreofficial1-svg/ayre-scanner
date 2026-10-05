@@ -88,6 +88,7 @@ from data.app_signals import (
 from data.app_devices import (
     register_device, unregister_device, device_count,
 )
+from data.app_exits import load_exits, add_exit, delete_exit
 from alerts import push as push_alerts
 from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
 from data.app_insights import load_insights, add_insight, update_insight, delete_insight
@@ -1751,7 +1752,7 @@ def api_signals_add():
         entry = update_signal(str(signal_id), symbol=symbol, rationale=rationale, **fields)
         if entry is None:
             return jsonify({"error": "Signal not found"}), 404
-        _push_signal_if_due(entry, was_visible=was_visible)
+        _push_signal_if_due(entry, was_visible=was_visible, previous=previous)
         return jsonify({"signal": entry})
 
     entry = add_signal(
@@ -1781,31 +1782,145 @@ def api_signals_delete(signal_id: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Consumer app: exit calls (website Signals tab → push to the app's Alerts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/exits", methods=["GET"])
+def api_exits_list():
+    """Website-only. Previously sent exit calls, newest first."""
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    return jsonify({"exits": load_exits()})
+
+
+@app.route("/api/exits", methods=["POST"])
+def api_exits_add():
+    """
+    Website-only. Saves an exit call and pushes it to the phones.
+
+    Body: {"symbol": "RELIANCE", "profit": 120.0, "exit_price": 2850.0}
+    profit is per share in ₹; a negative number is a loss. These three values
+    are the whole exit call.
+
+    Response: {"exit": {...}, "notified": true|false} — notified is False when
+    push isn't configured on the server (the call is still saved).
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    symbol = " ".join(str(payload.get("symbol", "")).split()).upper()
+    if not symbol:
+        return jsonify({"error": "stock is required"}), 400
+
+    try:
+        profit = float(payload.get("profit"))
+        exit_price = float(payload.get("exit_price"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "profit and exit price must be numbers"}), 400
+    if not (math.isfinite(profit) and math.isfinite(exit_price)):
+        return jsonify({"error": "profit and exit price must be numbers"}), 400
+    if exit_price <= 0:
+        return jsonify({"error": "exit price must be greater than zero"}), 400
+
+    entry = add_exit(symbol, profit, exit_price, session.get("username"))
+
+    notified = False
+    try:
+        notified = push_alerts.is_configured()
+        if notified:
+            push_alerts.notify_exit(symbol, profit, exit_price)
+    except Exception as e:      # a push problem must never fail the save
+        notified = False
+        print(f"   ⚠️   Push: could not send exit call — {e}")
+    return jsonify({"exit": entry, "notified": notified}), 201
+
+
+@app.route("/api/exits/<string:exit_id>", methods=["DELETE"])
+def api_exits_delete(exit_id: str):
+    """
+    Website-only. Removes an exit call from the history list. This does not
+    recall the notification that was already sent.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    if not delete_exit(exit_id):
+        return jsonify({"error": "Exit call not found"}), 404
+    return jsonify({"deleted": True, "id": exit_id})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Consumer app: push notifications (FCM)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _push_signal_if_due(entry: dict, was_visible: bool) -> None:
+# The fields whose change makes an already-announced pick worth a second push.
+# Notes, ordering, pinning, images and the like are housekeeping, not a change
+# to the pick itself.
+_SIGNAL_REVISION_FIELDS = ("symbol", "entry_price", "exit_price", "stop_loss")
+
+
+def _signal_was_revised(previous: dict | None, entry: dict) -> bool:
+    """True when the pick's symbol or one of its price levels actually changed."""
+    if not previous:
+        return False
+    for key in _SIGNAL_REVISION_FIELDS:
+        before, after = previous.get(key), entry.get(key)
+        if key == "symbol":
+            if str(before or "").upper() != str(after or "").upper():
+                return True
+            continue
+        if before is None and after is None:
+            continue
+        if before is None or after is None:
+            return True
+        try:
+            if abs(float(before) - float(after)) > 1e-9:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _push_signal_if_due(
+    entry: dict,
+    was_visible: bool,
+    previous: dict | None = None,
+) -> None:
     """
-    Announce an admin-published signal on the users' phones — exactly once.
+    Announce an admin-published signal on the users' phones.
 
     Called after the signal endpoints save a signal. `was_visible` is whether
     the signal was already live *before* this save (always False for a brand
-    new one), which is what separates "just published" from "an admin fixed a
-    typo in a signal that has been live for weeks".
+    new one), which is what separates "just published" from "an admin edited a
+    signal that has been live for weeks". `previous` is the signal as it was
+    before this save (None for a new one).
 
-      • already announced (push_sent_at)      → nothing
-      • live now, and newly so                 → push, then record it
+      • already announced (push_sent_at)      → a separate "revised" push, but
+                                                only if the pick itself changed
+                                                (symbol / entry / exit / stop)
+      • live now, and newly so                 → "new signal" push, recorded so
+                                                it is only ever announced once
       • enabled but scheduled (start_at later) → mark pending; the loop below
                                                  sends it when it goes live
     """
     try:
         signal_id = entry.get("id")
-        if not signal_id or entry.get("push_sent_at"):
+        if not signal_id:
             return
         if not entry.get("enabled", True):
             return
         if not push_alerts.is_configured():
             return      # nothing was sent, so don't record it as sent
+
+        if entry.get("push_sent_at"):
+            if (
+                was_visible
+                and _signal_is_visible(entry)
+                and _signal_was_revised(previous, entry)
+            ):
+                push_alerts.notify_revised_signal(entry)
+            return
+
         if _signal_is_visible(entry):
             if was_visible and not entry.get("push_pending"):
                 return

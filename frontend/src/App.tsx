@@ -9,6 +9,7 @@ import ScanProgress from './components/ScanProgress'
 import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
 import SignalsPanel from './components/SignalsPanel'
+import ExitCallsPanel from './components/ExitCallsPanel'
 import MarketInsightPanel from './components/MarketInsightPanel'
 import LearnPanel from './components/LearnPanel'
 import WeeklyReportPanel from './components/WeeklyReportPanel'
@@ -588,7 +589,12 @@ export default function App() {
           )}
         </header>
 
-        {view === 'signals' && <SignalsPanel />}
+        {view === 'signals' && (
+          <>
+            <SignalsPanel />
+            <ExitCallsPanel />
+          </>
+        )}
         {view === 'insights' && <MarketInsightPanel />}
         {view === 'learn' && <LearnPanel />}
         {view === 'weeklyReport' && <WeeklyReportPanel />}

@@ -20,12 +20,27 @@ Design rules
   • Self-cleaning. Tokens FCM reports as unregistered are removed from the
     device registry so it doesn't accumulate dead installs.
 
+Notification kinds (the app tells them apart by data["type"])
+─────────────────────────────────────────────────────────────
+  signal         notify_new_signal()      a newly published pick → opens Signals
+  signal_update  notify_revised_signal()  an already-announced pick changed
+                                          → opens Signals
+  exit           notify_exit()            exit call (stock, profit, exit price)
+                                          → opens the app's Alerts screen
+
+Wording is plain and short: a 2-3 word heading, the stock, one short line.
+Each kind has a pool of variations; one is picked at random and never the
+same as the previous one. The app keeps a matching pool
+(lib/services/notification_copy.dart) for entries it records itself.
+
 Credentials: see FIREBASE_SERVICE_ACCOUNT_* in config/settings.py.
 """
 
 import os
 import json
 import base64
+import random
+import re
 import threading
 
 from config.settings import (
@@ -201,6 +216,74 @@ def _in_background(fn, *args, **kwargs) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+# ── Wording ──────────────────────────────────────────────────────────────────
+
+_NEW_PICK = [
+    ("New Pick",        "A fresh pick is ready."),
+    ("New Signal",      "Check the Signals tab."),
+    ("Fresh Setup",     "A new setup is available."),
+    ("New Opportunity", "See the Signals tab."),
+    ("Buy Setup",       "A new setup is ready."),
+    ("Fresh Pick",      "Take a look in Signals."),
+    ("Buy Signal",      "Open the Signals tab."),
+]
+
+_REVISED = [
+    ("Signal Updated", "The signal has been updated."),
+    ("Pick Revised",   "The existing pick has changed."),
+    ("Updated Signal", "Check the latest details."),
+    ("Setup Updated",  "The setup has been updated."),
+    ("Pick Updated",   "Open Signals for the change."),
+]
+
+_EXIT_PROFIT = ["Book Profit", "Exit Signal", "Time to Exit", "Sell Signal", "Take Profit"]
+_EXIT_LOSS   = ["Exit Signal", "Time to Exit", "Sell Signal"]   # "Book Profit" would be wrong
+
+_last_pick: dict[str, int] = {}
+_pick_lock = threading.Lock()
+
+
+def _pick(key: str, pool: list):
+    """Random item from pool, never the same one twice in a row for this key."""
+    with _pick_lock:
+        index = random.randrange(len(pool))
+        if len(pool) > 1 and index == _last_pick.get(key):
+            index = (index + 1 + random.randrange(len(pool) - 1)) % len(pool)
+        _last_pick[key] = index
+        return pool[index]
+
+
+def format_rupees(value: float) -> str:
+    """₹2,850 · ₹120.50 · ₹1,23,456 — Indian grouping, decimals only if needed."""
+    paise_total = int(round(abs(float(value)) * 100))
+    rupees, paise = divmod(paise_total, 100)
+    digits = str(rupees)
+    if len(digits) > 3:
+        head, tail = digits[:-3], digits[-3:]
+        digits = re.sub(r"(\d)(?=(\d\d)+$)", r"\1,", head) + "," + tail
+    return f"{'-' if value < 0 else ''}₹{digits}" + (f".{paise:02d}" if paise else "")
+
+
+def build_new_signal_text(symbol: str) -> tuple[str, str]:
+    heading, line = _pick("new", _NEW_PICK)
+    return f"{heading}: {symbol}", line
+
+
+def build_revised_signal_text(symbol: str) -> tuple[str, str]:
+    heading, line = _pick("revised", _REVISED)
+    return f"{heading}: {symbol}", line
+
+
+def build_exit_text(stock: str, profit: float, exit_price: float) -> tuple[str, str]:
+    loss = profit < 0
+    heading = _pick("exit-loss" if loss else "exit", _EXIT_LOSS if loss else _EXIT_PROFIT)
+    label = "Loss" if loss else "Profit"
+    return (
+        f"{heading}: {stock}",
+        f"{label} {format_rupees(abs(profit))} | Exit {format_rupees(exit_price)}",
+    )
+
+
 # ── Public entry points ──────────────────────────────────────────────────────
 
 def notify_new_signal(signal: dict) -> None:
@@ -214,21 +297,83 @@ def notify_new_signal(signal: dict) -> None:
     symbol = str(signal.get("symbol") or "").strip().upper()
     if not symbol:
         return
-    rationale = str(signal.get("rationale") or "").strip()
+    title, body = build_new_signal_text(symbol)
 
-    def _send():
-        send_to_devices(
+    _in_background(
+        lambda: send_to_devices(
             list_devices(topic="signals"),
-            title=f"New scanner pick: {symbol}",
-            body=rationale or "A new pick is on the Signals tab.",
+            title=title,
+            body=body,
             data={
                 "type"     : "signal",
                 "symbol"   : symbol,
                 "signal_id": signal.get("id"),
             },
         )
+    )
 
-    _in_background(_send)
+
+def notify_revised_signal(signal: dict) -> None:
+    """
+    Push a separate "this pick changed" notification for a signal that was
+    already announced. Same audience as notify_new_signal. Fire-and-forget.
+    """
+    if not is_configured():
+        return
+
+    symbol = str(signal.get("symbol") or "").strip().upper()
+    if not symbol:
+        return
+    title, body = build_revised_signal_text(symbol)
+
+    _in_background(
+        lambda: send_to_devices(
+            list_devices(topic="signals"),
+            title=title,
+            body=body,
+            data={
+                "type"     : "signal_update",
+                "symbol"   : symbol,
+                "signal_id": signal.get("id"),
+            },
+        )
+    )
+
+
+def notify_exit(stock_name: str, profit: float, exit_price: float) -> None:
+    """
+    Push an exit call to every registered device. Fire-and-forget.
+
+    Only three values are needed: the stock name, the profit (negative for a
+    loss) and the exit price. The app shows it in its Alerts section and
+    tapping the notification opens that screen.
+    """
+    if not is_configured():
+        return
+
+    stock = " ".join(str(stock_name or "").split()).upper()
+    if not stock:
+        return
+    try:
+        profit = float(profit)
+        exit_price = float(exit_price)
+    except (TypeError, ValueError):
+        return
+    title, body = build_exit_text(stock, profit, exit_price)
+
+    _in_background(
+        lambda: send_to_devices(
+            list_devices(),
+            title=title,
+            body=body,
+            data={
+                "type"      : "exit",
+                "symbol"    : stock,
+                "profit"    : profit,
+                "exit_price": exit_price,
+            },
+        )
+    )
 
 
 def broadcast(title: str, body: str, data: dict | None = None) -> None:

@@ -65,6 +65,17 @@ export interface SignalPick {
   stop_loss?: number | null
 }
 
+// One row of /api/exits — an exit call sent to the app's Alerts section.
+// Only three values matter: stock, profit (negative = loss) and exit price.
+export interface ExitCall {
+  id: string
+  symbol: string
+  profit: number
+  exit_price: number
+  created_at: string
+  added_by?: string | null
+}
+
 // One row of /api/stocks — the admin panel's search-as-you-type source.
 export interface StockDirectoryEntry {
   symbol: string

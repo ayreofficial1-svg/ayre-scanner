@@ -45,6 +45,8 @@ market_close.json.tmp
 app_signals.json
 app_learn.json
 app_insights.json
+app_exits.json
+app_exits.json.tmp
 app_sentiment.json
 
 # Push notifications: registered phones' FCM tokens (personal device data)
