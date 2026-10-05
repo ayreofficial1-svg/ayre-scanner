@@ -305,3 +305,10 @@ FYERS_MASTER_FILE = "fyers_nse_cm_master.csv"
 # kept for this long so the automatic reconnect-and-restart does not re-request
 # them.
 SCAN_RESUME_MAX_AGE_SECONDS = 600
+
+
+# ── Mobile-app user authentication (Firebase ID tokens) ──────────────────────
+# When true, app-readable endpoints also require the Firebase account's email
+# to be verified (403 "email_not_verified" otherwise). Off by default; enforcing
+# it later is just this setting plus the app's existing verify prompt.
+APP_REQUIRE_VERIFIED_EMAIL = os.getenv("APP_REQUIRE_VERIFIED_EMAIL", "false").strip().lower() in {"1", "true", "yes", "on"}

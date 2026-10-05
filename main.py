@@ -106,6 +106,9 @@ from utils.scan_control import ScanCancelled, FyersAuthError
 from data.breadth import load_full_breadth, save_full_breadth
 from data.market_close import load_close_snapshot, save_close_snapshot
 from config.settings import APP_ASSET_DIR
+from config.settings import APP_REQUIRE_VERIFIED_EMAIL
+from auth import app_auth
+from flask import g
 from config.settings import RA_REGISTRATION_NUMBER, DISCLAIMER
 
 try:
@@ -142,7 +145,7 @@ else:
     @app.after_request
     def _add_cors_headers(response):
         response.headers["Access-Control-Allow-Origin"]  = "*"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
         return response
 
@@ -547,6 +550,7 @@ def _is_admin() -> bool:
     session may write — matching today's single-tier auth. Set it to restrict
     writes to specific usernames once the website has its own admin login.
     """
+    # Cookie session ONLY. Mobile-app (Firebase token) users must never count as admin.
     if not _is_authenticated():
         return False
     admins = _configured_admin_users()
@@ -571,21 +575,81 @@ def _auth_required() -> bool:
     }
 
 
+# Endpoints a signed-in APP user (Firebase Bearer token) may call — read-only
+# GETs the Flutter app uses. Matched against the Flask route rule. Anything not
+# listed here is admin-only (cookie session) by default.
+_APP_READABLE_RULES = {
+    "/api/market",
+    "/api/market/gainers",
+    "/api/market/losers",
+    "/api/market/most-active",
+    "/api/market/<string:market_key>/constituents",
+    "/api/sentiment",
+    "/api/signals",
+    "/api/learn",
+    "/api/learn/<string:article_id>",
+    "/api/insights",
+    "/api/insights/volatility",
+    "/api/insights/momentum",
+    "/api/insights/volume-surge",
+    "/api/breadth/full",
+    "/api/weekly-report",
+    "/api/compliance",
+    "/api/app/me",
+}
+
+
+def _auth_error(status: int, code: str, message: str):
+    return jsonify({"authenticated": False, "error": message, "code": code}), status
+
+
 @app.before_request
 def _require_authentication():
+    g.app_user = None
     if request.method == "OPTIONS":
         return None
     if request.path in _AUTH_PUBLIC_API:
         return None
     if request.path.startswith("/assets/") or _is_static_asset(request.path.lstrip("/")):
         return None
-    if not _auth_required() and request.method in ("GET", "HEAD"):
+    if not request.path.startswith("/api/"):
         return None
+
+    # Website admin: cookie session (unchanged).
     if _is_authenticated():
         return None
-    if request.path.startswith("/api/"):
-        return jsonify({"authenticated": False, "error": "Authentication required"}), 401
-    return None
+
+    # App user: Firebase ID token.
+    token = app_auth.extract_bearer(request.headers.get("Authorization"))
+    if token:
+        user, err = app_auth.verify_bearer(token)
+        if err:
+            return _auth_error(*err)
+        rule = request.url_rule.rule if request.url_rule else ""
+        if request.method not in ("GET", "HEAD") or rule not in _APP_READABLE_RULES:
+            return _auth_error(403, "forbidden", "Not allowed")
+        if APP_REQUIRE_VERIFIED_EMAIL and not user["email_verified"]:
+            return _auth_error(403, "email_not_verified", "Verify your email to continue")
+        g.app_user = user
+        return None
+
+    if not _auth_required() and request.method in ("GET", "HEAD"):
+        return None
+    return _auth_error(401, "app_auth_required", "Authentication required")
+
+
+@app.route("/api/app/me")
+def api_app_me():
+    """Identity of the signed-in app user, from the verified token. Stores nothing."""
+    user = getattr(g, "app_user", None)
+    if not user:
+        return _auth_error(401, "app_auth_required", "Authentication required")
+    return jsonify({
+        "uid": user["uid"],
+        "email": user["email"],
+        "email_verified": user["email_verified"],
+        "name": user["name"],
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────

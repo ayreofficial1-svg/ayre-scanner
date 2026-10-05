@@ -119,3 +119,12 @@ after initial setup, provided the FYERS credentials and TOTP secret remain valid
 ## Legal
 This tool is intended for use by SEBI-registered Research Analysts (RA).
 All signals are logged to `logs/signal_log.json` for 5-year SEBI record-keeping compliance.
+
+
+## Authentication: two separate identity systems
+
+- **Website admin** — Flask cookie session via `/api/auth/login`, credentials from Railway env (`SCANNER_USERS`, `SCANNER_ADMIN_USERS`). Unchanged. Only this system can satisfy `_is_admin()`.
+- **Mobile app users** — Firebase Authentication (email/password). The app sends `Authorization: Bearer <Firebase ID token>`; the backend verifies it with the Firebase Admin SDK (`auth/app_auth.py`, shared credentials in `auth/firebase_app.py`, same `FIREBASE_SERVICE_ACCOUNT_*` variables as push).
+  - App tokens may only call the read-only GETs listed in `_APP_READABLE_RULES` in `main.py` (plus `GET /api/app/me`). Everything else is admin-only by default (403 `forbidden`).
+  - Error codes: 401 `app_auth_required` / `app_token_invalid` / `app_token_expired`; 403 `forbidden` / `email_not_verified`; 503 `auth_unavailable` (Firebase not configured — fails closed).
+  - `APP_REQUIRE_VERIFIED_EMAIL=true` (default off) requires a verified email for app endpoints.

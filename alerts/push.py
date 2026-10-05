@@ -50,6 +50,7 @@ from config.settings import (
     PUSH_ANDROID_CHANNEL_ID,
 )
 from data.app_devices import list_devices, remove_tokens
+from auth import firebase_app as _firebase_app
 
 try:
     import firebase_admin
@@ -93,49 +94,17 @@ def _record(title: str, data: dict | None, result: dict, errors: dict, note: str
 
 def _credential_source() -> str | None:
     """Which credential the environment provides, or None."""
-    if FIREBASE_SERVICE_ACCOUNT_JSON.strip():
-        return "json"
-    if FIREBASE_SERVICE_ACCOUNT_BASE64.strip():
-        return "base64"
-    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if path and os.path.isfile(path):
-        return "file"
-    return None
-
-
-def _build_credential():
-    source = _credential_source()
-    if source == "json":
-        return _fb_credentials.Certificate(json.loads(FIREBASE_SERVICE_ACCOUNT_JSON))
-    if source == "base64":
-        decoded = base64.b64decode(FIREBASE_SERVICE_ACCOUNT_BASE64).decode("utf-8")
-        return _fb_credentials.Certificate(json.loads(decoded))
-    if source == "file":
-        return _fb_credentials.Certificate(os.environ["GOOGLE_APPLICATION_CREDENTIALS"].strip())
-    return None
+    return _firebase_app.credential_source()
 
 
 def _ensure_app():
-    """Initialise the Firebase app once. Returns it, or None if push is unavailable."""
+    """Shared Firebase app (auth/firebase_app.py). None if push is unavailable."""
     global _app, _init_failed
     if _app is not None:
         return _app
-    if _init_failed or not _SDK_AVAILABLE:
-        return None
-    with _init_lock:
-        if _app is not None:
-            return _app
-        try:
-            cred = _build_credential()
-            if cred is None:
-                _init_failed = True
-                return None
-            _app = firebase_admin.initialize_app(cred, name=_APP_NAME)
-            print("   🔔  Push: Firebase initialised")
-        except Exception as e:
-            _init_failed = True
-            print(f"   ⚠️   Push: Firebase init failed — {e}")
-            return None
+    _app = _firebase_app.get_app()
+    if _app is None:
+        _init_failed = True
     return _app
 
 
