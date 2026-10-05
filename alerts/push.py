@@ -39,6 +39,7 @@ Credentials: see FIREBASE_SERVICE_ACCOUNT_* in config/settings.py.
 import os
 import json
 import base64
+import datetime
 import random
 import re
 import threading
@@ -64,6 +65,28 @@ _BATCH_SIZE = 500            # FCM's per-multicast ceiling
 _init_lock = threading.Lock()
 _app = None
 _init_failed = False
+
+# What the most recent send did, kept so GET /api/push/status can show it —
+# otherwise a push that FCM rejects (or that had nobody to go to) leaves no
+# trace on the website. In memory only; resets on restart.
+_last_send: dict | None = None
+
+
+def last_send() -> dict | None:
+    """Outcome of the most recent send attempt, or None if none since startup."""
+    return dict(_last_send) if _last_send else None
+
+
+def _record(title: str, data: dict | None, result: dict, errors: dict, note: str = "") -> None:
+    global _last_send
+    _last_send = {
+        "at"     : datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "title"  : title,
+        "type"   : (data or {}).get("type"),
+        **result,
+        "errors" : errors,
+        "note"   : note,
+    }
 
 
 # ── Credentials / initialisation ─────────────────────────────────────────────
@@ -142,12 +165,18 @@ def send_to_devices(
     Returns {"attempted", "sent", "failed", "pruned"}.
     """
     result = {"attempted": 0, "sent": 0, "failed": 0, "pruned": 0}
+    errors: dict[str, int] = {}
     tokens = [d["token"] for d in devices if d.get("token")]
     if not tokens:
+        _record(title, data, result, errors,
+                "No registered device to send to (none registered, or none opted in to this kind of alert).")
+        print("   ⚠️   Push: nothing sent — no registered device for this alert")
         return result
 
     app = _ensure_app()
     if app is None:
+        _record(title, data, result, errors, "Firebase is not initialised on the server.")
+        print("   ⚠️   Push: nothing sent — Firebase is not initialised")
         return result
 
     payload = {str(k): str(v) for k, v in (data or {}).items() if v is not None}
@@ -179,7 +208,9 @@ def send_to_devices(
         except Exception as e:
             result["attempted"] += len(batch)
             result["failed"] += len(batch)
-            print(f"   ⚠️   Push: batch send failed — {e}")
+            reason = f"{type(e).__name__}: {e}"[:200]
+            errors[reason] = errors.get(reason, 0) + len(batch)
+            print(f"   ⚠️   Push: batch send failed — {reason}")
             continue
 
         result["attempted"] += len(batch)
@@ -188,6 +219,8 @@ def send_to_devices(
                 result["sent"] += 1
                 continue
             result["failed"] += 1
+            reason = f"{type(item.exception).__name__}: {item.exception}"[:200]
+            errors[reason] = errors.get(reason, 0) + 1
             # Only prune on an explicit "this token is dead" answer. Other
             # errors (quota, transient outage, a payload problem) say nothing
             # about the token, and deleting on those would wipe live devices.
@@ -200,6 +233,9 @@ def send_to_devices(
     if dead:
         result["pruned"] = remove_tokens(dead)
 
+    _record(title, data, result, errors)
+    for reason, count in errors.items():
+        print(f"   ⚠️   Push: {count} failed — {reason}")
     print(
         f"   🔔  Push: {result['sent']}/{result['attempted']} delivered"
         + (f", {result['pruned']} stale token(s) removed" if result["pruned"] else "")

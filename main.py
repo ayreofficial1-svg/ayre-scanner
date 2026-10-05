@@ -1982,12 +1982,15 @@ def api_devices_unregister():
 
 @app.route("/api/push/status", methods=["GET"])
 def api_push_status():
-    """Website-only. Is push set up, and how many phones would receive it?"""
+    """Website-only. Is push set up, how many phones would receive it, and what did the last push do?"""
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
     return jsonify({
         "configured": push_alerts.is_configured(),
         "devices"   : device_count(),
+        # What the last push actually did (sent / failed / why). Null until a
+        # push has been attempted since the server last started.
+        "last_send" : push_alerts.last_send(),
     })
 
 
