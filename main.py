@@ -484,13 +484,49 @@ _AUTH_PUBLIC_API = {
     "/api/auth/login",
     "/api/auth/logout",
     "/api/auth/session",
-    # Push-token registration. Public by necessity: the mobile app currently
-    # runs without its login gate, so a device has no session to present.
-    # All it can do is add/remove its own FCM token (validated and capped in
-    # data/app_devices.py); it cannot read anything or trigger a send.
+}
+
+# Endpoints that need a valid APP token (Firebase Bearer) and nothing else —
+# even a website-admin cookie does not satisfy them, so a record is always tied
+# to a real app account (uid).
+_APP_ACCOUNT_RULES = {
     "/api/devices/register",
     "/api/devices/unregister",
 }
+
+# Website login throttle (in-memory, per client IP). Website only.
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_LOGIN_MAX_FAILURES = 10
+_login_failures: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _client_ip() -> str:
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() if fwd else "") or (request.remote_addr or "unknown")
+
+
+def _login_throttled(ip: str) -> bool:
+    now = time.time()
+    with _login_lock:
+        recent = [t for t in _login_failures.get(ip, []) if now - t < _LOGIN_WINDOW_SECONDS]
+        if recent:
+            _login_failures[ip] = recent
+        else:
+            _login_failures.pop(ip, None)
+        return len(recent) >= _LOGIN_MAX_FAILURES
+
+
+def _login_record_failure(ip: str) -> None:
+    with _login_lock:
+        if len(_login_failures) > 5000:
+            _login_failures.clear()
+        _login_failures.setdefault(ip, []).append(time.time())
+
+
+def _login_clear(ip: str) -> None:
+    with _login_lock:
+        _login_failures.pop(ip, None)
 
 
 def _auth_credentials_configured() -> bool:
@@ -545,12 +581,12 @@ def _configured_admin_users() -> set[str]:
 
 def _is_admin() -> bool:
     """
-    Gate for the website-only write endpoints (POST/DELETE on /api/signals,
-    POST on /api/learn). If SCANNER_ADMIN_USERS is unset, any authenticated
-    session may write — matching today's single-tier auth. Set it to restrict
-    writes to specific usernames once the website has its own admin login.
+    Gate for admin-only endpoints (writes, rescans, backtests, ?all=1 views).
+    Satisfied ONLY by the website's Flask cookie session. Mobile-app (Firebase
+    token) users never count as admin: this function must not read g.app_user
+    or the Authorization header. If SCANNER_ADMIN_USERS is unset, any website
+    login is an admin — set it in Railway to restrict this to named users.
     """
-    # Cookie session ONLY. Mobile-app (Firebase token) users must never count as admin.
     if not _is_authenticated():
         return False
     admins = _configured_admin_users()
@@ -561,18 +597,6 @@ def _is_admin() -> bool:
 
 def _is_static_asset(path: str) -> bool:
     return bool(path and os.path.isfile(os.path.join(STATIC_DIR, path)))
-
-
-def _auth_required() -> bool:
-    """
-    Sign-in is required by default. Set AUTH_REQUIRED=false (also 0/no/off) to
-    let anonymous clients make read-only (GET/HEAD) API calls — used while the
-    mobile app runs without its login gate. Writes and scan-triggering POSTs
-    still require a session regardless of this flag.
-    """
-    return os.environ.get("AUTH_REQUIRED", "true").strip().lower() not in {
-        "0", "false", "no", "off",
-    }
 
 
 # Endpoints a signed-in APP user (Firebase Bearer token) may call — read-only
@@ -615,6 +639,21 @@ def _require_authentication():
     if not request.path.startswith("/api/"):
         return None
 
+    rule = request.url_rule.rule if request.url_rule else ""
+
+    # App-account endpoints: a valid app token is mandatory.
+    if rule in _APP_ACCOUNT_RULES:
+        token = app_auth.extract_bearer(request.headers.get("Authorization"))
+        if not token:
+            return _auth_error(401, "app_auth_required", "Authentication required")
+        user, err = app_auth.verify_bearer(token)
+        if err:
+            return _auth_error(*err)
+        if APP_REQUIRE_VERIFIED_EMAIL and not user["email_verified"]:
+            return _auth_error(403, "email_not_verified", "Verify your email to continue")
+        g.app_user = user
+        return None
+
     # Website admin: cookie session (unchanged).
     if _is_authenticated():
         return None
@@ -625,7 +664,6 @@ def _require_authentication():
         user, err = app_auth.verify_bearer(token)
         if err:
             return _auth_error(*err)
-        rule = request.url_rule.rule if request.url_rule else ""
         if request.method not in ("GET", "HEAD") or rule not in _APP_READABLE_RULES:
             return _auth_error(403, "forbidden", "Not allowed")
         if APP_REQUIRE_VERIFIED_EMAIL and not user["email_verified"]:
@@ -633,8 +671,7 @@ def _require_authentication():
         g.app_user = user
         return None
 
-    if not _auth_required() and request.method in ("GET", "HEAD"):
-        return None
+    # Anonymous: always refused (no bypass).
     return _auth_error(401, "app_auth_required", "Authentication required")
 
 
@@ -676,6 +713,13 @@ def api_auth_login():
             "error": "Login is not configured. Set SCANNER_USERS in Railway.",
         }), 503
 
+    ip = _client_ip()
+    if _login_throttled(ip):
+        return jsonify({
+            "authenticated": False,
+            "error": "Too many failed attempts. Try again in a few minutes.",
+        }), 429
+
     payload = request.get_json(silent=True) or {}
     username = str(payload.get("username", ""))
     password = str(payload.get("password", ""))
@@ -686,8 +730,10 @@ def api_auth_login():
         session.clear()
         session["authenticated"] = True
         session["username"] = username
+        _login_clear(ip)
         return jsonify({"authenticated": True})
 
+    _login_record_failure(ip)
     return jsonify({"authenticated": False, "error": "Invalid username or password"}), 401
 
 
@@ -2030,6 +2076,7 @@ def api_devices_register():
         platform=str(payload.get("platform") or ""),
         signals=payload.get("signals", True) is not False,
         app_version=payload.get("app_version"),
+        uid=g.app_user["uid"],
     )
     if entry is None:
         return jsonify({"error": "Invalid token, or device limit reached"}), 400
@@ -2040,7 +2087,7 @@ def api_devices_register():
 def api_devices_unregister():
     """Called when the user switches push off in Settings."""
     payload = request.get_json(silent=True) or {}
-    unregister_device(str(payload.get("token") or ""))
+    unregister_device(str(payload.get("token") or ""), uid=g.app_user["uid"])
     return jsonify({"registered": False})
 
 

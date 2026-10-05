@@ -15,6 +15,7 @@ Entry schema (JSON object keyed by token)
       "platform"     : "android" | "ios" | "unknown",
       "signals"      : true,             # wants "new signal" pushes
       "app_version"  : "2.0.0" | null,
+      "uid"          : "<Firebase uid of the signed-in account> | null",
       "registered_at": "<ISO timestamp>",
       "last_seen_at" : "<ISO timestamp>"
     }
@@ -78,6 +79,7 @@ def register_device(
     platform: str = "unknown",
     signals: bool = True,
     app_version: str | None = None,
+    uid: str | None = None,
 ) -> dict | None:
     """
     Create or update a device. Returns the stored entry, or None when the
@@ -102,6 +104,7 @@ def register_device(
             "platform"     : platform,
             "signals"      : bool(signals),
             "app_version"  : (str(app_version).strip()[:32] or None) if app_version else None,
+            "uid"          : (str(uid)[:128] if uid else None),
             "registered_at": (existing or {}).get("registered_at", now),
             "last_seen_at" : now,
         }
@@ -110,12 +113,19 @@ def register_device(
         return entry
 
 
-def unregister_device(token: str) -> bool:
-    """Remove a device. Returns True if it was registered."""
+def unregister_device(token: str, uid: str | None = None) -> bool:
+    """
+    Remove a device. Returns True if it was registered. When [uid] is given,
+    a token recorded for a different account is left alone (an entry with no
+    recorded uid, from before sign-in existed, may be removed by anyone).
+    """
     token = (token or "").strip()
     with _lock:
         devices = _load()
         if token not in devices:
+            return False
+        owner = devices[token].get("uid")
+        if uid and owner and owner != uid:
             return False
         del devices[token]
         _save(devices)

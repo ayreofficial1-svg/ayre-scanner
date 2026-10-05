@@ -128,3 +128,7 @@ All signals are logged to `logs/signal_log.json` for 5-year SEBI record-keeping 
   - App tokens may only call the read-only GETs listed in `_APP_READABLE_RULES` in `main.py` (plus `GET /api/app/me`). Everything else is admin-only by default (403 `forbidden`).
   - Error codes: 401 `app_auth_required` / `app_token_invalid` / `app_token_expired`; 403 `forbidden` / `email_not_verified`; 503 `auth_unavailable` (Firebase not configured — fails closed).
   - `APP_REQUIRE_VERIFIED_EMAIL=true` (default off) requires a verified email for app endpoints.
+  - **No anonymous access.** `AUTH_REQUIRED` is retired and ignored (delete it from Railway). Anonymous `/api/*` calls always get 401 `app_auth_required`.
+  - `POST /api/devices/register` and `/unregister` need a valid app token (an admin cookie does not satisfy them). The Firebase `uid` is stored on the device record; an account cannot unregister another account's token.
+  - Website login (`/api/auth/login`) is throttled: 10 failed attempts per IP per 15 min → 429 (in-memory, resets on restart).
+  - Railway variables to set: `SCANNER_ADMIN_USERS` (your admin username), `FLASK_SECRET_KEY` (64+ random chars), `SESSION_COOKIE_SECURE=true`.
