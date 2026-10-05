@@ -36,6 +36,7 @@ import json
 import uuid
 import datetime
 from config.settings import APP_SIGNALS_FILE
+from config.persistence import atomic_write_json
 
 
 def _now_iso() -> str:
@@ -133,8 +134,7 @@ def load_signals(active_only: bool = False) -> list[dict]:
 
 
 def save_signals(signals: list[dict]) -> None:
-    with open(APP_SIGNALS_FILE, "w", encoding="utf-8") as f:
-        json.dump(signals, f, indent=2)
+    atomic_write_json(APP_SIGNALS_FILE, signals)
 
 
 def add_signal(symbol: str, rationale: str, added_by: str, **fields) -> dict:

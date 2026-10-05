@@ -4,6 +4,7 @@ import os
 import uuid
 
 from config.settings import APP_INSIGHTS_FILE
+from config.persistence import atomic_write_json
 
 
 def _now_iso() -> str:
@@ -76,8 +77,7 @@ def load_insights(visible_only: bool = False) -> list[dict]:
 
 
 def save_insights(insights: list[dict]) -> None:
-    with open(APP_INSIGHTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(insights, f, indent=2)
+    atomic_write_json(APP_INSIGHTS_FILE, insights)
 
 
 def add_insight(title: str, body: str, **fields) -> dict:

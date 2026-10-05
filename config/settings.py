@@ -20,6 +20,8 @@ Conditions implemented:
 import os
 from dotenv import load_dotenv
 
+from config.persistence import resolve as _persist
+
 # ── Load .env file ─────────────────────────────────────────────────────────────
 load_dotenv()
 
@@ -147,17 +149,25 @@ MIN_BARS = 60   # conservative floor; newly listed stocks with < 60 bars skipped
 # ── Watchlist TTL ✅ ───────────────────────────────────────────────────────────
 WATCHLIST_TTL_DAYS = 5
 
+# ── Persistent storage (Phase O) ───────────────────────────────────────────────
+# The small files wrapped in _persist(...) below (watchlist, alert log, admin
+# content, exit calls, push-device list) live on the Railway Volume when
+# PERSISTENT_DATA_DIR (or Railway's own RAILWAY_VOLUME_MOUNT_PATH) is set;
+# otherwise they stay at these relative paths exactly as before.
+# Everything else (scan_results/, logs/, caches, tokens, uploads) stays on the
+# normal disk. See config/persistence.py.
+
 # ── Alert deduplication ✅ ─────────────────────────────────────────────────────
-WATCHLIST_FILE = "watchlist.json"
-ALERT_LOG_FILE = "alert_log.json"
+WATCHLIST_FILE = _persist("watchlist.json")
+ALERT_LOG_FILE = _persist("alert_log.json")
 SIGNAL_LOG_DIR = "logs"
 
 # ── Consumer app: admin-curated signals, learn content, insights ─────────────
-APP_SIGNALS_FILE       = "app_signals.json"
-APP_LEARN_FILE         = "app_learn.json"
-APP_INSIGHTS_FILE      = "app_insights.json"
-APP_WEEKLY_REPORT_FILE = "app_weekly_report.json"
-APP_EXITS_FILE         = "app_exits.json"   # exit calls sent from the Signals tab
+APP_SIGNALS_FILE       = _persist("app_signals.json")
+APP_LEARN_FILE         = _persist("app_learn.json")
+APP_INSIGHTS_FILE      = _persist("app_insights.json")
+APP_WEEKLY_REPORT_FILE = _persist("app_weekly_report.json")
+APP_EXITS_FILE         = _persist("app_exits.json")   # exit calls sent from the Signals tab
 APP_ASSET_DIR          = "static/uploads"
 # Sentiment is computed automatically from Nifty-500 breadth as of Phase 2
 # (see data/app_sentiment.py) — APP_SENTIMENT_FILE/APP_SENTIMENT_DEFAULT (the
@@ -252,7 +262,7 @@ MARKET_CLOSE_FILE = "market_close.json"
 # ── Push notifications (Firebase Cloud Messaging) ✅ ───────────────────────────
 # Device registry for the mobile app. Same single-JSON-file pattern as the
 # other app_*.json stores.
-APP_DEVICES_FILE = "app_devices.json"
+APP_DEVICES_FILE = _persist("app_devices.json")
 
 # Credentials for the Firebase Admin SDK. Provide ONE of these in the
 # environment (Railway → Variables):

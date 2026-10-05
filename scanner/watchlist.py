@@ -47,6 +47,7 @@ import os
 import json
 import datetime
 from config.settings import WATCHLIST_FILE, ALERT_LOG_FILE, WATCHLIST_TTL_DAYS
+from config.persistence import atomic_write_json
 
 # Fixed UTC+5:30 offset — no pytz/zoneinfo dependency.
 # Mirrors main.py's _IST: ensures watchlist/alert-log dates and the
@@ -68,8 +69,7 @@ def load_watchlist() -> dict:
 
 
 def save_watchlist(watchlist: dict) -> None:
-    with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(watchlist, f, indent=2)
+    atomic_write_json(WATCHLIST_FILE, watchlist)
 
 
 # ── Watchlist operations ──────────────────────────────────────────────────────
@@ -140,8 +140,7 @@ def load_alert_log() -> dict:
 
 
 def save_alert_log(log: dict) -> None:
-    with open(ALERT_LOG_FILE, "w", encoding="utf-8") as f:
-        json.dump(log, f, indent=2)
+    atomic_write_json(ALERT_LOG_FILE, log)
 
 
 def clean_alert_log(log: dict) -> dict:

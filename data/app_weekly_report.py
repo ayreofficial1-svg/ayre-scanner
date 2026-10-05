@@ -87,6 +87,7 @@ import json
 import uuid
 import datetime
 from config.settings import APP_WEEKLY_REPORT_FILE
+from config.persistence import atomic_write_json
 
 # The only two outcome spellings accepted anywhere in this feature.
 VALID_OUTCOMES = {"target", "stop_loss"}
@@ -215,8 +216,7 @@ def get_report(report_id: str, enabled_only: bool = False) -> dict | None:
 
 
 def save_reports(reports: list[dict]) -> None:
-    with open(APP_WEEKLY_REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(reports, f, indent=2)
+    atomic_write_json(APP_WEEKLY_REPORT_FILE, reports)
 
 
 def add_report(week_start: str, week_end: str, stocks: list[dict], **fields) -> dict:

@@ -36,6 +36,7 @@ import json
 import uuid
 import datetime
 from config.settings import APP_LEARN_FILE
+from config.persistence import atomic_write_json
 
 
 def _now_iso() -> str:
@@ -108,8 +109,7 @@ def get_article(article_id: str, published_only: bool = False) -> dict | None:
 
 
 def save_articles(articles: list[dict]) -> None:
-    with open(APP_LEARN_FILE, "w", encoding="utf-8") as f:
-        json.dump(articles, f, indent=2)
+    atomic_write_json(APP_LEARN_FILE, articles)
 
 
 def _normalize_article(entry: dict) -> dict:

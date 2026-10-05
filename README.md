@@ -132,3 +132,12 @@ All signals are logged to `logs/signal_log.json` for 5-year SEBI record-keeping 
   - `POST /api/devices/register` and `/unregister` need a valid app token (an admin cookie does not satisfy them). The Firebase `uid` is stored on the device record; an account cannot unregister another account's token.
   - Website login (`/api/auth/login`) is throttled: 10 failed attempts per IP per 15 min → 429 (in-memory, resets on restart).
   - Railway variables to set: `SCANNER_ADMIN_USERS` (your admin username), `FLASK_SECRET_KEY` (64+ random chars), `SESSION_COOKIE_SECURE=true`.
+
+## Persistent storage (optional Railway Volume)
+
+Only these small files can live on a Railway Volume: `app_signals.json`, `app_learn.json`, `app_insights.json`, `app_weekly_report.json`, `app_exits.json`, `app_devices.json`, `watchlist.json`, `alert_log.json`.
+
+- Directory is taken from `PERSISTENT_DATA_DIR`, else Railway's automatic `RAILWAY_VOLUME_MOUNT_PATH`. With neither set, files stay at their old relative paths (unchanged behaviour). If the directory is not writable, the backend logs a warning and falls back to local disk.
+- First start on an empty volume: existing local copies of those files are copied in once (never overwriting what is already on the volume).
+- Everything else — `scan_results/`, `logs/`, `backtest_state.json`, caches, `.fyers_token`, `static/uploads/` — stays on the normal disk.
+- Code: `config/persistence.py`; paths wired in `config/settings.py`.
