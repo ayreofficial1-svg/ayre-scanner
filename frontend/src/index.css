@@ -1414,6 +1414,44 @@ tbody tr {
   border: 1px solid var(--green, #2ea043);
 }
 
+.tag-sent,
+.tag-changed {
+  font-family: var(--mono); font-size: 0.62rem;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 0.2rem 0.5rem; border-radius: 4px;
+}
+.tag-sent {
+  color: var(--text-muted);
+  border: 1px solid var(--border-hover);
+}
+.tag-changed {
+  color: var(--red);
+  border: 1px solid var(--red);
+}
+
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 1rem;
+}
+.modal-card {
+  width: 100%; max-width: 440px;
+  background: var(--bg, #111); color: var(--text-main);
+  border: 1px solid var(--border-hover); border-radius: 8px;
+  padding: 1.25rem;
+  display: flex; flex-direction: column; gap: 0.9rem;
+}
+.modal-text {
+  margin: 0; font-family: var(--mono); font-size: 0.78rem;
+  color: var(--text-muted);
+}
+.check-row {
+  display: flex; align-items: flex-start; gap: 0.6rem;
+  font-family: var(--mono); font-size: 0.8rem; cursor: pointer;
+}
+.check-row input { margin-top: 0.15rem; }
+
 .warn-bar {
   padding: 0.75rem 1rem; margin-bottom: 1rem;
   border: 1px solid var(--border-hover); border-left: 3px solid var(--red);

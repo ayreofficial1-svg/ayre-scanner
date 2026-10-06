@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import type { ExitCall } from '../types'
 import { inr } from '../utils'
 import StockPicker from './StockPicker'
+import { postGuarded } from '../pushApi'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ExitCallsPanel
@@ -76,17 +77,12 @@ export default function ExitCallsPanel() {
 
     setSubmitting(true)
     try {
-      const res  = await fetch('/api/exits', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, profit, exit_price }),
-      })
-      const data = await res.json().catch(() => ({})) as { error?: string; notified?: boolean }
-      if (!res.ok) throw new Error(data.error || 'Failed to send exit call')
+      const { ok, data } = await postGuarded('/api/exits', { symbol, profit, exit_price })
+      if (!ok) throw new Error(data.error || 'Failed to send exit call')
       setForm(emptyForm())
       setNotice(
         data.notified
-          ? `Exit call for ${symbol} sent to the app.`
+          ? `Exit call for ${symbol} sent to ${data.audience ?? 'the'} phone(s).`
           : `Exit call for ${symbol} saved, but push isn't set up on the server, so no phone was notified.`,
       )
       await load()

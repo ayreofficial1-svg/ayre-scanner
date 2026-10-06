@@ -54,6 +54,8 @@ export interface SignalPick {
   published?: boolean
   published_at?: string | null
   published_by?: string | null
+  // Manual-notification summary (admin view only).
+  push_state?: SignalPushState
   featured?: boolean
   pinned?: boolean
   display_order?: number
@@ -67,6 +69,38 @@ export interface SignalPick {
   entry_price?: number | null
   exit_price?: number | null
   stop_loss?: number | null
+}
+
+export interface SignalPushState {
+  announced: boolean
+  announced_at?: string | null
+  update_sent_at?: string | null
+  changed_since: boolean
+}
+
+// One row of the manual-send audit log (/api/push/status → audit).
+export interface PushAuditEntry {
+  id: string
+  at: string
+  admin?: string
+  type: string
+  key?: string
+  status: 'sending' | 'done' | 'refused'
+  audience?: number
+  attempted?: number
+  sent?: number
+  failed?: number
+  reason?: string
+}
+
+export interface PushStatus {
+  configured: boolean
+  devices: number
+  signal_devices: number
+  sends_today: number
+  daily_cap: number
+  duplicate_window_sec: number
+  audit: PushAuditEntry[]
 }
 
 // One row of /api/exits — an exit call sent to the app's Alerts section.

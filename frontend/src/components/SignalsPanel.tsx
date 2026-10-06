@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import type { SignalPick } from '../types'
 import { inr, pct } from '../utils'
 import StockPicker from './StockPicker'
+import { postGuarded, usePushStatus, whenIST } from '../pushApi'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SignalsPanel
@@ -15,7 +16,9 @@ import StockPicker from './StockPicker'
 //
 // Publication gate: a saved signal is a DRAFT (admin only). Only the
 // "Publish to app" button makes it visible to app users. Saving, editing and
-// publishing never send a notification.
+// publishing never send a notification. Phone notifications are separate,
+// manual buttons ("Send notification" / "Send update notification"), each
+// confirmed and logged by the server.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function emptyForm() {
@@ -46,6 +49,9 @@ export default function SignalsPanel() {
   const [submitting, setSubmitting] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [publishTarget, setPublishTarget] = useState<SignalPick | null>(null)
+  const [alsoNotify, setAlsoNotify] = useState(false)
+  const { status: pushStatus, refresh: refreshPush } = usePushStatus()
 
   const load = async () => {
     setLoading(true)
@@ -137,32 +143,97 @@ export default function SignalsPanel() {
     }
   }
 
-  const setPublication = async (signal: SignalPick, publish: boolean) => {
+  const unpublish = async (signal: SignalPick) => {
     if (busyId) return
-    const message = publish
-      ? `Publish ${signal.symbol} to the app?\n\nUsers of the app will see this signal. No notification is sent.`
-      : `Unpublish ${signal.symbol}?\n\nIt will be hidden from the app and kept here as a Draft. No notification is sent.`
-    if (!window.confirm(message)) return
+    if (!window.confirm(
+      `Unpublish ${signal.symbol}?\n\nIt will be hidden from the app and kept here as a Draft. No notification is sent.`,
+    )) return
 
     setBusyId(signal.id)
     setError(null)
     setNotice(null)
     try {
-      const res  = await fetch(`/api/signals/${signal.id}/${publish ? 'publish' : 'unpublish'}`, {
+      const res  = await fetch(`/api/signals/${signal.id}/unpublish`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confirm: true }),
       })
       const data = await res.json().catch(() => ({})) as { error?: string }
       if (!res.ok) throw new Error(data.error || 'Failed to change publication')
-      setNotice(
-        publish
-          ? `${signal.symbol} is now published. App users see it the next time they open Signals. No notification was sent.`
-          : `${signal.symbol} is unpublished and hidden from the app.`,
-      )
+      setNotice(`${signal.symbol} is unpublished and hidden from the app.`)
       await load()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to change publication')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const openPublish = (signal: SignalPick) => {
+    if (busyId) return
+    setAlsoNotify(false)          // always off by default
+    setPublishTarget(signal)
+    refreshPush()
+  }
+
+  const confirmPublish = async () => {
+    const signal = publishTarget
+    if (!signal || busyId) return
+    setPublishTarget(null)
+    setBusyId(signal.id)
+    setError(null)
+    setNotice(null)
+    try {
+      const res  = await fetch(`/api/signals/${signal.id}/publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true, notify: alsoNotify }),
+      })
+      const data = await res.json().catch(() => ({})) as {
+        error?: string
+        notification?: { ok: boolean; audience?: number; error?: string }
+      }
+      if (!res.ok) throw new Error(data.error || 'Failed to change publication')
+      const n = data.notification
+      setNotice(
+        !alsoNotify
+          ? `${signal.symbol} is now published. App users see it the next time they open Signals. No notification was sent.`
+          : n?.ok
+            ? `${signal.symbol} is published and a notification was sent to ${n.audience} phone(s).`
+            : `${signal.symbol} is published, but the notification was NOT sent: ${n?.error ?? 'unknown reason'}`,
+      )
+      await load()
+      refreshPush()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to change publication')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const sendNotification = async (signal: SignalPick, kind: 'new' | 'update', again = false) => {
+    if (busyId) return
+    const audience = pushStatus?.signal_devices
+    const who = audience != null ? `${audience} phone(s) with signal alerts on` : 'phones with signal alerts on'
+    const message = kind === 'new'
+      ? `Send a "new signal" notification for ${signal.symbol} to ${who}?\n\nA notification cannot be recalled.`
+      : `Send a "signal updated" notification for ${signal.symbol} to ${who}?\n\nA notification cannot be recalled.`
+    if (!window.confirm(again ? `${message}\n\nThis was already sent once. Send it again?` : message)) return
+
+    setBusyId(signal.id)
+    setError(null)
+    setNotice(null)
+    try {
+      const { ok, data } = await postGuarded(
+        `/api/signals/${signal.id}/notify`,
+        { kind, ...(again ? { send_again: true } : {}) },
+      )
+      if (!ok) throw new Error(data.error || 'Failed to send notification')
+      setNotice(`Notification for ${signal.symbol} sent to ${data.audience} phone(s).`)
+      await load()
+      refreshPush()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to send notification')
     } finally {
       setBusyId(null)
     }
@@ -266,6 +337,14 @@ export default function SignalsPanel() {
                 {state === 'Hidden' && <span className="tag-disabled">Hidden</span>}
                 {state === 'Draft' && <span className="tag-draft">Draft</span>}
                 {state === 'Published' && <span className="tag-published">Published</span>}
+                {state === 'Published' && s.push_state?.announced && (
+                  <span className="tag-sent">
+                    Notified{s.push_state.announced_at ? ` ${whenIST(s.push_state.announced_at)}` : ''}
+                  </span>
+                )}
+                {state === 'Published' && s.push_state?.changed_since && (
+                  <span className="tag-changed">Changed since last notification</span>
+                )}
               </div>
               <div className="signal-row-prices">
                 <PriceTag label="Entry" value={s.entry_price} />
@@ -274,13 +353,33 @@ export default function SignalsPanel() {
               </div>
               <div className="signal-row-actions">
                 {state === 'Draft' && (
-                  <button className="rescan-btn" disabled={busy} onClick={() => setPublication(s, true)}>
+                  <button className="rescan-btn" disabled={busy} onClick={() => openPublish(s)}>
                     {busy ? 'Working...' : 'Publish to app'}
                   </button>
                 )}
                 {state === 'Published' && (
-                  <button className="theme-btn" disabled={busy} onClick={() => setPublication(s, false)}>
+                  <button className="theme-btn" disabled={busy} onClick={() => unpublish(s)}>
                     {busy ? 'Working...' : 'Unpublish'}
+                  </button>
+                )}
+                {state === 'Published' && !s.push_state?.announced && (
+                  <button className="rescan-btn" disabled={busy} onClick={() => sendNotification(s, 'new')}>
+                    Send notification
+                  </button>
+                )}
+                {state === 'Published' && s.push_state?.announced && (
+                  <button
+                    className="theme-btn"
+                    disabled={busy}
+                    title="Already announced. Sends it again after an extra confirmation."
+                    onClick={() => sendNotification(s, 'new', true)}
+                  >
+                    Send again
+                  </button>
+                )}
+                {state === 'Published' && s.push_state?.announced && s.push_state.changed_since && (
+                  <button className="rescan-btn" disabled={busy} onClick={() => sendNotification(s, 'update')}>
+                    Send update notification
                   </button>
                 )}
                 <button className="theme-btn" onClick={() => editSignal(s)}>Edit</button>
@@ -289,6 +388,41 @@ export default function SignalsPanel() {
             </div>
             )
           })}
+        </div>
+      )}
+
+      {publishTarget && (
+        <div className="modal-backdrop" onClick={() => setPublishTarget(null)}>
+          <div className="modal-card" onClick={e => e.stopPropagation()}>
+            <div className="section-title">Publish {publishTarget.symbol}?</div>
+            <p className="modal-text">
+              Users of the app will see this signal the next time they open Signals.
+            </p>
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={alsoNotify}
+                onChange={e => setAlsoNotify(e.target.checked)}
+              />
+              <span>
+                Also send a phone notification
+                {pushStatus
+                  ? ` (${pushStatus.signal_devices} phone${pushStatus.signal_devices === 1 ? '' : 's'} with signal alerts on)`
+                  : ''}
+              </span>
+            </label>
+            <p className="modal-text">
+              {alsoNotify
+                ? 'A notification cannot be recalled once sent.'
+                : 'No notification will be sent.'}
+            </p>
+            <div className="clean-form-actions">
+              <button className="theme-btn" onClick={() => setPublishTarget(null)}>Cancel</button>
+              <button className="rescan-btn" onClick={confirmPublish}>
+                {alsoNotify ? 'Publish and notify' : 'Publish'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

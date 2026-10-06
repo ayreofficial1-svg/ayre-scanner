@@ -401,3 +401,12 @@ SWEEP_LOG_EVERY              = int(_env_float("SWEEP_LOG_EVERY", 10))
 # Shadow-mode comparison log (bounded; newest kept).
 SWEEP_SHADOW_LOG_FILE        = _persist("sweep_shadow_log.json")
 SWEEP_SHADOW_LOG_MAX         = int(_env_float("SWEEP_SHADOW_LOG_MAX", 300))
+
+
+# ── Manual notification centre (Phase 4) ─────────────────────────────────────
+# Every notification is sent by an explicit admin button. These only tune the
+# safety guard; there is deliberately NO setting that turns automatic pushing on.
+PUSH_DAILY_MAX_MANUAL         = max(1, int(_env_float("PUSH_DAILY_MAX_MANUAL", 30)))
+PUSH_DUPLICATE_WINDOW_SECONDS = max(0.0, _env_float("PUSH_DUPLICATE_WINDOW_SECONDS", 60.0))
+PUSH_AUDIT_LOG_FILE           = _persist(_env_str("PUSH_AUDIT_LOG_FILE", "push_audit_log.json"))
+PUSH_AUDIT_LOG_MAX            = max(50, int(_env_float("PUSH_AUDIT_LOG_MAX", 500)))

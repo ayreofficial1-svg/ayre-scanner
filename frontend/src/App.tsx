@@ -10,6 +10,7 @@ import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
 import SignalsPanel from './components/SignalsPanel'
 import ExitCallsPanel from './components/ExitCallsPanel'
+import NotificationsPanel from './components/NotificationsPanel'
 import MarketInsightPanel from './components/MarketInsightPanel'
 import LearnPanel from './components/LearnPanel'
 import WeeklyReportPanel from './components/WeeklyReportPanel'
@@ -593,6 +594,7 @@ export default function App() {
           <>
             <SignalsPanel />
             <ExitCallsPanel />
+            <NotificationsPanel />
           </>
         )}
         {view === 'insights' && <MarketInsightPanel />}

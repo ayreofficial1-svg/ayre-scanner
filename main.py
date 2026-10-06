@@ -85,8 +85,11 @@ from scanner.historical import (
 from utils.logger import get_log_summary
 from utils.scan_progress import LIVE_PROGRESS, BACKTEST_PROGRESS
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk, fetch_full_market_breadth
+from alerts import manual_push
+from data import push_audit
 from data.app_signals import (
     load_signals, add_signal, update_signal, delete_signal, set_published,
+    set_notification_state,
 )
 from data.app_devices import (
     register_device, unregister_device, device_count,
@@ -1809,7 +1812,30 @@ def api_stocks_directory():
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Publication bookkeeping that only the admin website sees.
-_SIGNAL_ADMIN_ONLY_FIELDS = ("published", "published_at", "published_by", "unpublished_at")
+_SIGNAL_ADMIN_ONLY_FIELDS = (
+    "published", "published_at", "published_by", "unpublished_at",
+    # Phase 4: manual-notification bookkeeping, admin website only.
+    "notified_at", "notified_levels", "update_notified_at",
+)
+
+
+def _signal_push_state(signal: dict) -> dict:
+    """
+    Admin-only summary of manual notifications for one signal:
+    whether it was announced, when, and whether its levels changed since.
+    Legacy signals announced by the old automatic push (push_sent_at) count
+    as announced; their levels at that time are unknown, so they never show
+    "changed".
+    """
+    announced_at = signal.get("notified_at") or signal.get("push_sent_at")
+    levels = signal.get("notified_levels")
+    changed = bool(announced_at and levels and _signal_was_revised(levels, signal))
+    return {
+        "announced"        : bool(announced_at),
+        "announced_at"     : announced_at,
+        "update_sent_at"   : signal.get("update_notified_at"),
+        "changed_since"    : changed,
+    }
 
 
 @app.route("/api/signals", methods=["GET"])
@@ -1859,9 +1885,11 @@ def api_signals_list():
             "last_price": q.get("last_price"),
             "change_pct": q.get("change_pct"),
         }
-        if not include_hidden:
-            # Publication bookkeeping is admin-only; the app feed keeps its
-            # original shape.
+        if include_hidden:
+            item["push_state"] = _signal_push_state(s)
+        else:
+            # Publication / notification bookkeeping is admin-only; the app
+            # feed keeps its original shape.
             for key in _SIGNAL_ADMIN_ONLY_FIELDS:
                 item.pop(key, None)
         enriched.append(item)
@@ -1960,12 +1988,100 @@ def _set_signal_publication(signal_id: str, publish: bool):
     entry = set_published(signal_id, publish, session.get("username"))
     if entry is None:
         return jsonify({"error": "Signal not found"}), 404
+
+    notification = None
+    if publish and payload.get("notify") is True:
+        # Optional, explicit "also send a phone notification" tick box.
+        # Publishing has already succeeded; a refused notification never undoes it.
+        notification = _manual_signal_notification(entry, "new", payload)
+
     print(
         f"   📣  Signal {entry.get('symbol')} ({signal_id}) "
         f"{'PUBLISHED to the app' if publish else 'UNPUBLISHED (hidden from the app)'} "
-        f"by {session.get('username')} — no notification sent"
+        f"by {session.get('username')} — "
+        f"{'notification requested' if notification else 'no notification sent'}"
     )
-    return jsonify({"signal": entry, "changed": True})
+    body = {"signal": entry, "changed": True}
+    if notification is not None:
+        body["notification"] = notification
+    return jsonify(body)
+
+
+def _manual_signal_notification(signal: dict, kind: str, payload: dict) -> dict:
+    """
+    Send the "new signal" (kind="new") or "update" (kind="update") notification
+    for a Published signal through the shared manual-send guard.
+    Returns {"ok": True, "audience": N} or {"ok": False, "error", "code"}.
+    Only called from admin endpoints.
+    """
+    admin = session.get("username")
+    if not push_is_live_signal(signal):
+        return {"ok": False, "code": "not_published",
+                "error": "Only a Published, visible signal can be announced."}
+    try:
+        send = manual_push.send_new_signal if kind == "new" else manual_push.send_revised_signal
+        result = send(signal, admin, payload.get("confirm") is True,
+                      send_again=payload.get("send_again") is True)
+    except manual_push.SendRefused as refused:
+        return {"ok": False, "code": refused.code, "error": refused.message,
+                "status": refused.status}
+    set_notification_state(signal["id"], kind)
+    return {"ok": True, "audience": result["audience"], "kind": kind}
+
+
+def push_is_live_signal(signal: dict) -> bool:
+    from data.app_signals import is_live
+    return is_live(signal)
+
+
+@app.route("/api/signals/<string:signal_id>/notify", methods=["POST"])
+def api_signals_notify(signal_id: str):
+    """
+    Website-only. Manually send a phone notification for a Published signal.
+
+    Body: {"confirm": true, "kind": "new" | "update", "send_again": false}
+      new    — "new signal" notification (once; "send_again" repeats it)
+      update — "signal updated" notification, only if the symbol or price
+               levels changed since the last notification (or "send_again")
+    A Draft, unpublished or deactivated signal can never be announced.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    kind = str(payload.get("kind") or "new").lower()
+    if kind not in ("new", "update"):
+        return jsonify({"error": "kind must be \"new\" or \"update\""}), 400
+    if payload.get("confirm") is not True:
+        return jsonify({"error": "Confirmation required", "code": "confirm_required"}), 400
+
+    signal = next((s for s in load_signals() if s.get("id") == signal_id), None)
+    if signal is None:
+        return jsonify({"error": "Signal not found"}), 404
+
+    state = _signal_push_state(signal)
+    again = payload.get("send_again") is True
+    if kind == "new" and state["announced"] and not again:
+        return jsonify({
+            "error": "This signal was already announced. Confirm \"send again\" to repeat it.",
+            "code": "already_sent",
+        }), 409
+    if kind == "update":
+        if not state["announced"] and not again:
+            return jsonify({
+                "error": "Send the \"new signal\" notification first.",
+                "code": "not_announced",
+            }), 409
+        if not state["changed_since"] and not again:
+            return jsonify({
+                "error": "Nothing changed since the last notification.",
+                "code": "no_change",
+            }), 409
+
+    result = _manual_signal_notification(signal, kind, payload)
+    if not result["ok"]:
+        return jsonify({"error": result["error"], "code": result["code"]}), result.get("status", 409)
+    return jsonify({"sent": True, "audience": result["audience"], "kind": kind}), 202
 
 
 @app.route("/api/signals/<string:signal_id>/publish", methods=["POST"])
@@ -1995,9 +2111,11 @@ def api_exits_list():
 @app.route("/api/exits", methods=["POST"])
 def api_exits_add():
     """
-    Website-only. Saves an exit call and pushes it to the phones.
+    Website-only. Saves an exit call and pushes it to the phones (manual send,
+    through the shared guard in alerts/manual_push.py).
 
-    Body: {"symbol": "RELIANCE", "profit": 120.0, "exit_price": 2850.0}
+    Body: {"symbol": "RELIANCE", "profit": 120.0, "exit_price": 2850.0,
+           "confirm": true, "send_again": false}
     profit is per share in ₹; a negative number is a loss. These three values
     are the whole exit call.
 
@@ -2022,17 +2140,27 @@ def api_exits_add():
     if exit_price <= 0:
         return jsonify({"error": "exit price must be greater than zero"}), 400
 
-    entry = add_exit(symbol, profit, exit_price, session.get("username"))
-
+    # Manual send through the shared guard. If push is configured the guard
+    # runs BEFORE anything is saved, so a refused (duplicate / capped / unconfirmed)
+    # exit call leaves no record. If push is not configured the call is still
+    # saved, exactly as before, and no phone is notified.
+    admin = session.get("username")
     notified = False
-    try:
-        notified = push_alerts.is_configured()
-        if notified:
-            push_alerts.notify_exit(symbol, profit, exit_price)
-    except Exception as e:      # a push problem must never fail the save
-        notified = False
-        print(f"   ⚠️   Push: could not send exit call — {e}")
-    return jsonify({"exit": entry, "notified": notified}), 201
+    audience = 0
+    if push_alerts.is_configured():
+        try:
+            sent = manual_push.send_exit(
+                symbol, profit, exit_price, admin,
+                payload.get("confirm") is True,
+                send_again=payload.get("send_again") is True,
+            )
+            notified, audience = True, sent["audience"]
+        except manual_push.SendRefused as refused:
+            return jsonify({"error": refused.message, "code": refused.code}), refused.status
+        except Exception as e:
+            print(f"   ⚠️   Push: could not send exit call — {e}")
+    entry = add_exit(symbol, profit, exit_price, admin)
+    return jsonify({"exit": entry, "notified": notified, "audience": audience}), 201
 
 
 @app.route("/api/exits/<string:exit_id>", methods=["DELETE"])
@@ -2117,15 +2245,21 @@ def api_devices_unregister():
 
 @app.route("/api/push/status", methods=["GET"])
 def api_push_status():
-    """Website-only. Is push set up, how many phones would receive it, and what did the last push do?"""
+    """Website-only. Is push set up, how many phones, today's sends vs the cap, recent audit entries."""
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
+    from config.settings import PUSH_DAILY_MAX_MANUAL, PUSH_DUPLICATE_WINDOW_SECONDS
     return jsonify({
         "configured": push_alerts.is_configured(),
         "devices"   : device_count(),
+        "signal_devices": len(push_alerts.list_devices(topic="signals")),
         # What the last push actually did (sent / failed / why). Null until a
         # push has been attempted since the server last started.
         "last_send" : push_alerts.last_send(),
+        "sends_today"         : push_audit.sends_today(),
+        "daily_cap"           : PUSH_DAILY_MAX_MANUAL,
+        "duplicate_window_sec": int(PUSH_DUPLICATE_WINDOW_SECONDS),
+        "audit"               : push_audit.recent(30),
     })
 
 
@@ -2134,7 +2268,7 @@ def api_push_send():
     """
     Website-only. Send a custom notification to every registered phone — also
     the quickest way to test the whole chain end to end.
-    Body: {"title": "...", "body": "..."}
+    Body: {"title": "...", "body": "...", "confirm": true, "send_again": false}
     """
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
@@ -2150,8 +2284,15 @@ def api_push_send():
     if not title or not body:
         return jsonify({"error": "title and body are required"}), 400
 
-    push_alerts.broadcast(title, body)
-    return jsonify({"queued": True, "devices": device_count()}), 202
+    try:
+        result = manual_push.send_custom(
+            title, body, session.get("username"),
+            payload.get("confirm") is True,
+            send_again=payload.get("send_again") is True,
+        )
+    except manual_push.SendRefused as refused:
+        return jsonify({"error": refused.message, "code": refused.code}), refused.status
+    return jsonify({"queued": True, "devices": result["audience"]}), 202
 
 
 # ─────────────────────────────────────────────────────────────────────────────

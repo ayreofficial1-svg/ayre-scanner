@@ -273,6 +273,37 @@ def set_published(signal_id: str, published: bool, by: str | None = None) -> dic
     return None
 
 
+def set_notification_state(signal_id: str, kind: str) -> None:
+    """
+    Record that a MANUAL notification went out for this signal.
+
+      kind == "new"    -> notified_at (+ the price levels at that moment)
+      kind == "update" -> update_notified_at (+ refreshed levels)
+
+    The stored levels let the website show "changed since last notification".
+    Bookkeeping only: does not touch updated_at or the publication state.
+    """
+    signals = load_signals()
+    for idx, signal in enumerate(signals):
+        if signal.get("id") != signal_id:
+            continue
+        updated = dict(signal)
+        now = _now_iso()
+        if kind == "new":
+            updated["notified_at"] = now
+        else:
+            updated["update_notified_at"] = now
+        updated["notified_levels"] = {
+            "symbol": updated.get("symbol"),
+            "entry_price": updated.get("entry_price"),
+            "exit_price": updated.get("exit_price"),
+            "stop_loss": updated.get("stop_loss"),
+        }
+        signals[idx] = _normalize_signal(updated)
+        save_signals(signals)
+        return
+
+
 def set_push_state(
     signal_id: str,
     *,
