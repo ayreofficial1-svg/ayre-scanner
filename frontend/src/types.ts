@@ -50,6 +50,10 @@ export interface SignalPick {
   added_by?: string | null
   active?: boolean
   enabled?: boolean
+  // Publication state (admin view only). Missing = legacy record = Published.
+  published?: boolean
+  published_at?: string | null
+  published_by?: string | null
   featured?: boolean
   pinned?: boolean
   display_order?: number

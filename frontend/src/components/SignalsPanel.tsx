@@ -12,6 +12,10 @@ import StockPicker from './StockPicker'
 // (rationale, category, image, scheduling window, featured/pinned ordering)
 // is still accepted by the API for backward compatibility but is no longer
 // surfaced here — this tab now only edits the fields it's actually for.
+//
+// Publication gate: a saved signal is a DRAFT (admin only). Only the
+// "Publish to app" button makes it visible to app users. Saving, editing and
+// publishing never send a notification.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function emptyForm() {
@@ -22,7 +26,16 @@ function emptyForm() {
     exit_price: '',
     stop_loss: '',
     enabled: true,
+    live: false,   // editing a signal that app users currently see
   }
+}
+
+type SignalState = 'Draft' | 'Published' | 'Hidden'
+
+// Missing `published` = legacy record = Published.
+function signalState(s: SignalPick): SignalState {
+  if (s.enabled === false || s.active === false) return 'Hidden'
+  return s.published === false ? 'Draft' : 'Published'
 }
 
 export default function SignalsPanel() {
@@ -31,6 +44,8 @@ export default function SignalsPanel() {
   const [error, setError] = useState<string | null>(null)
   const [form, setForm] = useState(emptyForm)
   const [submitting, setSubmitting] = useState(false)
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
 
   const load = async () => {
     setLoading(true)
@@ -59,6 +74,7 @@ export default function SignalsPanel() {
       exit_price: signal.exit_price != null ? String(signal.exit_price) : '',
       stop_loss: signal.stop_loss != null ? String(signal.stop_loss) : '',
       enabled: signal.enabled ?? signal.active ?? true,
+      live: signalState(signal) === 'Published',
     })
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -67,6 +83,7 @@ export default function SignalsPanel() {
     event.preventDefault()
     if (!form.symbol.trim()) return
     setError(null)
+    setNotice(null)
 
     const numOrNull = (v: string) => (v.trim() === '' ? null : Number(v))
     const entry_price = numOrNull(form.entry_price)
@@ -93,6 +110,13 @@ export default function SignalsPanel() {
       })
       const data = await res.json().catch(() => ({})) as { error?: string }
       if (!res.ok) throw new Error(data.error || 'Failed to save signal')
+      setNotice(
+        form.id
+          ? form.live
+            ? 'Saved. This signal is live, so app users now see the change. No notification was sent.'
+            : 'Saved. No notification was sent.'
+          : 'Saved as a Draft. Not visible in the app yet. Use "Publish to app" when ready.',
+      )
       resetForm()
       await load()
     } catch (err) {
@@ -113,6 +137,37 @@ export default function SignalsPanel() {
     }
   }
 
+  const setPublication = async (signal: SignalPick, publish: boolean) => {
+    if (busyId) return
+    const message = publish
+      ? `Publish ${signal.symbol} to the app?\n\nUsers of the app will see this signal. No notification is sent.`
+      : `Unpublish ${signal.symbol}?\n\nIt will be hidden from the app and kept here as a Draft. No notification is sent.`
+    if (!window.confirm(message)) return
+
+    setBusyId(signal.id)
+    setError(null)
+    setNotice(null)
+    try {
+      const res  = await fetch(`/api/signals/${signal.id}/${publish ? 'publish' : 'unpublish'}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: true }),
+      })
+      const data = await res.json().catch(() => ({})) as { error?: string }
+      if (!res.ok) throw new Error(data.error || 'Failed to change publication')
+      setNotice(
+        publish
+          ? `${signal.symbol} is now published. App users see it the next time they open Signals. No notification was sent.`
+          : `${signal.symbol} is unpublished and hidden from the app.`,
+      )
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to change publication')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   return (
     <div className="section">
       <div className="section-header">
@@ -120,6 +175,17 @@ export default function SignalsPanel() {
       </div>
 
       {error && <div className="error-bar">{error}</div>}
+      {notice && <div className="notice-bar">{notice}</div>}
+      {form.id && form.live && (
+        <div className="warn-bar">
+          This signal is live. Saving changes what app users see. No notification is sent.
+        </div>
+      )}
+      {!form.id && (
+        <div className="notice-bar">
+          New signals are saved as Drafts and are not visible in the app until you publish them.
+        </div>
+      )}
 
       <form className="clean-form" onSubmit={addSignal}>
         <div className="clean-form-grid">
@@ -187,14 +253,19 @@ export default function SignalsPanel() {
         <div className="empty-state">No signals yet. Add your first stock above.</div>
       ) : (
         <div className="signal-list">
-          {signals.map(s => (
-            <div className={`signal-row${s.enabled === false ? ' disabled' : ''}`} key={s.id}>
+          {signals.map(s => {
+            const state = signalState(s)
+            const busy = busyId === s.id
+            return (
+            <div className={`signal-row${state === 'Hidden' ? ' disabled' : ''}`} key={s.id}>
               <div className="signal-row-main">
                 <span className="card-sym">{s.symbol}</span>
                 <span className={`card-val ${(s.change_pct ?? 0) >= 0 ? 'g' : 'r'}`}>
                   {inr(s.last_price)} · {pct(s.change_pct)}
                 </span>
-                {s.enabled === false && <span className="tag-disabled">Disabled</span>}
+                {state === 'Hidden' && <span className="tag-disabled">Hidden</span>}
+                {state === 'Draft' && <span className="tag-draft">Draft</span>}
+                {state === 'Published' && <span className="tag-published">Published</span>}
               </div>
               <div className="signal-row-prices">
                 <PriceTag label="Entry" value={s.entry_price} />
@@ -202,11 +273,22 @@ export default function SignalsPanel() {
                 <PriceTag label="Stop loss" value={s.stop_loss} />
               </div>
               <div className="signal-row-actions">
+                {state === 'Draft' && (
+                  <button className="rescan-btn" disabled={busy} onClick={() => setPublication(s, true)}>
+                    {busy ? 'Working...' : 'Publish to app'}
+                  </button>
+                )}
+                {state === 'Published' && (
+                  <button className="theme-btn" disabled={busy} onClick={() => setPublication(s, false)}>
+                    {busy ? 'Working...' : 'Unpublish'}
+                  </button>
+                )}
                 <button className="theme-btn" onClick={() => editSignal(s)}>Edit</button>
                 <button className="theme-btn" onClick={() => removeSignal(s.id)}>Remove</button>
               </div>
             </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </div>

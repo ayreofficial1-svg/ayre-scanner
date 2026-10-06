@@ -26,6 +26,23 @@ DELETE /api/signals/<id> does NOT remove the entry — it flips "active" to
 false so history is preserved. GET /api/signals only shows active=true
 entries to the consumer app.
 
+Publication gate (Phase 3)
+──────────────────────────
+Every signal also has a publication state, separate from "active"/"enabled":
+
+  "published"   : true | false   # false = Draft (admin only)
+  "published_at": ISO timestamp  # set by set_published()
+  "published_by": username       # set by set_published()
+
+  • New signals are created as Drafts (published=False).
+  • LEGACY records that have no "published" field count as Published, so
+    every signal that was live before this phase stays live.
+  • The consumer app feed shows a signal only when it is Published AND
+    visible by the existing rules (enabled + start_at/end_at window).
+  • Only set_published() changes the publication fields. add_signal() and
+    update_signal() silently drop any client-supplied value for them, so a
+    normal save can never publish anything.
+
 Storage is a single JSON file (same pattern as scanner/watchlist.py). Fine
 for a single admin-curated list; swap for a real DB later without changing
 the read/write API used by main.py.
@@ -68,10 +85,32 @@ def _is_visible(entry: dict, now: datetime.datetime | None = None) -> bool:
     return True
 
 
-# Public alias — main.py's push logic needs the same visibility rule the
-# consumer feed uses, so there is exactly one definition of "live".
+# Public alias — there is exactly one definition of "visible" (enabled +
+# schedule window).
 def is_visible(entry: dict, now: datetime.datetime | None = None) -> bool:
     return _is_visible(entry, now)
+
+
+# Fields only set_published() may change. Anything a client sends for them
+# through add_signal()/update_signal() is dropped.
+_PUBLICATION_FIELDS = ("published", "published_at", "published_by", "unpublished_at")
+
+
+def _is_published(entry: dict) -> bool:
+    """Legacy records (no "published" field) count as Published."""
+    value = entry.get("published")
+    if value is None:
+        return True
+    return bool(value)
+
+
+def is_live(entry: dict, now: datetime.datetime | None = None) -> bool:
+    """What the consumer app may show: Published AND visible."""
+    return _is_published(entry) and _is_visible(entry, now)
+
+
+def _without_publication_fields(fields: dict) -> dict:
+    return {k: v for k, v in fields.items() if k not in _PUBLICATION_FIELDS}
 
 
 def _normalize_signal(entry: dict) -> dict:
@@ -82,6 +121,7 @@ def _normalize_signal(entry: dict) -> dict:
         "rationale": str(entry.get("rationale") or "").strip(),
         "active": active,
         "enabled": bool(entry.get("enabled", active)),
+        "published": _is_published(entry),
         "featured": bool(entry.get("featured", False)),
         "pinned": bool(entry.get("pinned", False)),
         "display_order": int(entry.get("display_order") or 0),
@@ -112,10 +152,12 @@ def _sort_key(entry: dict) -> tuple[int, int, str]:
     return (pinned, order, updated)
 
 
-def load_signals(active_only: bool = False) -> list[dict]:
+def load_signals(active_only: bool = False, published_only: bool = False) -> list[dict]:
     """
-    Load all signals. Pass active_only=True to filter out deactivated ones
-    (this is what GET /api/signals uses for the consumer app).
+    Load all signals. Pass active_only=True to filter out deactivated /
+    out-of-window ones, and published_only=True to filter out Drafts and
+    unpublished signals. The consumer app feed (GET /api/signals) uses both;
+    the admin website view uses neither.
     """
     signals: list[dict] = []
     if os.path.exists(APP_SIGNALS_FILE):
@@ -130,6 +172,8 @@ def load_signals(active_only: bool = False) -> list[dict]:
     normalized = [_normalize_signal(s) for s in signals if isinstance(s, dict)]
     if active_only:
         normalized = [s for s in normalized if _is_visible(s)]
+    if published_only:
+        normalized = [s for s in normalized if _is_published(s)]
     return sorted(normalized, key=_sort_key)
 
 
@@ -138,7 +182,12 @@ def save_signals(signals: list[dict]) -> None:
 
 
 def add_signal(symbol: str, rationale: str, added_by: str, **fields) -> dict:
-    """Append a new signal (newest-first) and persist it. Returns the entry."""
+    """
+    Append a new signal (newest-first) and persist it. Returns the entry.
+    The signal is always created as a Draft (published=False); use
+    set_published() to publish it.
+    """
+    fields = _without_publication_fields(fields)
     entry = {
         "id"        : uuid.uuid4().hex,
         "symbol"    : symbol.strip().upper(),
@@ -150,6 +199,7 @@ def add_signal(symbol: str, rationale: str, added_by: str, **fields) -> dict:
         "created_at": _now_iso(),
         "updated_at": _now_iso(),
         **fields,
+        "published": False,
     }
     entry = _normalize_signal(entry)
     signals = load_signals()
@@ -159,6 +209,8 @@ def add_signal(symbol: str, rationale: str, added_by: str, **fields) -> dict:
 
 
 def update_signal(signal_id: str, **fields) -> dict | None:
+    """Edit a signal. Never changes its publication state."""
+    fields = _without_publication_fields(fields)
     signals = load_signals()
     for idx, signal in enumerate(signals):
         if signal.get("id") == signal_id:
@@ -193,6 +245,32 @@ def delete_signal(signal_id: str) -> bool:
         return False
     save_signals(signals)
     return True
+
+
+def set_published(signal_id: str, published: bool, by: str | None = None) -> dict | None:
+    """
+    Publish (Draft -> visible in the app) or unpublish (back to Draft) a
+    signal. Returns the updated signal, or None if the id does not exist.
+
+    Bookkeeping only: does NOT touch updated_at (that would reorder the feed)
+    and sends nothing.
+    """
+    signals = load_signals()
+    for idx, signal in enumerate(signals):
+        if signal.get("id") != signal_id:
+            continue
+        updated = dict(signal)
+        updated["published"] = bool(published)
+        if published:
+            updated["published_at"] = _now_iso()
+            updated["published_by"] = by or "unknown"
+            updated.pop("unpublished_at", None)
+        else:
+            updated["unpublished_at"] = _now_iso()
+        signals[idx] = _normalize_signal(updated)
+        save_signals(signals)
+        return signals[idx]
+    return None
 
 
 def set_push_state(

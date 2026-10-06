@@ -86,8 +86,7 @@ from utils.logger import get_log_summary
 from utils.scan_progress import LIVE_PROGRESS, BACKTEST_PROGRESS
 from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk, fetch_full_market_breadth
 from data.app_signals import (
-    load_signals, add_signal, update_signal, delete_signal,
-    is_visible as _signal_is_visible, set_push_state,
+    load_signals, add_signal, update_signal, delete_signal, set_published,
 )
 from data.app_devices import (
     register_device, unregister_device, device_count,
@@ -1809,6 +1808,10 @@ def api_stocks_directory():
 # Consumer app: Signals tab (admin-curated stock picks)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Publication bookkeeping that only the admin website sees.
+_SIGNAL_ADMIN_ONLY_FIELDS = ("published", "published_at", "published_by", "unpublished_at")
+
+
 @app.route("/api/signals", methods=["GET"])
 def api_signals_list():
     """
@@ -1833,8 +1836,15 @@ def api_signals_list():
     }
     """
     global _fyers
+    # Server-side decision (never a client parameter alone): only a signed-in
+    # admin session may ask for the full list. Everyone else — including the
+    # app — gets Published AND visible signals only. Drafts, unpublished and
+    # deactivated signals never leave the admin view.
     include_hidden = request.args.get("all") == "1" and _is_admin()
-    signals = load_signals(active_only=not include_hidden)
+    signals = load_signals(
+        active_only=not include_hidden,
+        published_only=not include_hidden,
+    )
 
     quotes: dict[str, dict] = {}
     symbols = [s["symbol"] for s in signals if s.get("symbol")]
@@ -1844,11 +1854,17 @@ def api_signals_list():
     enriched = []
     for s in signals:
         q = quotes.get(str(s.get("symbol", "")).upper(), {})
-        enriched.append({
+        item = {
             **s,
             "last_price": q.get("last_price"),
             "change_pct": q.get("change_pct"),
-        })
+        }
+        if not include_hidden:
+            # Publication bookkeeping is admin-only; the app feed keeps its
+            # original shape.
+            for key in _SIGNAL_ADMIN_ONLY_FIELDS:
+                item.pop(key, None)
+        enriched.append(item)
 
     return jsonify({
         "signals"   : enriched,
@@ -1860,6 +1876,11 @@ def api_signals_list():
 def api_signals_add():
     """
     Website-only. Creates or updates an admin-curated stock recommendation.
+
+    A NEW signal is always saved as a Draft (not visible in the app). Saving
+    or editing never publishes anything and never sends a notification; use
+    POST /api/signals/<id>/publish for that. Editing a Published signal
+    changes what app users see immediately.
 
     Body: {"symbol": "RELIANCE", "enabled": true,
            "entry_price": 2850.0, "exit_price": 3050.0, "stop_loss": 2760.0}.
@@ -1884,14 +1905,9 @@ def api_signals_add():
 
     fields = {**_content_fields(payload), **price_fields}
     if signal_id:
-        previous = next(
-            (s for s in load_signals() if s.get("id") == str(signal_id)), None
-        )
-        was_visible = bool(previous and _signal_is_visible(previous))
         entry = update_signal(str(signal_id), symbol=symbol, rationale=rationale, **fields)
         if entry is None:
             return jsonify({"error": "Signal not found"}), 404
-        _push_signal_if_due(entry, was_visible=was_visible, previous=previous)
         return jsonify({"signal": entry})
 
     entry = add_signal(
@@ -1900,7 +1916,6 @@ def api_signals_add():
         added_by=session.get("username"),
         **fields,
     )
-    _push_signal_if_due(entry, was_visible=False)
     return jsonify({"signal": entry}), 201
 
 
@@ -1918,6 +1933,51 @@ def api_signals_delete(signal_id: str):
     if not removed:
         return jsonify({"error": "Signal not found (or already inactive)"}), 404
     return jsonify({"deleted": True, "id": signal_id})
+
+
+def _set_signal_publication(signal_id: str, publish: bool):
+    """
+    Shared body of the publish / unpublish endpoints. Admin cookie session
+    only (app tokens are refused by the global auth gate for non-GET calls and
+    by _is_admin() here). Requires {"confirm": true} so a stray call cannot
+    change what app users see. Sends NO notification.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    payload = request.get_json(silent=True) or {}
+    if payload.get("confirm") is not True:
+        return jsonify({"error": "Confirmation required"}), 400
+
+    current = next((s for s in load_signals() if s.get("id") == signal_id), None)
+    if current is None:
+        return jsonify({"error": "Signal not found"}), 404
+    if publish and not current.get("enabled", True):
+        return jsonify({"error": "Signal is deactivated. Re-enable it before publishing."}), 409
+    if bool(current.get("published")) == publish:
+        return jsonify({"signal": current, "changed": False})
+
+    entry = set_published(signal_id, publish, session.get("username"))
+    if entry is None:
+        return jsonify({"error": "Signal not found"}), 404
+    print(
+        f"   📣  Signal {entry.get('symbol')} ({signal_id}) "
+        f"{'PUBLISHED to the app' if publish else 'UNPUBLISHED (hidden from the app)'} "
+        f"by {session.get('username')} — no notification sent"
+    )
+    return jsonify({"signal": entry, "changed": True})
+
+
+@app.route("/api/signals/<string:signal_id>/publish", methods=["POST"])
+def api_signals_publish(signal_id: str):
+    """Website-only. Draft -> visible in the app. Body: {"confirm": true}. No notification."""
+    return _set_signal_publication(signal_id, True)
+
+
+@app.route("/api/signals/<string:signal_id>/unpublish", methods=["POST"])
+def api_signals_unpublish(signal_id: str):
+    """Website-only. Hide a signal from the app (back to Draft). Body: {"confirm": true}. No notification."""
+    return _set_signal_publication(signal_id, False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1992,9 +2052,14 @@ def api_exits_delete(exit_id: str):
 # Consumer app: push notifications (FCM)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# The fields whose change makes an already-announced pick worth a second push.
-# Notes, ordering, pinning, images and the like are housekeeping, not a change
-# to the pick itself.
+# The fields whose change makes an already-announced pick worth a second
+# notification. Notes, ordering, pinning, images and the like are housekeeping,
+# not a change to the pick itself.
+#
+# NOTE (Phase 3): nothing in the backend sends a signal notification
+# automatically any more. These helpers are kept only so Phase 4's manual
+# "Send update notification" button can tell whether the levels changed since
+# the last notification.
 _SIGNAL_REVISION_FIELDS = ("symbol", "entry_price", "exit_price", "stop_loss")
 
 
@@ -2018,76 +2083,6 @@ def _signal_was_revised(previous: dict | None, entry: dict) -> bool:
         except (TypeError, ValueError):
             return True
     return False
-
-
-def _push_signal_if_due(
-    entry: dict,
-    was_visible: bool,
-    previous: dict | None = None,
-) -> None:
-    """
-    Announce an admin-published signal on the users' phones.
-
-    Called after the signal endpoints save a signal. `was_visible` is whether
-    the signal was already live *before* this save (always False for a brand
-    new one), which is what separates "just published" from "an admin edited a
-    signal that has been live for weeks". `previous` is the signal as it was
-    before this save (None for a new one).
-
-      • already announced (push_sent_at)      → a separate "revised" push, but
-                                                only if the pick itself changed
-                                                (symbol / entry / exit / stop)
-      • live now, and newly so                 → "new signal" push, recorded so
-                                                it is only ever announced once
-      • enabled but scheduled (start_at later) → mark pending; the loop below
-                                                 sends it when it goes live
-    """
-    try:
-        signal_id = entry.get("id")
-        if not signal_id:
-            return
-        if not entry.get("enabled", True):
-            return
-        if not push_alerts.is_configured():
-            return      # nothing was sent, so don't record it as sent
-
-        if entry.get("push_sent_at"):
-            if (
-                was_visible
-                and _signal_is_visible(entry)
-                and _signal_was_revised(previous, entry)
-            ):
-                push_alerts.notify_revised_signal(entry)
-            return
-
-        if _signal_is_visible(entry):
-            if was_visible and not entry.get("push_pending"):
-                return
-            push_alerts.notify_new_signal(entry)
-            set_push_state(signal_id, sent=True)
-        elif entry.get("start_at"):
-            set_push_state(signal_id, pending=True)
-    except Exception as e:      # a push problem must never fail a publish
-        print(f"   ⚠️   Push: could not process signal — {e}")
-
-
-def _push_pending_loop() -> None:
-    """Send the push for scheduled signals once their start_at passes."""
-    while True:
-        time.sleep(60)
-        try:
-            if not push_alerts.is_configured():
-                continue
-            for signal in load_signals():
-                if (
-                    signal.get("push_pending")
-                    and not signal.get("push_sent_at")
-                    and _signal_is_visible(signal)
-                ):
-                    push_alerts.notify_new_signal(signal)
-                    set_push_state(signal["id"], sent=True)
-        except Exception as e:
-            print(f"   ⚠️   Push: pending-signal check failed — {e}")
 
 
 @app.route("/api/devices/register", methods=["POST"])
@@ -4868,7 +4863,6 @@ def main():
         print("🔔  Push notifications enabled (FCM)")
     else:
         print("🔕  Push notifications off — set FIREBASE_SERVICE_ACCOUNT_JSON to enable")
-    threading.Thread(target=_push_pending_loop, daemon=True, name="push-pending-loop").start()
 
     _start_market_poller(interval_seconds=60)
     _start_quotes_poller(interval_seconds=15)
