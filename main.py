@@ -229,6 +229,11 @@ _POST_CLOSE_PASSIVE_START = datetime.time(16, 0)
 _CLOSE_SNAPSHOT_INTERVAL_SECONDS = 60
 _CLOSE_INDEX_SETTLE_SECONDS      = 30                     # re-read after the bell (0 = off)
 _CLOSE_CAPTURE_DEADLINE          = datetime.time(15, 45)  # give up + keep last reading
+# The official close is the last index tick at or before the bell. A couple of
+# seconds of grace covers network/delivery lag on a tick the exchange stamped
+# 15:29:59; anything arriving later than that is a post-close value and is
+# never used as the close.
+_CLOSE_TICK_GRACE_SECONDS        = 2.0
 
 _close_lock: threading.Lock = threading.Lock()
 _close_snapshot: dict | None = None
@@ -2251,6 +2256,18 @@ def api_signals_list():
         active_only=not include_hidden,
         published_only=not include_hidden,
     )
+    if not include_hidden:
+        # App feed: every published signal has equal importance. The admin
+        # pinned / display_order fields must not rank one stock above the
+        # others, so the feed is ordered by one neutral rule only — the most
+        # recently published first (falling back to when it was added).
+        signals = sorted(
+            signals,
+            key=lambda s: str(
+                s.get("published_at") or s.get("created_at") or s.get("date_added") or ""
+            ),
+            reverse=True,
+        )
 
     quotes: dict[str, dict] = {}
     symbols = [s["symbol"] for s in signals if s.get("symbol")]
@@ -2272,6 +2289,10 @@ def api_signals_list():
             # feed keeps its original shape.
             for key in _SIGNAL_ADMIN_ONLY_FIELDS:
                 item.pop(key, None)
+            # No stock is featured or pinned in the app.
+            item["featured"] = False
+            item["pinned"] = False
+            item["display_order"] = 0
         enriched.append(item)
 
     return jsonify({
@@ -4498,13 +4519,30 @@ def _build_close_snapshot(today: datetime.date) -> dict | None:
     }
 
 
+def _read_index_board_at_close(today: datetime.date) -> list | None:
+    """
+    The three index rows as of the bell: for each index, the last tick that
+    arrived at or before 15:30:00 IST (+ a small delivery-lag grace). Ticks
+    that arrive after the bell are ignored, so a later or recalculated value
+    can never replace the real closing level. None if any index has no tick
+    in that window.
+    """
+    close_dt = datetime.datetime.combine(today, _MARKET_CLOSE, tzinfo=_IST)
+    cutoff_ts = close_dt.timestamp() + _CLOSE_TICK_GRACE_SECONDS
+    try:
+        board = _fyers_stream.index_board_at(MARKETS, cutoff_ts)
+    except Exception:
+        return None
+    return board["markets"] if board else None
+
+
 def _capture_index_close(today: datetime.date) -> bool:
     """
-    Refresh ONLY the index values in today's snapshot from the latest ticks and
-    mark it final. Everything else in the snapshot is left exactly as the last
-    intraday reading had it.
+    Refresh ONLY the index values in today's snapshot with the readings as of
+    the bell and mark it final. Everything else in the snapshot is left
+    exactly as the last intraday reading had it.
     """
-    markets = _read_index_board(today)
+    markets = _read_index_board_at_close(today)
     if not markets:
         return False
     current = _close_snapshot_get()
@@ -4586,12 +4624,14 @@ def _close_snapshot_tick() -> float:
             _close_index_captured_for = today
             print(f"   🏁  Index close saved for {today.isoformat()} at "
                   f"{datetime.datetime.now(_IST).strftime('%H:%M:%S')} IST.")
-        elif now >= _today_at(now, _CLOSE_CAPTURE_DEADLINE):
+        else:
+            # No index tick at or before the bell (e.g. the feed was down at
+            # the close). Waiting cannot help — any tick arriving now is a
+            # post-close value — so keep the last in-session reading as the
+            # close instead of ever using a later one.
             _promote_last_reading_to_final(today)
             _close_capture_done_for = today
             return 60.0
-        else:
-            return 5.0   # no usable ticks yet — try again shortly
 
     # (2) One re-read a few seconds on, to pick up a final tick that lands just
     #     after the bell. Index values only; harmless if it finds nothing new.

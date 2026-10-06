@@ -43,6 +43,7 @@ briefly-interrupted socket never produces a blank screen in the app.
 
 from __future__ import annotations
 
+import collections
 import datetime
 import logging
 import threading
@@ -59,6 +60,9 @@ _MAX_WS_SYMBOLS = 200
 # is_ready()/index_board()/breadth() — protects against silently serving
 # frozen data forever if the feed goes quiet without the socket noticing.
 _DEFAULT_STALE_AFTER_SECONDS = 45.0
+
+# How many recent ticks to remember per index symbol (see _index_history).
+_INDEX_HISTORY_LEN = 2000
 
 
 class FyersMarketStream:
@@ -77,6 +81,13 @@ class FyersMarketStream:
         self._index_symbols: dict[str, str] = {}           # market_key -> fyers index symbol
         self._market_symbols: dict[str, list[str]] = {}    # market_key -> [fyers equity symbols]
         self._last_tick_at: float | None = None
+        # Short per-index tick history (fyers index symbol -> deque of tick
+        # rows, each stamped with its arrival time in row["ts"]). Only the
+        # three index symbols are kept, so this stays tiny. It exists so the
+        # end-of-session close can be read as "the last tick at or before the
+        # bell" instead of "whatever tick happens to be newest right now",
+        # which after 15:30 may be a later, post-close value.
+        self._index_history: dict[str, collections.deque] = {}
 
     # ── configuration ────────────────────────────────────────────────────
     def configure_universe(
@@ -199,7 +210,14 @@ class FyersMarketStream:
         row = _normalize_tick(message)
         with self._lock:
             self._ticks[symbol] = row
-            self._last_tick_at = time.time()
+            self._last_tick_at = row["ts"]
+            if symbol in {s.upper() for s in self._index_symbols.values()}:
+                hist = self._index_history.get(symbol)
+                if hist is None:
+                    hist = collections.deque(maxlen=_INDEX_HISTORY_LEN)
+                    self._index_history[symbol] = hist
+                if row.get("ltp") is not None:
+                    hist.append(row)
 
     # ── read side (Flask request threads) ───────────────────────────────
     def last_tick_at(self) -> float | None:
@@ -257,6 +275,44 @@ class FyersMarketStream:
             entry = found[m["market_key"]].copy()
             entry["key"] = m["market_key"]
             markets_list.append(entry)
+
+        return {
+            "markets"   : markets_list,
+            "source"    : "fyers_ws",
+            "updated_at": datetime.datetime.now().isoformat(),
+        }
+
+    def index_board_at(self, markets: list[dict], cutoff_ts: float) -> dict | None:
+        """
+        Same row shape as index_board(), but each index is the LAST tick that
+        arrived at or before `cutoff_ts` (unix time) — never a later one.
+
+        Used for the official end-of-session close: a tick that lands after
+        the bell (a post-close recalculation, or any later value) must never
+        become the stored closing value. Returns None unless all indices have
+        at least one tick at or before the cutoff.
+        """
+        with self._lock:
+            idx_syms = dict(self._index_symbols)
+            history = {k: list(v) for k, v in self._index_history.items()}
+
+        markets_list = []
+        for m in markets:
+            sym = idx_syms.get(m["market_key"], m["fyers_symbol"]).upper()
+            row = None
+            for tick in reversed(history.get(sym, [])):
+                if tick["ts"] <= cutoff_ts and tick.get("ltp") is not None:
+                    row = tick
+                    break
+            if row is None:
+                return None
+            markets_list.append({
+                "key"   : m["market_key"],
+                "name"  : m["display_name"],
+                "value" : row["ltp"],
+                "change": row["chp"] if row.get("chp") is not None else 0.0,
+                "points": row["ch"]  if row.get("ch")  is not None else 0.0,
+            })
 
         return {
             "markets"   : markets_list,
