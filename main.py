@@ -77,6 +77,8 @@ from scanner.watchlist import (
 )
 from scanner.engine import run_scan
 from scanner import sweep as sweep_mod
+from scanner import entry_detect
+from data import entry_hits
 from scanner.sweep import RUNTIME as _sweep
 from scanner.historical import (
     run_historical_scan, topup_historical_scan, backtest_universe_gap, backtest_retry_symbols,
@@ -1405,6 +1407,7 @@ def api_status():
         "memory_mb"       : mem_mb,
         "history_store"   : history_store.health(),
         "sweep"           : _sweep.health(),
+        "entry_detection" : entry_detect.status(),
     })
 
 
@@ -1420,6 +1423,123 @@ def api_sweep_shadow():
         "mode": _cfg.SWEEP_MODE,
         "entries": sweep_mod.shadow_log(int(request.args.get("limit", 50) or 50)),
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry detection (Phase 5) — ADMIN ONLY.
+# None of these routes is in _APP_READABLE_RULES, so the mobile app can never
+# call them, and none of them sends a notification or publishes anything.
+# ─────────────────────────────────────────────────────────────────────────────
+
+entry_detect.configure(signals_provider=lambda: load_signals())
+
+
+@app.route("/api/entries/status", methods=["GET"])
+def api_entries_status():
+    """Admin-only. Is detection on, what is armed, last hit, last sweep used."""
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    return jsonify({**entry_detect.status(), "sweep": {
+        "mode": _cfg.SWEEP_MODE, "serving_live": _sweep.serving_live(),
+    }})
+
+
+@app.route("/api/entries/hits", methods=["GET"])
+def api_entries_hits():
+    """
+    Admin-only. Detected entry hits, newest first. ?days=1 (today) .. 7.
+    Adds age, the price now (from the latest sweep — no Fyers call) and the
+    linked signal's publication state.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    try:
+        days = max(1, min(30, int(request.args.get("days", 1))))
+    except ValueError:
+        days = 1
+
+    signals = {s["id"]: s for s in load_signals()}
+    with _sweep.lock:
+        rows = dict(_sweep.rows)
+    now_ist = datetime.datetime.now(_IST)
+    out = []
+    for h in entry_hits.hits(days):
+        row = rows.get(f"NSE:{h['symbol']}-EQ") or {}
+        item = dict(h)
+        item["price_now"] = row.get("lp")
+        try:
+            at = datetime.datetime.fromisoformat(h["detected_at"])
+            item["age_minutes"] = max(0, int((now_ist - at).total_seconds() // 60))
+        except (KeyError, ValueError):
+            item["age_minutes"] = None
+        sig = signals.get(h.get("signal_id") or "")
+        if sig is not None:
+            if sig.get("enabled") is False or sig.get("active") is False:
+                item["signal_state"] = "Hidden"
+            else:
+                item["signal_state"] = "Published" if sig.get("published") else "Draft"
+        out.append(item)
+    return jsonify({"hits": out, "detection": entry_detect.status()})
+
+
+def _hit_status_change(hit_id: str, status: str):
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    rec = entry_hits.set_status(hit_id, status, session.get("username"))
+    if rec is None:
+        return jsonify({"error": "Hit not found"}), 404
+    return jsonify({"hit": rec})
+
+
+@app.route("/api/entries/hits/<string:hit_id>/review", methods=["POST"])
+def api_entries_review(hit_id: str):
+    """Admin-only. Mark a hit as reviewed. Detection for its signal continues."""
+    return _hit_status_change(hit_id, "reviewed")
+
+
+@app.route("/api/entries/hits/<string:hit_id>/dismiss", methods=["POST"])
+def api_entries_dismiss(hit_id: str):
+    """Admin-only. Dismiss a hit. For an admin signal this also stops detection for it until re-armed or its entry price is edited."""
+    return _hit_status_change(hit_id, "dismissed")
+
+
+@app.route("/api/signals/<string:signal_id>/rearm", methods=["POST"])
+def api_signals_rearm(signal_id: str):
+    """Admin-only. Start entry detection afresh for a signal (clears 'done'). Sends nothing."""
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    if not any(s.get("id") == signal_id for s in load_signals()):
+        return jsonify({"error": "Signal not found"}), 404
+    if not entry_hits.rearm_signal(signal_id):
+        return jsonify({"error": "This signal is not armed (needs an entry price, enabled, "
+                                 "and a sweep with detection on)."}), 409
+    return jsonify({"rearmed": True, "id": signal_id})
+
+
+@app.route("/api/entries/hits/<string:hit_id>/create-draft", methods=["POST"])
+def api_entries_create_draft(hit_id: str):
+    """
+    Admin-only. Turn a SCANNER hit into a Draft signal pre-filled with the stock
+    and the SMA44 level as entry price. The signal is a Draft (Phase 3 rules):
+    not visible in the app, nothing is sent. Publishing is a separate button.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    hit = entry_hits.get_hit(hit_id)
+    if hit is None:
+        return jsonify({"error": "Hit not found"}), 404
+    if hit.get("kind") != "scanner":
+        return jsonify({"error": "Only scanner hits can be turned into a draft signal."}), 409
+    if hit.get("draft_signal_id"):
+        return jsonify({"error": "A draft was already created from this hit."}), 409
+    level = hit.get("level")
+    fields = {"enabled": True}
+    if isinstance(level, (int, float)) and level > 0:
+        fields["entry_price"] = round(float(level), 2)
+    entry = add_signal(symbol=hit["symbol"], rationale="", added_by=session.get("username"), **fields)
+    entry_hits.set_status(hit_id, "draft_created", session.get("username"), draft_signal_id=entry["id"])
+    print(f"   📝  Draft signal created from scanner hit {hit['symbol']} by {session.get('username')} — Draft, nothing sent")
+    return jsonify({"signal": entry}), 201
 
 
 @app.route("/api/market")
@@ -3803,6 +3923,10 @@ def _sweep_tick() -> None:
             "published": publish,
         }
         _sweep.mark_ok(out.duration, out.calls, summary)
+        if publish and not closing and _sweep.serving_live():
+            # Admin-only entry detection (Phase 5). Uses this sweep's data, makes
+            # no Fyers calls and can never notify or publish anything.
+            entry_detect.process_sweep(out, _fyers, now)
         n = _sweep.sweeps_ok
         if n == 1 or n % max(1, _cfg.SWEEP_LOG_EVERY) == 0:
             print(

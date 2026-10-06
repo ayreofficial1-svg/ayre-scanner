@@ -410,3 +410,26 @@ PUSH_DAILY_MAX_MANUAL         = max(1, int(_env_float("PUSH_DAILY_MAX_MANUAL", 3
 PUSH_DUPLICATE_WINDOW_SECONDS = max(0.0, _env_float("PUSH_DUPLICATE_WINDOW_SECONDS", 60.0))
 PUSH_AUDIT_LOG_FILE           = _persist(_env_str("PUSH_AUDIT_LOG_FILE", "push_audit_log.json"))
 PUSH_AUDIT_LOG_MAX            = max(50, int(_env_float("PUSH_AUDIT_LOG_MAX", 500)))
+
+
+# ── Entry detection, admin-only (Phase 5) ────────────────────────────────────
+# Detects when an admin signal's entry price or a scanner stock's SMA44 line is
+# touched and records it in an ADMIN-ONLY file. It can never notify anyone or
+# change what app users see (one-way wall, see scanner/entry_detect.py).
+# Off by default; needs SWEEP_MODE=live and a healthy sweep.
+ENTRY_DETECTION_ENABLED       = _env_bool("ENTRY_DETECTION_ENABLED", False)
+ENTRY_SCANNER_STOCKS_ENABLED  = _env_bool("ENTRY_SCANNER_STOCKS_ENABLED", True)
+# No detection before this IST time (opening-auction noise).
+ENTRY_NOISE_UNTIL_TIME        = _env_str("ENTRY_NOISE_UNTIL_TIME", "09:15:30")
+# A hit is flagged "extended" when the price is already this many % past the level.
+ENTRY_EXTENDED_PCT            = _env_float("ENTRY_EXTENDED_PCT", 0.5)
+# Admin signals are armed only while younger than this many days.
+ENTRY_ARM_MAX_AGE_DAYS        = int(_env_float("ENTRY_ARM_MAX_AGE_DAYS", 10))
+ENTRY_STORE_RETENTION_DAYS    = max(1, int(_env_float("ENTRY_STORE_RETENTION_DAYS", 7)))
+ENTRY_MAX_HITS_PER_DAY        = max(1, int(_env_float("ENTRY_MAX_HITS_PER_DAY", 200)))
+# Optional e-mail to the admin address (same ALERT_EMAIL_* settings as scan alerts).
+ENTRY_ADMIN_EMAIL_ENABLED     = _env_bool("ENTRY_ADMIN_EMAIL_ENABLED", False)
+ENTRY_ADMIN_EMAIL_MAX_PER_DAY = max(1, int(_env_float("ENTRY_ADMIN_EMAIL_MAX_PER_DAY", 20)))
+# Optional: one paced 1-minute history call per admin-signal hit to record the exact touch minute.
+ENTRY_EXACT_MINUTE_ENABLED    = _env_bool("ENTRY_EXACT_MINUTE_ENABLED", False)
+ENTRY_HITS_FILE               = _persist("entry_hits.json")
