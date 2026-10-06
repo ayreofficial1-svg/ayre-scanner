@@ -59,7 +59,7 @@ def _json_safe(value):
             pass
     return str(value)
 
-from auth.fyers_auth import reconnect_fyers, get_cached_token
+from auth.fyers_auth import reconnect_fyers, get_cached_token, client_from_cached_token
 from config.settings import (
     ACTIVE_CHECK_HOURS, ACTIVE_CHECK_MINUTE, PASSIVE_CHECK_INTERVAL,
     FYERS_APP_ID_FULL, BREADTH_CHECK_HOURS, BREADTH_CHECK_MINUTE,
@@ -69,11 +69,15 @@ from data.symbols import (
     plain_constituents_for_market, SENSEX30,
 )
 from data.fyers_stream import stream as _fyers_stream
+from data import history_store
+from config import settings as _cfg
 from scanner.watchlist import (
     load_watchlist, clean_watchlist, save_watchlist,
     load_alert_log, clean_alert_log, save_alert_log,
 )
 from scanner.engine import run_scan
+from scanner import sweep as sweep_mod
+from scanner.sweep import RUNTIME as _sweep
 from scanner.historical import (
     run_historical_scan, topup_historical_scan, backtest_universe_gap, backtest_retry_symbols,
     _tag as _universe_tag,
@@ -183,6 +187,10 @@ _state = {
 }
 _fyers      = None
 _symbols    = None
+# Once-per-day Fyers login, shared by the scan loop and the history-store job so
+# whichever needs Fyers first logs in and the other reuses that session.
+_auth_lock = threading.RLock()
+_last_auth_date: datetime.date | None = None
 _symbols_meta: dict = {}   # provenance of _symbols (source / count / complete) from data.symbols
 _start_time = time.time()   # for /api/status uptime tracking
 
@@ -314,6 +322,11 @@ _heavy_guard = threading.Lock()
 _heavy_kind: str | None = None
 _live_cancel = threading.Event()        # Stop for the scheduled / manual scan
 _backtest_cancel = threading.Event()    # Stop for the running backtest
+_history_cancel = threading.Event()     # Pause for the daily history-store download
+# Held by a published one-minute sweep while it evaluates, and by the hourly scan
+# for its whole run: the two never write the watchlist / alert log / results together.
+_sweep_run_lock = threading.Lock()
+_sweep_cancel = threading.Event()
 _backtest_stop_reason: str | None = None  # why the backtest was stopped (shown to the user)
 
 
@@ -1388,6 +1401,22 @@ def api_status():
         "total_scanned"   : _state["total_scanned"],
         "total_attempted" : _state["total_attempted"],
         "memory_mb"       : mem_mb,
+        "history_store"   : history_store.health(),
+        "sweep"           : _sweep.health(),
+    })
+
+
+@app.route("/api/sweep/status")
+def api_sweep_status():
+    return jsonify(_sweep.health())
+
+
+@app.route("/api/sweep/shadow")
+def api_sweep_shadow():
+    """Shadow mode: newest-first differences between each hourly scan and the sweep."""
+    return jsonify({
+        "mode": _cfg.SWEEP_MODE,
+        "entries": sweep_mod.shadow_log(int(request.args.get("limit", 50) or 50)),
     })
 
 
@@ -2726,6 +2755,9 @@ def _do_scan(lock_held: bool = False):
                 _backtest_stop_reason = "a scheduled scan started"
                 _backtest_cancel.set()
                 BACKTEST_PROGRESS.request_stop()
+            elif _heavy_kind == "history":
+                print("🛑  Scheduled scan is due — pausing the history download (previous store kept) …")
+                _history_cancel.set()
             else:
                 print("⏳  Scheduled scan is waiting for the running scan to finish …")
         try:
@@ -2736,11 +2768,13 @@ def _do_scan(lock_held: bool = False):
             return
         _state["scan_waiting"] = False
 
+    _sweep_run_lock.acquire()      # waits (seconds) for a published sweep that is mid-evaluation
     _state["scanning"] = True
     _state["error"]    = None
     _state["notice"]   = None
     progress_run = LIVE_PROGRESS.start(total=len(_symbols or []))
     cancelled = False
+    _scan_t0 = time.time()
     try:
         if not _fyers_market_data_allowed():
             _state["error"] = "Scan skipped because the market is not source-confirmed open."
@@ -2830,6 +2864,9 @@ def _do_scan(lock_held: bool = False):
         except Exception as exc:
             print(f"⚠️   Could not save live scan result: {exc}")
 
+        # Shadow mode: compare this hourly scan with the one-minute sweep (log only).
+        sweep_mod.compare_with_legacy(signals, watchlist_items, _scan_t0, time.time())
+
     except ScanCancelled:
         cancelled = True
         _state["error"]  = None
@@ -2838,6 +2875,10 @@ def _do_scan(lock_held: bool = False):
     except Exception as e:
         _state["error"] = str(e)
     finally:
+        try:
+            _sweep_run_lock.release()
+        except RuntimeError:
+            pass
         # `scanning` flips first so that by the time the website sees the
         # progress tracker go inactive, /api/results already reports the
         # finished scan.
@@ -3232,8 +3273,7 @@ def _scan_loop() -> None:
              09:30-15:30. Re-authenticates Fyers once per trading day before
              the first scan.
     """
-    global _fyers
-    _last_auth_date: datetime.date | None = None
+    global _fyers, _last_auth_date
 
     while True:
         now_ist = datetime.datetime.now(_IST)
@@ -3275,15 +3315,21 @@ def _scan_loop() -> None:
         # ── ACTIVE WINDOW ─────────────────────────────────────────────────────
         if _last_auth_date != today:
             print(f"\n🔑  Source-confirmed trading day ({today}) - refreshing Fyers token before scan slots …")
-            for attempt in range(3):
-                try:
-                    _fyers = reconnect_fyers()
-                    _last_auth_date = today
-                    break
-                except Exception as e:
-                    print(f"   ⚠️  Re-auth attempt {attempt + 1}/3 failed: {e}")
-                    time.sleep(30)
-            else:
+            reauth_ok = False
+            with _auth_lock:
+                if _last_auth_date == today:      # the history-store job logged in meanwhile
+                    reauth_ok = True
+                else:
+                    for attempt in range(3):
+                        try:
+                            _fyers = reconnect_fyers()
+                            _last_auth_date = today
+                            reauth_ok = True
+                            break
+                        except Exception as e:
+                            print(f"   ⚠️  Re-auth attempt {attempt + 1}/3 failed: {e}")
+                            time.sleep(30)
+            if not reauth_ok:
                 retry_at = _next_passive_status_check_at_or_after(datetime.datetime.now(_IST))
                 _state["next_passive_check_time"] = _format_ist(retry_at)
                 print(
@@ -3324,8 +3370,344 @@ def _scan_loop() -> None:
             print("\n⏭️   Previous scan still running — skipping this fixed slot.")
             continue
 
+        if _sweep.serving_live():
+            print(f"\n🟣  Slot {datetime.datetime.now(_IST).strftime('%H:%M')} IST — the one-minute sweep is "
+                  "healthy and live, so the hourly history scan is skipped (it runs again if the sweep fails).")
+            continue
+
         print(f"\n🟢  Active check — {datetime.datetime.now(_IST).strftime('%H:%M')} IST")
         _do_scan()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily history store (live-entry plan, Phase 1) — independent thread
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_fyers_today() -> "object":
+    """
+    A Fyers client authenticated today.  Reuses the session the scan loop (or an
+    earlier call) already created; otherwise tries today's cached token and only
+    then runs the automated login.  Shares _last_auth_date with _scan_loop, so
+    the once-per-day login rule is unchanged: whoever needs Fyers first logs in.
+    """
+    global _fyers, _last_auth_date
+    today = datetime.datetime.now(_IST).date()
+    with _auth_lock:
+        if _fyers is not None and _last_auth_date == today:
+            return _fyers
+        client = client_from_cached_token()
+        if client is not None:
+            print("🔑  History store: reusing today's cached Fyers token.")
+        else:
+            print("🔑  History store: logging in to Fyers ahead of the open …")
+            client = reconnect_fyers()
+        _fyers = client
+        _last_auth_date = today
+        return client
+
+
+def _previous_weekday(day: datetime.date) -> datetime.date:
+    d = day - datetime.timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= datetime.timedelta(days=1)
+    return d
+
+
+def _history_download_time() -> datetime.time:
+    try:
+        hh, mm = str(_cfg.HISTORY_STORE_DOWNLOAD_TIME).split(":", 1)
+        return datetime.time(int(hh), int(mm))
+    except Exception:
+        return datetime.time(8, 45)
+
+
+def _history_due(now: datetime.datetime, last_check: datetime.date | None) -> bool:
+    """
+    True when the job should run now.  At most one completed check per IST day.
+      * no valid store            → run now (catch-up after a fresh deploy / bad file)
+      * weekday at/after the time → the daily job
+      * otherwise                 → catch-up only if the store is older than the
+                                    previous weekday (late start / long downtime)
+    """
+    today = now.date()
+    if last_check == today:
+        return False
+    snap = history_store.get_snapshot()
+    if snap is None or not snap.frames:
+        return True
+    if now.weekday() < 5 and now.time() >= _history_download_time():
+        return True
+    return snap.as_of < _previous_weekday(today)
+
+
+def _history_loop() -> None:
+    """
+    Keeps the on-disk history store current without touching scans.
+
+    Decides "download or skip" with a single probe request (see
+    data/history_store.refresh_if_needed), so weekends and holidays cost one
+    request and no download.  The download takes the shared heavy-job lock, and a
+    due scheduled scan pauses it (the previous store is never touched by a
+    paused / failed download); it is retried after HISTORY_STORE_RETRY_MINUTES.
+    """
+    global _fyers, _last_auth_date
+    if not history_store.is_enabled():
+        print("📦  History store job disabled (HISTORY_STORE_ENABLED=false).")
+        return
+    print(f"📦  History store job started (daily at {_history_download_time().strftime('%H:%M')} IST on weekdays, "
+          "plus catch-up after a late start).")
+    last_check: datetime.date | None = None
+    retry_not_before = 0.0
+    while True:
+        try:
+            now = datetime.datetime.now(_IST)
+            if time.time() >= retry_not_before and _history_due(now, last_check):
+                if not _heavy_try_acquire("history"):
+                    time.sleep(30)          # a scan / backtest holds Fyers; try again shortly
+                    continue
+                _history_cancel.clear()
+                failed = False
+                try:
+                    if not _symbols_complete():
+                        _refresh_symbols(force_if_incomplete=True)
+                    client = _ensure_fyers_today()
+                    for _attempt in (1, 2):
+                        try:
+                            result = history_store.refresh_if_needed(
+                                client, list(_symbols or []),
+                                cancel=_history_cancel,
+                                universe_complete=_symbols_complete(),
+                            )
+                            break
+                        except FyersAuthError as exc:
+                            if _attempt == 2:
+                                raise
+                            print(f"⚠️   History store: Fyers rejected the session ({exc}) — logging in again.")
+                            with _auth_lock:
+                                _fyers = client = reconnect_fyers()
+                                _last_auth_date = datetime.datetime.now(_IST).date()
+                    if result.get("action") in ("downloaded", "skipped_up_to_date", "disabled"):
+                        last_check = now.date()
+                    else:
+                        failed = True
+                except ScanCancelled:
+                    failed = True
+                except Exception as exc:
+                    failed = True
+                    print(f"⚠️   History store job failed: {type(exc).__name__}: {exc}")
+                finally:
+                    _history_cancel.clear()
+                    _heavy_release()
+                    _state["last_heavy_fyers_op_at"] = time.time()
+                if failed:
+                    retry_not_before = time.time() + float(_cfg.HISTORY_STORE_RETRY_MINUTES) * 60.0
+                    print(f"📦  History store: will retry in {_cfg.HISTORY_STORE_RETRY_MINUTES:.0f} min "
+                          "(the previous store, if any, is untouched).")
+        except Exception as exc:
+            print(f"⚠️   History store loop error: {exc}")
+        time.sleep(30)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# One-minute quote sweep (live-entry plan, Phase 2) — independent thread
+# ─────────────────────────────────────────────────────────────────────────────
+
+_sweep_fail_log_at = 0.0
+
+
+def _sweep_note_failure(why: str) -> None:
+    """Count a failed sweep; log the first one at once, then at most every 10 minutes."""
+    global _sweep_fail_log_at
+    _sweep.mark_failed(why)
+    if time.time() - _sweep_fail_log_at > 600 or _sweep.consecutive_failures == 1:
+        _sweep_fail_log_at = time.time()
+        print(f"⚠️   Sweep failed ({_sweep.consecutive_failures} in a row): {why}")
+        if _sweep.consecutive_failures == _cfg.SWEEP_MAX_CONSECUTIVE_FAILURES and _cfg.SWEEP_MODE == "live":
+            print("   ↪ The hourly history scan takes over until the sweep recovers.")
+
+
+def _sweep_publish(out, *, final: bool) -> None:
+    """Publish a live sweep exactly where the hourly scan publishes (same fields, same files)."""
+    fr = out.fetch_report
+    fr["universe_total"] = len(_symbols or [])
+    fr["universe"] = {
+        "index": "NIFTY 500",
+        "source": _symbols_meta.get("source"),
+        "count": len(_symbols or []),
+        "complete": _symbols_complete(),
+        "built_at": _symbols_meta.get("built_at"),
+        "sources_tried": _symbols_meta.get("sources_tried"),
+        "fyers_master": {
+            k: v for k, v in (_symbols_meta.get("fyers_master") or {}).items()
+            if k in ("loaded", "source", "listed_on_fyers", "remapped", "not_in_master")
+        },
+    }
+    report = _scan_report_summary(fr)
+    report["source"] = "sweep"
+    notice = None
+    if fr.get("failed"):
+        notice = (f"{fr['failed']} stock(s) had no live quote in the latest sweep; "
+                  "they are retried automatically on the next one.")
+    now_s = datetime.datetime.now(_IST).strftime("%d %b %Y %H:%M:%S")
+
+    # build everything first, then assign (readers never see a half-updated result)
+    _state["signals"]         = out.signals
+    _state["watchlist_items"] = out.watchlist_items
+    _state["scan_time"]       = now_s
+    _state["total_scanned"]   = fr.get("evaluated", fr["valid"])
+    _state["total_attempted"] = fr["attempted"]
+    _state["scan_report"]     = report
+    _state["universe_stats"]  = out.universe_stats
+    _state["error"]           = None
+    _state["notice"]          = notice
+    _state["next_scan_time"]  = _format_ist(
+        datetime.datetime.now(_IST) + datetime.timedelta(seconds=_cfg.SWEEP_INTERVAL_SECONDS))
+
+    membership = (
+        tuple(sorted(d["symbol"] for d in out.signals)),
+        tuple(sorted(d["symbol"] for d in out.watchlist_items)),
+    )
+    with _sweep.lock:
+        due = (
+            final
+            or membership != _sweep.last_saved_membership
+            or time.time() - _sweep.last_saved_at >= _cfg.SWEEP_SAVE_INTERVAL_SECONDS
+        )
+        if due:
+            _sweep.last_saved_at = time.time()
+            _sweep.last_saved_membership = membership
+    if due:
+        try:
+            saved_stats = save_universe_stats(out.universe_stats)
+            _state["universe_stats_as_of"] = saved_stats["as_of"]
+        except Exception as exc:
+            print(f"⚠️   Sweep: could not save insights stats: {exc}")
+        try:
+            _save_scan_result("live", datetime.datetime.now(_IST).date().isoformat(), _json_safe({
+                "signals": out.signals, "watchlist_items": out.watchlist_items,
+                "scan_time": now_s, "total_scanned": _state["total_scanned"],
+                "total_attempted": _state["total_attempted"], "scan_report": report,
+            }), partial=bool(fr.get("failed")))
+        except Exception as exc:
+            print(f"⚠️   Sweep: could not save live scan result: {exc}")
+
+
+def _sweep_tick() -> None:
+    global _fyers, _last_auth_date
+    mode = _cfg.SWEEP_MODE
+    now = datetime.datetime.now(_IST)
+    today = now.date()
+    t = now.time()
+    start_t = sweep_mod.parse_hhmm(_cfg.SWEEP_START_TIME, datetime.time(9, 16))
+    final_t = sweep_mod.parse_hhmm(_cfg.SWEEP_FINAL_TIME, datetime.time(15, 46))
+
+    closing = False
+    if _is_market_open() and t >= start_t and now.weekday() < 5:
+        if not _fyers_market_data_allowed():
+            return                                  # holiday / not source-confirmed open
+    elif (mode == "live" and final_t <= t <= datetime.time(16, 30)
+          and _sweep.sweeps_today_day == today and _sweep.sweeps_today > 0
+          and _sweep.closing_done_day != today):
+        closing = True                              # one closing sweep after the bell
+    else:
+        return
+
+    if time.time() < _sweep.backoff_until:
+        _sweep.mark_skipped("backing off after a Fyers rate limit")
+        return
+    if _fyers is None or _last_auth_date != today:
+        _sweep.mark_skipped("waiting for today's Fyers login")
+        return
+    _refresh_symbols()                              # once per day (cheap otherwise)
+    ok, why = sweep_mod.store_ready(list(_symbols or []))
+    if not ok or not _symbols_complete():
+        _sweep.mark_skipped(why or "stock universe incomplete")
+        return
+
+    publish = mode == "live"
+    if publish:
+        if _state.get("scanning") or _heavy_kind == "live":
+            _sweep.mark_skipped("an hourly scan is running")
+            return
+        if not _sweep_run_lock.acquire(blocking=False):
+            _sweep.mark_skipped("an hourly scan is running")
+            return
+    try:
+        try:
+            out = sweep_mod.run_sweep(_fyers, list(_symbols), publish=publish, cancel=_sweep_cancel)
+        except FyersAuthError as exc:
+            _sweep_note_failure(f"Fyers rejected the session ({exc})")
+            if not _state.get("scanning"):
+                try:
+                    with _auth_lock:
+                        _fyers = reconnect_fyers()
+                        _last_auth_date = today
+                except Exception as exc2:
+                    print(f"⚠️   Sweep: re-login failed: {exc2}")
+            return
+        except ScanCancelled:
+            return
+        if not out.ok:
+            if out.rate_limited:
+                _sweep.backoff_until = time.time() + _cfg.SWEEP_RATE_LIMIT_BACKOFF_SECONDS
+                print(f"⚠️   Sweep: Fyers rate limit — sweeps pause for {_cfg.SWEEP_RATE_LIMIT_BACKOFF_SECONDS:.0f}s "
+                      "(the hourly scan is never paused).")
+            _sweep_note_failure(out.why)
+            return
+        if publish:
+            _sweep_publish(out, final=closing)
+            if closing:
+                _sweep.closing_done_day = today
+                print("🔔  Closing sweep saved — final result of the session.")
+        else:
+            sweep_mod.remember_shadow(out)
+        summary = {
+            "signals": len(out.signals), "watchlist": len(out.watchlist_items),
+            "evaluated": out.fetch_report.get("evaluated"), "failed_quotes": out.fetch_report.get("failed"),
+            "published": publish,
+        }
+        _sweep.mark_ok(out.duration, out.calls, summary)
+        n = _sweep.sweeps_ok
+        if n == 1 or n % max(1, _cfg.SWEEP_LOG_EVERY) == 0:
+            print(
+                f"📡  Sweep #{n} ({mode}): {summary['evaluated']} stocks evaluated, "
+                f"{summary['signals']} signals / {summary['watchlist']} watchlist, "
+                f"{out.calls} quote calls, {out.duration:.1f}s — "
+                f"Fyers calls last minute: {sweep_mod.fyers_calls_last_minute()}/"
+                f"{_cfg.FYERS_MAX_REQUESTS_PER_MINUTE}"
+            )
+    finally:
+        if publish:
+            try:
+                _sweep_run_lock.release()
+            except RuntimeError:
+                pass
+
+
+def _sweep_loop() -> None:
+    """
+    Layer 1: evaluates the whole universe every SWEEP_INTERVAL_SECONDS from ~10
+    quote requests.  Independent thread; never overlaps itself; any failure only
+    means the hourly scan keeps (or resumes) doing the job.
+    """
+    if _cfg.SWEEP_MODE == "off":
+        print("📡  Quote sweep: off (SWEEP_MODE=off) — the hourly scan runs as before.")
+        return
+    print(f"📡  Quote sweep started in {_cfg.SWEEP_MODE.upper()} mode "
+          f"(every {_cfg.SWEEP_INTERVAL_SECONDS:.0f}s from {_cfg.SWEEP_START_TIME} IST"
+          + ("; results are NOT published, they are compared with each hourly scan)" if _cfg.SWEEP_MODE == "shadow" else ")"))
+    next_t = time.monotonic()
+    while True:
+        try:
+            _sweep_tick()
+        except Exception as exc:
+            _sweep_note_failure(f"{type(exc).__name__}: {exc}")
+        next_t += _cfg.SWEEP_INTERVAL_SECONDS
+        delay = next_t - time.monotonic()
+        if delay < 1.0:                 # running behind: never burst to catch up
+            next_t = time.monotonic() + 1.0
+            delay = 1.0
+        time.sleep(delay)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3344,11 +3726,15 @@ def _refresh_full_breadth() -> None:
     if _fyers is None or not _symbols:
         return
 
-    try:
-        result = fetch_full_market_breadth(_fyers, _symbols)
-    except Exception as e:
-        print(f"   ⚠️  Breadth poller: fetch error: {e}")
-        return
+    result = _sweep.latest_breadth()          # from the one-minute sweep: 0 Fyers calls
+    if result is not None:
+        print("   📊  Breadth taken from the one-minute sweep (no extra Fyers calls).")
+    else:
+        try:
+            result = fetch_full_market_breadth(_fyers, _symbols)
+        except Exception as e:
+            print(f"   ⚠️  Breadth poller: fetch error: {e}")
+            return
 
     if not result:
         print("   ⚠️  Breadth poller: no usable data returned this cycle.")
@@ -3451,7 +3837,9 @@ def _refresh_quotes() -> None:
     if not sym_map:
         return
 
-    raw = fetch_ltp_bulk(_fyers, list(sym_map.keys()))
+    raw = _sweep.latest_ltp(list(sym_map.keys()))      # sweep prices: no Fyers call
+    if raw is None:
+        raw = fetch_ltp_bulk(_fyers, list(sym_map.keys()))
     remapped: dict[str, float | None] = {
         sym_map[fsym]: ltp
         for fsym, ltp in raw.items()
@@ -4454,6 +4842,8 @@ def main():
             )
             _bt_commit_locked()
 
+    history_store.load_on_startup()          # disk → memory, no Fyers calls
+
     summary = get_log_summary()
     print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")
     print(f"    Stocks     : {len(_symbols)}")
@@ -4464,6 +4854,8 @@ def main():
         f"({slot_labels[0]}–{slot_labels[-1]} IST via {', '.join(slot_labels)}) …"
     )
     threading.Thread(target=_scan_loop, daemon=True, name="scan-loop").start()
+    threading.Thread(target=_history_loop, daemon=True, name="history-store-loop").start()
+    threading.Thread(target=_sweep_loop, daemon=True, name="sweep-loop").start()
 
     breadth_slot_labels = [f"{h:02d}:{BREADTH_CHECK_MINUTE:02d}" for h in BREADTH_CHECK_HOURS]
     print(

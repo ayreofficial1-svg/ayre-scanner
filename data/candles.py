@@ -79,6 +79,7 @@ _RATE_LIMIT_PAUSE = 2.0       # grows linearly: 2, 4, 6 … seconds
 _INVALID_SYMBOL_CODE = -300
 _RATE_LIMIT_CODE = 429
 _AUTH_CODES = {-8, -15, -16, -17, 401, 403}
+AUTH_CODES = _AUTH_CODES
 _AUTH_ABORT_AFTER = 8         # consecutive auth rejections before the scan aborts
 
 # Retry waves for transient failures (Fyers errors / rate limits).  Only the
@@ -146,6 +147,12 @@ class _Pacer:
         with self._lock:
             self._next = max(self._next, time.monotonic() + self._interval)
 
+    def recent_calls(self) -> int:
+        """Paced Fyers requests that started in the last 60 seconds."""
+        with self._lock:
+            now = time.monotonic()
+            return sum(1 for t in self._stamps if now - 60.0 < t <= now)
+
     def rate_limited(self, pause: float) -> None:
         with self._lock:
             self._interval = min(self._interval * 1.5, 1.0)
@@ -165,7 +172,13 @@ class _Pacer:
 
 
 _PACER = _Pacer(_SLEEP, FYERS_MAX_REQUESTS_PER_MINUTE)
+PACER = _PACER                  # public alias: the quote sweep shares this pacer
 _auth_fail_streak = 0
+
+
+def fyers_calls_last_minute() -> int:
+    """How many paced Fyers requests were made in the last 60 s (limit: 190 by our own cap)."""
+    return _PACER.recent_calls()
 
 
 class _Win:
@@ -451,7 +464,7 @@ def _bare(symbol: str) -> str:
 
 
 def _fetch_universe(
-    fyers, symbols, range_to, *, live, progress=None, cancel=None, verbose=False,
+    fyers, symbols, range_to, *, live, progress=None, cancel=None, verbose=False, collect_resolved=False,
 ) -> tuple[dict[str, pd.DataFrame], dict]:
     global _auth_fail_streak
     _auth_fail_streak = 0
@@ -464,6 +477,7 @@ def _fetch_universe(
     partial: dict[str, pd.DataFrame] = {}
     degraded: list[str] = []
     ledger: dict[str, dict] = {}
+    resolved_map: dict[str, str] = {}     # NSE symbol -> Fyers ticker that answered
     recovered = 0
     waves = 0
 
@@ -493,6 +507,8 @@ def _fetch_universe(
     def _settle(sym: str, out: _Outcome) -> str:
         if out.status == "ok":
             results[sym] = out.df
+            if out.resolved:
+                resolved_map[sym] = out.resolved
             failed.pop(sym, None)
             partial.pop(out.resolved, None)
             return "valid"
@@ -602,6 +618,8 @@ def _fetch_universe(
         "cached_no_data": sum(1 for o in no_data.values() if o.cached),
         "ledger": ledger,
     }
+    if collect_resolved:
+        report["resolved"] = resolved_map      # only the history store asks for this
     assert report["valid"] + report["no_data"] + report["failed"] == total
     return results, report
 
@@ -627,6 +645,32 @@ def fetch_candles_bulk_at_date(
         fyers, symbols, range_to,
         live=False, progress=progress, cancel=cancel, verbose=verbose,
     )
+
+
+def fetch_history_for_store(fyers, symbols, range_to, *, cancel=None, progress=None, verbose=False):
+    """
+    History download for data/history_store.py.  Same fetcher, pacing, retry
+    waves and symbol resolution as a live scan (live=True), ending at `range_to`.
+    Returns (results, report); report["resolved"] maps symbol -> Fyers ticker.
+    """
+    return _fetch_universe(
+        fyers, symbols, range_to,
+        live=True, progress=progress, cancel=cancel, verbose=verbose,
+        collect_resolved=True,
+    )
+
+
+def probe_latest_daily_bar(fyers, symbol: str, cancel=None) -> datetime.date | None:
+    """
+    ONE paced Fyers request: the date of the newest daily bar of `symbol`
+    dated before today (IST).  None when Fyers gives nothing usable.
+    """
+    today = _today_ist()
+    w = _request_window(fyers, symbol, today - datetime.timedelta(days=14), today, cancel)
+    if w.status != "ok" or w.df is None or w.df.empty:
+        return None
+    idx = [d.date() for d in w.df.index if d.date() < today]
+    return max(idx) if idx else None
 
 
 def fetch_candles(fyers: fyersModel.FyersModel, symbol: str) -> pd.DataFrame | None:

@@ -218,6 +218,10 @@ def run_scan(
     verbose   : bool = False,
     progress  = None,
     cancel    = None,
+    candle_provider = None,
+    dry_run   : bool = False,
+    quiet     : bool = False,
+    yield_cpu : bool = False,
 ) -> tuple[list[dict], list[dict], dict, dict]:
     """
     Execute a full scan across all symbols.
@@ -232,6 +236,16 @@ def run_scan(
     verbose     : if True, print per-symbol results
     cancel      : optional threading.Event; when set the scan stops safely and
                   raises utils.scan_control.ScanCancelled.
+    candle_provider : optional callable returning (candle_data, fetch_report) in
+                  place of the Fyers history download.  Used by the one-minute
+                  sweep (scanner/sweep.py); everything after the fetch — weekly
+                  filter, evaluation, alerts, watchlist, trade-ready time — is the
+                  SAME code path as a normal scan.
+    dry_run     : evaluate only.  Nothing is written to disk, no alert is fired,
+                  no intraday call is made; the caller passes COPIES of
+                  watchlist / alert_log.  Used by the sweep's shadow mode.
+    quiet       : suppress the per-run console output (minute-by-minute sweeps).
+    yield_cpu   : tiny sleep per symbol so Flask threads are never starved.
     progress    : optional utils.scan_progress.ScanProgress. Fed from counters
                   the scan already keeps (in-memory only — no extra Fyers calls)
                   so the website can show live progress.
@@ -245,6 +259,12 @@ def run_scan(
     universe_stats is {bare_symbol: {atr_pct, macd_bullish, volume_surge,
     close}} for every evaluated symbol — see module docstring.
     """
+    say = (lambda *a, **k: None) if quiet else print
+
+    def _save_wl() -> None:
+        if not dry_run:
+            save_watchlist(watchlist)
+
     signals         : list[dict] = []
     watchlist_items : list[dict] = []
     promoted        : list[str]  = []
@@ -252,16 +272,19 @@ def run_scan(
     t_start = time.time()
 
     # ── Step 1: Fetch daily candles once ─────────────────────────────────────
-    print(f"\n⚙️   Fetching daily data for {len(symbols)} stocks …")
+    say(f"\n⚙️   Fetching daily data for {len(symbols)} stocks …")
     if WEEKLY_RISING_FILTER:
-        print("⚙️   Weekly bars will be derived from daily data (0 extra API calls) …\n")
+        say("⚙️   Weekly bars will be derived from daily data (0 extra API calls) …\n")
 
     weekly_data: dict = {}
     weekly_report: dict = {"valid": 0, "no_data": 0, "failed": 0, "attempted": 0}
 
-    candle_data, fetch_report = fetch_candles_bulk_persistent(
-        fyers, symbols, interval, verbose, progress=progress, cancel=cancel
-    )
+    if candle_provider is not None:
+        candle_data, fetch_report = candle_provider()
+    else:
+        candle_data, fetch_report = fetch_candles_bulk_persistent(
+            fyers, symbols, interval, verbose, progress=progress, cancel=cancel
+        )
     if WEEKLY_RISING_FILTER:
         weekly_data, weekly_report = weekly_candles_from_daily(candle_data)
 
@@ -272,7 +295,7 @@ def run_scan(
         candle_data = {k: v for k, v in candle_data.items() if k in QUALITY_STOCK_WHITELIST}
         quality_filtered = original_count - len(candle_data)
         if quality_filtered > 0:
-            print(f"   🔍  Applied quality whitelist filter: skipped {quality_filtered} symbols\n")
+            say(f"   🔍  Applied quality whitelist filter: skipped {quality_filtered} symbols\n")
 
     # ── Step 1b: Apply weekly pre-filter results (data already fetched above) ─
     weekly_status: dict[str, bool | None] = {}
@@ -280,7 +303,7 @@ def run_scan(
     weekly_not_rising = 0
     symbols_to_evaluate = list(candle_data.keys())
     if WEEKLY_RISING_FILTER:
-        print(
+        say(
             f"   📊  Weekly data: {weekly_report['valid']} valid | "
             f"{weekly_report['no_data']} skipped\n"
         )
@@ -304,11 +327,11 @@ def run_scan(
         if WEEKLY_FILTER_EXCLUDES:
             weekly_filtered = not_rising_count
             if weekly_filtered > 0:
-                print(f"   📉  Weekly rising filter: {weekly_filtered} symbols excluded (weekly SMA44 not rising)\n")
+                say(f"   📉  Weekly rising filter: {weekly_filtered} symbols excluded (weekly SMA44 not rising)\n")
             symbols_to_evaluate = symbols_to_evaluate_filtered
             candle_data = {k: v for k, v in candle_data.items() if k in symbols_to_evaluate}
         else:
-            print(
+            say(
                 f"   📈  Weekly SMA44 not rising: {weekly_not_rising} symbols "
                 f"(informational only — full universe is scanned)\n"
             )
@@ -319,7 +342,7 @@ def run_scan(
     attempted = fetch_report["attempted"]
     accounted = fetch_report["valid"] + fetch_report["no_data"] + fetch_report["failed"]
 
-    print(
+    say(
         f"   ✅  Fetch complete: {fetch_report['valid']} valid | "
         f"{fetch_report['no_data']} no-data | "
         f"{fetch_report['failed']} failed | "
@@ -342,13 +365,13 @@ def run_scan(
 
     if accounted != attempted:
         gap = attempted - accounted
-        print(
+        say(
             f"   ❌  COVERAGE GAP: {gap} of {attempted} symbols unaccounted for. "
             f"This is a bug — check fetch_candles_bulk classification logic."
         )
     elif fetch_report["failed"] > 0:
         failed_syms = fetch_report.get("failed_symbols", [])
-        print(
+        say(
             f"   ⚠️   {fetch_report['failed']} symbols still failing after all retry waves "
             f"(Fyers-side errors, codes in the ledger): "
             f"{failed_syms[:5]}" + (" …" if len(failed_syms) > 5 else "")
@@ -357,25 +380,27 @@ def run_scan(
     # ── Step 2: Prune watchlist entries with broken SMA44 structure ───────────
     removed_broken = _cleanup_broken_structures(watchlist, candle_data)
     if removed_broken:
-        print(
+        say(
             f"   🗑️   Removed {len(removed_broken)} watchlist entries "
             f"(price below SMA44): {', '.join(removed_broken[:10])}"
             + (" …" if len(removed_broken) > 10 else "")
         )
-        save_watchlist(watchlist)
+        _save_wl()
 
     # ── Step 3: Evaluate each symbol ─────────────────────────────────────────
-    print("⚙️   Evaluating conditions …")
+    say("⚙️   Evaluating conditions …")
 
     if progress is not None:
         progress.begin_analyse(len(candle_data))
 
     for eval_idx, (symbol, raw) in enumerate(candle_data.items()):
         if cancel is not None and cancel.is_set():
-            save_watchlist(watchlist)      # keep watchlist consistent with alerts already sent
+            _save_wl()                     # keep watchlist consistent with alerts already sent
             raise ScanCancelled()
         if progress is not None:
             progress.analyse_done(eval_idx)   # symbols fully evaluated so far
+        if yield_cpu:
+            time.sleep(0.001)
         try:
             # NEW — computed once, shared by evaluate() AND the stats
             # capture below. Pure pandas over ~700 rows; zero Fyers cost.
@@ -421,7 +446,10 @@ def run_scan(
                     promoted.append(display)
                     remove_from_watchlist(watchlist, display)
 
-                if d["is_new_alert"]:
+                if d["is_new_alert"] and dry_run:
+                    # in-memory copy only: no alert, no intraday call, no file
+                    mark_alerted(display, alert_log, d["close"], None)
+                elif d["is_new_alert"]:
                     source = "🎯 Watchlist Promoted!" if is_promoted else "New Signal"
                     fire_alert(
                         symbol             = display,
@@ -467,7 +495,7 @@ def run_scan(
             if verbose and result["status"] != "none":
                 d    = result["data"]
                 flag = "✅" if result["status"] == "signal" else "👀"
-                print(
+                say(
                     f"   {flag} {d['symbol']:<18} "
                     f"C={d['close']:.2f}  SMA44={d['sma44']:.2f}  "
                     f"MACD={d['macd']:.4f}  Signal={d['macd_signal']:.4f}  "
@@ -479,7 +507,7 @@ def run_scan(
         except Exception as e:
             # Never silent: an evaluation error is OUR problem, so it is logged,
             # reported, and excluded from the "evaluated" count.
-            print(f"   ⚠️  {symbol}: evaluation error — {type(e).__name__}: {e}")
+            say(f"   ⚠️  {symbol}: evaluation error — {type(e).__name__}: {e}")
             fetch_report["evaluation_errors"].append(
                 {"symbol": symbol.replace("NSE:", "").replace("-EQ", ""), "error": f"{type(e).__name__}: {e}"}
             )
@@ -492,13 +520,13 @@ def run_scan(
     if progress is not None:
         progress.analyse_done(len(candle_data))
 
-    save_watchlist(watchlist)
+    _save_wl()
     fetch_report["evaluated"] = len(candle_data) - len(fetch_report["evaluation_errors"])
     if fetch_report["evaluation_errors"]:
-        print(f"   ❌  {len(fetch_report['evaluation_errors'])} symbol(s) raised evaluation errors (see above)")
+        say(f"   ❌  {len(fetch_report['evaluation_errors'])} symbol(s) raised evaluation errors (see above)")
 
     t_total = time.time() - t_start
-    print(
+    say(
         f"\n   ✅  {len(signals)} signal(s)  |  "
         f"👀  {len(watchlist_items)} watchlist  |  "
         f"🎯  {len(promoted)} promoted  |  "

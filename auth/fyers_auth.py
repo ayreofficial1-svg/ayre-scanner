@@ -373,6 +373,25 @@ def get_cached_token() -> str | None:
     return _TOKEN_CACHE.get("token")
 
 
+def client_from_cached_token() -> fyersModel.FyersModel | None:
+    """
+    A validated client built from today's cached token, or None.  Never logs in
+    and never exits the process (unlike connect_fyers), so background jobs can
+    try it before deciding to run the full automated login.
+    """
+    try:
+        token = _load_cached_token()
+        if not token:
+            return None
+        client = _build_fyers_client(token)
+        profile = client.get_profile()
+        if str(profile.get("code")) == "200":
+            return client
+    except Exception:
+        pass
+    return None
+
+
 def connect_fyers() -> fyersModel.FyersModel:
     try:
         _check_credentials()

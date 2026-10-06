@@ -83,37 +83,41 @@ def fetch_ltp_bulk(
         if now - _last_fetch_at < QUOTES_MIN_INTERVAL and _last_result:
             return dict(_last_result)
 
-        symbols_str = ",".join(fyers_symbols[:50])   # Fyers hard cap
-
-        try:
-            resp = fyers.quotes(data={"symbols": symbols_str})
-        except Exception as e:
-            log.warning(f"quotes.fetch_ltp_bulk: Fyers API error: {e}")
-            # Reset the fetch timestamp so the next call actually retries
-            # rather than being blocked by the interval guard indefinitely.
-            _last_fetch_at = 0.0
-            return dict(_last_result) if _last_result else {}
-
-        if not resp or resp.get("s") != "ok":
-            log.warning(f"quotes.fetch_ltp_bulk: bad response: {resp}")
-            # Detect rate-limit responses (code -50 or message containing "limit")
-            # and reset so recovery happens on the very next poller tick.
-            msg = str(resp.get("message") or resp.get("errmsg") or "").lower()
-            code = resp.get("code", 0)
-            if code == -50 or "limit" in msg or "429" in msg:
-                log.warning("quotes.fetch_ltp_bulk: rate limit detected — resetting fetch timer for recovery")
-                _last_fetch_at = 0.0
-            return dict(_last_result) if _last_result else {}
-
         result: dict[str, float | None] = {s: None for s in fyers_symbols}
 
-        for item in resp.get("d", []):
-            # Fyers returns symbol under "n" in quotes response
-            sym = str(item.get("n") or item.get("symbol") or "")
-            v   = item.get("v") or item
-            ltp = _pick_ltp(v)
-            if sym in result and ltp is not None:
-                result[sym] = ltp
+        # Fyers accepts at most 50 symbols per call; longer lists are split
+        # (they used to be silently truncated to the first 50).
+        chunks = [fyers_symbols[i:i + 50] for i in range(0, len(fyers_symbols), 50)]
+        for ci, chunk in enumerate(chunks):
+            if ci:
+                time.sleep(0.3)
+            try:
+                resp = fyers.quotes(data={"symbols": ",".join(chunk)})
+            except Exception as e:
+                log.warning(f"quotes.fetch_ltp_bulk: Fyers API error: {e}")
+                # Reset the fetch timestamp so the next call actually retries
+                # rather than being blocked by the interval guard indefinitely.
+                _last_fetch_at = 0.0
+                return dict(_last_result) if _last_result else {}
+
+            if not resp or resp.get("s") != "ok":
+                log.warning(f"quotes.fetch_ltp_bulk: bad response: {resp}")
+                # Detect rate-limit responses (code -50 or message containing "limit")
+                # and reset so recovery happens on the very next poller tick.
+                msg = str((resp or {}).get("message") or (resp or {}).get("errmsg") or "").lower()
+                code = (resp or {}).get("code", 0)
+                if code == -50 or "limit" in msg or "429" in msg:
+                    log.warning("quotes.fetch_ltp_bulk: rate limit detected — resetting fetch timer for recovery")
+                    _last_fetch_at = 0.0
+                return dict(_last_result) if _last_result else {}
+
+            for item in resp.get("d", []):
+                # Fyers returns symbol under "n" in quotes response
+                sym = str(item.get("n") or item.get("symbol") or "")
+                v   = item.get("v") or item
+                ltp = _pick_ltp(v)
+                if sym in result and ltp is not None:
+                    result[sym] = ltp
 
         _last_fetch_at = time.time()
         _last_result   = result

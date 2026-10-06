@@ -322,3 +322,82 @@ SCAN_RESUME_MAX_AGE_SECONDS = 600
 # to be verified (403 "email_not_verified" otherwise). Off by default; enforcing
 # it later is just this setting plus the app's existing verify prompt.
 APP_REQUIRE_VERIFIED_EMAIL = os.getenv("APP_REQUIRE_VERIFIED_EMAIL", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# ── Daily history store (Phase 1 of the live-entry plan; data/history_store.py) ─
+# One on-disk generation of daily candles for the whole universe, downloaded once
+# per trading day before the open and loaded into memory.  Phase 1 only builds the
+# store; scans, breadth, quotes, the WebSocket and backtests behave as before.
+# Every value can be overridden with an environment variable (Railway → Variables).
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, "")).strip() or default)
+    except ValueError:
+        return default
+
+
+HISTORY_STORE_ENABLED        = _env_bool("HISTORY_STORE_ENABLED", True)
+# IST wall-clock time (HH:MM) of the daily download on weekdays.
+HISTORY_STORE_DOWNLOAD_TIME  = _env_str("HISTORY_STORE_DOWNLOAD_TIME", "08:45")
+# A new generation is published only if at least this share of the universe is stored ...
+HISTORY_STORE_MIN_COVERAGE   = _env_float("HISTORY_STORE_MIN_COVERAGE", 0.95)
+# ... and at least this share of the stored stocks end on the expected session date.
+HISTORY_STORE_MIN_FRESH_SHARE = _env_float("HISTORY_STORE_MIN_FRESH_SHARE", 0.90)
+# A download is not started with less free space than this on the data volume.
+HISTORY_STORE_MIN_FREE_MB    = _env_float("HISTORY_STORE_MIN_FREE_MB", 200.0)
+# Sub-folder (of the persistent data dir, or of the working dir when persistence is off).
+HISTORY_STORE_DIR_NAME       = _env_str("HISTORY_STORE_DIR_NAME", "history_store")
+# Liquid instruments used by the one-request "has a new session completed?" probe.
+HISTORY_STORE_PROBE_SYMBOLS  = [
+    s.strip() for s in _env_str(
+        "HISTORY_STORE_PROBE_SYMBOLS", "NSE:NIFTY50-INDEX,NSE:RELIANCE-EQ"
+    ).split(",") if s.strip()
+]
+# After a failed or cancelled attempt, wait this long before trying again.
+HISTORY_STORE_RETRY_MINUTES  = _env_float("HISTORY_STORE_RETRY_MINUTES", 15.0)
+
+
+# ── One-minute quote sweep (Phase 2 of the live-entry plan; scanner/sweep.py) ─
+# Every SWEEP_INTERVAL_SECONDS the whole universe is priced with ~10 paced Fyers
+# quote requests, today's candle is built from the quote (open / day high / day
+# low / last / volume) and appended to the stored history (Phase 1), and the
+# SAME scan code (scanner/engine.run_scan) evaluates it.
+#   off     — nothing changes (default)
+#   shadow  — sweep runs and is compared with every hourly scan; nothing published
+#   live    — sweep results are published; the hourly scan is skipped while the
+#             sweep is healthy and runs exactly as before when it is not
+SWEEP_MODE = _env_str("SWEEP_MODE", "off").lower()
+if SWEEP_MODE not in {"off", "shadow", "live"}:
+    SWEEP_MODE = "off"
+SWEEP_INTERVAL_SECONDS       = max(20.0, _env_float("SWEEP_INTERVAL_SECONDS", 60.0))
+# First sweep of the day (IST HH:MM) — keeps the opening-auction noise out.
+SWEEP_START_TIME             = _env_str("SWEEP_START_TIME", "09:16")
+# One closing sweep after the bell so the saved result is the final one.
+SWEEP_FINAL_TIME             = _env_str("SWEEP_FINAL_TIME", "15:46")
+# A sweep is discarded when more than this share of stocks got no quote.
+SWEEP_MAX_FAILED_SHARE       = _env_float("SWEEP_MAX_FAILED_SHARE", 0.20)
+# This many failed sweeps in a row → the sweep is "unhealthy" and the hourly scan takes over.
+SWEEP_MAX_CONSECUTIVE_FAILURES = int(_env_float("SWEEP_MAX_CONSECUTIVE_FAILURES", 3))
+# A sweep result older than this no longer counts as healthy.
+SWEEP_HEALTHY_MAX_AGE_SECONDS = _env_float("SWEEP_HEALTHY_MAX_AGE_SECONDS", 180.0)
+# A stock whose quote batch failed re-uses its previous quote for at most this long.
+SWEEP_QUOTE_CARRY_SECONDS    = _env_float("SWEEP_QUOTE_CARRY_SECONDS", 180.0)
+# Wait this long after Fyers answers "rate limit" before sweeping again.
+SWEEP_RATE_LIMIT_BACKOFF_SECONDS = _env_float("SWEEP_RATE_LIMIT_BACKOFF_SECONDS", 120.0)
+# Saved scan result / insights file are rewritten at most this often (or when membership changes).
+SWEEP_SAVE_INTERVAL_SECONDS  = _env_float("SWEEP_SAVE_INTERVAL_SECONDS", 300.0)
+# While the sweep is healthy, breadth and signal prices come from it (0 extra Fyers calls).
+SWEEP_REUSE_FOR_BREADTH      = _env_bool("SWEEP_REUSE_FOR_BREADTH", True)
+SWEEP_REUSE_FOR_QUOTES       = _env_bool("SWEEP_REUSE_FOR_QUOTES", True)
+# One summary line in the log every N sweeps (problems are always logged at once).
+SWEEP_LOG_EVERY              = int(_env_float("SWEEP_LOG_EVERY", 10))
+# Shadow-mode comparison log (bounded; newest kept).
+SWEEP_SHADOW_LOG_FILE        = _persist("sweep_shadow_log.json")
+SWEEP_SHADOW_LOG_MAX         = int(_env_float("SWEEP_SHADOW_LOG_MAX", 300))
