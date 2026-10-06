@@ -141,3 +141,46 @@ Only these small files can live on a Railway Volume: `app_signals.json`, `app_le
 - First start on an empty volume: existing local copies of those files are copied in once (never overwriting what is already on the volume).
 - Everything else — `scan_results/`, `logs/`, `backtest_state.json`, caches, `.fyers_token`, `static/uploads/` — stays on the normal disk.
 - Code: `config/persistence.py`; paths wired in `config/settings.py`.
+
+## Live entry detection and the publication workflow
+
+**Nothing reaches app users automatically.** The system may *detect* things by itself and show them to the admin on the website; only an explicit, confirmed admin action publishes anything to the app or sends a phone notification.
+
+### Two sides with a wall between them
+
+- **Detection side (automatic, admin-only).** Once per trading day the daily history is downloaded and stored on the Volume (`data/history_store.py`). Every minute a *sweep* (`scanner/sweep.py`, about 10 Fyers requests through the shared pacer) reads the price list of all 500 stocks and adds today's live bar on top of the stored history. After each healthy live sweep, `scanner/entry_detect.py` checks (a) every armed admin signal's entry price and (b) the sweep's own scanner signals, and records each touch **once per day** in `entry_hits.json` (`data/entry_hits.py`). These modules never import the push modules or the app signals feed, and no app-facing endpoint reads the hit store.
+- **Publication side (manual).** The admin presses buttons on the website: *Publish to app*, *Send notification*, *Send update notification*, *Publish entry reached*, exit calls, custom messages. Every notification goes through one server-side guard (`alerts/manual_push.py`): admin login, explicit `confirm`, duplicate window, daily cap, per-day rule for entry-reached, audit log (`push_audit_log.json`). The only place the two sides meet is the admin's button press, which reads a hit and copies a few facts onto a signal.
+
+### Publication states
+
+A signal is **Draft** (admin only), **Published** (in the app feed) or **Hidden** (deactivated). New signals start as Draft. Legacy records without a `published` field count as Published. The app feed is decided on the server from the admin login, never from a client parameter. Saving or editing never notifies. Editing a Published signal changes what users see immediately (the website warns). Changing a signal's entry price or stock withdraws its published "entry reached" facts; unpublishing does too.
+
+### Where to look
+
+`GET /api/system/overview` (admin, signed in on the website): Fyers calls per minute, mode, history store, sweep timing, armed count, last hit, push summary, signal counts, and the size of every file this work added. `GET /api/status` has the basic health.
+
+### Settings (environment variables; all have safe defaults)
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `SWEEP_MODE` | off | `off` / `shadow` / `live`; detection needs `live` |
+| `SWEEP_INTERVAL_SECONDS` | 60 | Sweep interval (raise to 120 if CPU is high) |
+| `ENTRY_DETECTION_ENABLED` | false | Master switch for detection |
+| `ENTRY_SCANNER_STOCKS_ENABLED` | true | Also record scanner-signal hits |
+| `ENTRY_NOISE_UNTIL_TIME` | 09:15:30 | No detection before this IST time |
+| `ENTRY_EXTENDED_PCT` | 0.5 | % past the level that marks a hit "extended" |
+| `ENTRY_ARM_MAX_AGE_DAYS` | 10 | Admin signals are armed only this long |
+| `ENTRY_STORE_RETENTION_DAYS` | 7 | Days of hits kept |
+| `ENTRY_MAX_HITS_PER_DAY` | 200 | Cap on stored hits per day |
+| `ENTRY_ADMIN_EMAIL_ENABLED` / `ENTRY_ADMIN_EMAIL_MAX_PER_DAY` | false / 20 | Optional e-mail to the admin on a hit |
+| `ENTRY_EXACT_MINUTE_ENABLED` | false | One paced 1-minute call per admin hit for the exact minute |
+| `ENTRY_STALE_MINUTES` | 15 | Age after which publishing a hit needs an extra confirmation |
+| `PUSH_DAILY_MAX_MANUAL` | 30 | Daily cap on manual notifications |
+| `PUSH_DUPLICATE_WINDOW_SECONDS` | 60 | Same type + stock within this window is refused |
+| `PUSH_AUDIT_LOG_FILE` / `PUSH_AUDIT_LOG_MAX` | push_audit_log.json / 500 | Audit log file and entry cap |
+
+There is deliberately **no** setting that turns automatic publishing or automatic push on.
+
+### Rollback
+
+Turn detection off with `ENTRY_DETECTION_ENABLED=false` (hits stop; everything else is unchanged). `SWEEP_MODE=off` returns to the hourly scan only. Do **not** roll the backend code back below the publication gate once drafts exist: older code would show drafts to app users and push automatically. First publish or deactivate every draft.

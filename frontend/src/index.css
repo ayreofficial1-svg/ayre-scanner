@@ -1452,6 +1452,15 @@ tbody tr {
 }
 .check-row input { margin-top: 0.15rem; }
 
+.tag-hit {
+  font-family: var(--mono); font-size: 0.62rem;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  padding: 0.2rem 0.5rem; border-radius: 4px;
+  color: var(--green, #2ea043); border: 1px solid var(--green, #2ea043);
+}
+.hit-new { border-left: 3px solid var(--green, #2ea043); }
+.warn-list { margin: 0; padding-left: 1.1rem; font-family: var(--mono); font-size: 0.76rem; color: var(--text-main); }
+
 .warn-bar {
   padding: 0.75rem 1rem; margin-bottom: 1rem;
   border: 1px solid var(--border-hover); border-left: 3px solid var(--red);

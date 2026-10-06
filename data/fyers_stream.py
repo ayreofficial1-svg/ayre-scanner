@@ -9,7 +9,8 @@ Why a WebSocket instead of REST polling
 ────────────────────────────────────────
 - ONE persistent connection carries live ticks for every symbol this app
   needs: 3 index symbols + the deduplicated union of Nifty 50, Sensex 30
-  and Bank Nifty constituent equities (~140 unique symbols in practice).
+  and Bank Nifty constituent equities (about 64 symbols in practice: 3
+  indices + about 61 unique equities).
   Fyers caps Data WebSocket subscriptions at 200 symbols per connection
   ("Understanding Symbol Subscription Limit in Data WebSocket",
   support.fyers.in) — this app's whole universe fits comfortably under

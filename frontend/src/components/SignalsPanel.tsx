@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import type { SignalPick } from '../types'
+import type { SignalPick, SignalEntryState } from '../types'
 import { inr, pct } from '../utils'
 import StockPicker from './StockPicker'
 import { postGuarded, usePushStatus, whenIST } from '../pushApi'
@@ -30,6 +30,8 @@ function emptyForm() {
     stop_loss: '',
     enabled: true,
     live: false,   // editing a signal that app users currently see
+    reached: false, // ...and its "entry reached" fact is live in the app
+    entry_was: '',  // entry price when the edit started
   }
 }
 
@@ -51,6 +53,7 @@ export default function SignalsPanel() {
   const [notice, setNotice] = useState<string | null>(null)
   const [publishTarget, setPublishTarget] = useState<SignalPick | null>(null)
   const [alsoNotify, setAlsoNotify] = useState(false)
+  const [entryStates, setEntryStates] = useState<Record<string, SignalEntryState>>({})
   const { status: pushStatus, refresh: refreshPush } = usePushStatus()
 
   const load = async () => {
@@ -61,6 +64,10 @@ export default function SignalsPanel() {
       if (!res.ok) throw new Error(data.error || 'Failed to load signals')
       setSignals(data.signals)
       setError(null)
+      try {   // detection state is informational; never blocks the list
+        const r = await fetch('/api/entries/signal-states')
+        if (r.ok) setEntryStates((await r.json() as { states: Record<string, SignalEntryState> }).states)
+      } catch { /* ignore */ }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load signals')
     } finally {
@@ -81,6 +88,8 @@ export default function SignalsPanel() {
       stop_loss: signal.stop_loss != null ? String(signal.stop_loss) : '',
       enabled: signal.enabled ?? signal.active ?? true,
       live: signalState(signal) === 'Published',
+      reached: !!signal.entry_reached_at,
+      entry_was: signal.entry_price != null ? String(signal.entry_price) : '',
     })
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -252,6 +261,12 @@ export default function SignalsPanel() {
           This signal is live. Saving changes what app users see. No notification is sent.
         </div>
       )}
+      {form.id && form.reached && (
+        <div className="warn-bar">
+          "Entry reached" is live in the app for this signal. If you change the entry price or the stock,
+          it is withdrawn from the app at save time and entry detection starts again.
+        </div>
+      )}
       {!form.id && (
         <div className="notice-bar">
           New signals are saved as Drafts and are not visible in the app until you publish them.
@@ -344,6 +359,18 @@ export default function SignalsPanel() {
                 )}
                 {state === 'Published' && s.push_state?.changed_since && (
                   <span className="tag-changed">Changed since last notification</span>
+                )}
+                {entryStates[s.id]?.armed && (
+                  <span className="tag-sent">
+                    Armed · {entryStates[s.id].direction === 'up' ? 'waiting to rise to entry' : 'waiting to fall to entry'}
+                  </span>
+                )}
+                {entryStates[s.id]?.done && <span className="tag-disabled">Detection paused</span>}
+                {entryStates[s.id]?.hit && !s.entry_reached_at && (
+                  <span className="tag-hit">Entry hit {whenIST(entryStates[s.id].hit!.detected_at)}</span>
+                )}
+                {s.entry_reached_at && (
+                  <span className="tag-published">Entry reached live {whenIST(s.entry_reached_at)}</span>
                 )}
               </div>
               <div className="signal-row-prices">

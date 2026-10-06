@@ -140,6 +140,16 @@ def send_revised_signal(signal: dict, admin, confirm, send_again=False) -> dict:
     )
 
 
+def send_entry_reached(signal: dict, admin, confirm, send_again=False) -> dict:
+    symbol = str(signal.get("symbol") or "").strip().upper()
+    title, body = push.build_entry_reached_text(symbol)
+    return send_manual(
+        kind="entry_reached", key=symbol, title=title, body=body,
+        data={"type": "entry_reached", "symbol": symbol, "signal_id": signal.get("id")},
+        topic="signals", admin=admin, confirm=confirm, send_again=send_again,
+    )
+
+
 def send_exit(stock: str, profit: float, exit_price: float, admin, confirm, send_again=False) -> dict:
     title, body = push.build_exit_text(stock, profit, exit_price)
     return send_manual(

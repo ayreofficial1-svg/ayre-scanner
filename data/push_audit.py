@@ -111,3 +111,14 @@ def last_send(kind: str, key: str, within_seconds: float | None = None) -> dict 
                     return None
             return e
     return None
+
+
+def sent_today(kind: str, key: str) -> bool:
+    """True if a non-refused send of this type + key already happened today (IST)."""
+    today = ist_day()
+    with _lock:
+        return any(
+            e.get("day") == today and e.get("type") == kind and e.get("key") == key
+            and e.get("status") in ("sending", "done")
+            for e in _load()
+        )

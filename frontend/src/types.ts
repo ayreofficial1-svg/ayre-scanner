@@ -56,6 +56,10 @@ export interface SignalPick {
   published_by?: string | null
   // Manual-notification summary (admin view only).
   push_state?: SignalPushState
+  // Entry-reached facts (published by the admin; the app sees only these three).
+  entry_reached_at?: string | null
+  entry_reached_price?: number | null
+  entry_reached_extended?: boolean
   featured?: boolean
   pinned?: boolean
   display_order?: number
@@ -76,6 +80,49 @@ export interface SignalPushState {
   announced_at?: string | null
   update_sent_at?: string | null
   changed_since: boolean
+}
+
+// One detected entry hit (/api/entries/hits). Admin website only.
+export interface EntryHit {
+  id: string
+  day: string
+  kind: 'admin' | 'scanner'
+  symbol: string
+  signal_id?: string | null
+  level?: number | null
+  direction?: 'up' | 'down' | 'touch' | null
+  detected_at: string
+  exact_minute?: string | null
+  price_at_detection?: number | null
+  source?: string
+  extended?: boolean
+  late_start?: boolean
+  status: 'new' | 'reviewed' | 'dismissed' | 'draft_created' | 'entry_reached_published'
+  age_minutes: number | null
+  price_now?: number | null
+  now_extended_pct?: number | null
+  stale: boolean
+  stale_reasons: string[]
+  signal_state?: 'Draft' | 'Published' | 'Hidden'
+  entry_reached_live?: boolean
+  draft_signal_id?: string | null
+}
+
+export interface EntryHitsResponse {
+  hits: EntryHit[]
+  stale_minutes: number
+  market_open: boolean
+  detection: { enabled: boolean; armed_admin: number; armed_scanner: number; last_hit?: { symbol: string; at: string } | null }
+}
+
+// Per-signal detection state (/api/entries/signal-states). Admin only.
+export interface SignalEntryState {
+  armed: boolean
+  done: boolean
+  direction?: 'up' | 'down' | null
+  hit?: { id: string; status: string; detected_at: string; level?: number | null } | null
+  entry_reached_published: boolean
+  entry_reached_at?: string | null
 }
 
 // One row of the manual-send audit log (/api/push/status → audit).

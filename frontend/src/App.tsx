@@ -9,6 +9,7 @@ import ScanProgress from './components/ScanProgress'
 import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
 import SignalsPanel from './components/SignalsPanel'
+import EntryHitsPanel from './components/EntryHitsPanel'
 import ExitCallsPanel from './components/ExitCallsPanel'
 import NotificationsPanel from './components/NotificationsPanel'
 import MarketInsightPanel from './components/MarketInsightPanel'
@@ -592,6 +593,7 @@ export default function App() {
 
         {view === 'signals' && (
           <>
+            <EntryHitsPanel />
             <SignalsPanel />
             <ExitCallsPanel />
             <NotificationsPanel />

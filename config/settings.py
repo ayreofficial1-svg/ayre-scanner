@@ -433,3 +433,8 @@ ENTRY_ADMIN_EMAIL_MAX_PER_DAY = max(1, int(_env_float("ENTRY_ADMIN_EMAIL_MAX_PER
 # Optional: one paced 1-minute history call per admin-signal hit to record the exact touch minute.
 ENTRY_EXACT_MINUTE_ENABLED    = _env_bool("ENTRY_EXACT_MINUTE_ENABLED", False)
 ENTRY_HITS_FILE               = _persist("entry_hits.json")
+
+# ── Entry-reached publication (Phase 6) ──────────────────────────────────────
+# A hit older than this many minutes needs an extra "I understand" confirmation
+# before the admin may publish it as "entry reached".
+ENTRY_STALE_MINUTES           = max(1, int(_env_float("ENTRY_STALE_MINUTES", 15)))

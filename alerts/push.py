@@ -7,8 +7,13 @@ This is the phone-delivery counterpart of alerts/notify.py (terminal / sound /
 desktop / email). It is deliberately separate from fire_alert(): fire_alert
 reports the *raw scanner's* hits to the operator, whereas users of the app
 should only be pushed the picks an admin has curated and published — the
-same picks GET /api/signals serves. main.py therefore calls
-notify_new_signal() from the admin signal endpoints, not from the scan loop.
+same picks GET /api/signals serves.
+
+NOTHING in this module decides to send. The only caller of send_to_devices()
+is alerts/manual_push.py, which is reached only from admin website endpoints
+(explicit button + confirmation + server-side guard + audit log). The old
+fire-and-forget notify_*/broadcast helpers were removed in the final
+hardening phase so no automatic path can be wired back in by accident.
 
 Design rules
 ────────────
@@ -22,11 +27,11 @@ Design rules
 
 Notification kinds (the app tells them apart by data["type"])
 ─────────────────────────────────────────────────────────────
-  signal         notify_new_signal()      a newly published pick → opens Signals
-  signal_update  notify_revised_signal()  an already-announced pick changed
-                                          → opens Signals
-  exit           notify_exit()            exit call (stock, profit, exit price)
-                                          → opens the app's Alerts screen
+  signal         a published pick, announced by the admin → opens Signals
+  signal_update  an already-announced pick changed → opens Signals
+  entry_reached  a published pick reached its entry level → opens Signals
+  exit           exit call (stock, profit, exit price) → opens the Alerts screen
+  general        custom message from the Notifications panel
 
 Wording is plain and short: a 2-3 word heading, the stock, one short line.
 Each kind has a pool of variations; one is picked at random and never the
@@ -127,9 +132,8 @@ def send_to_devices(
     data: dict | None = None,
 ) -> dict:
     """
-    Send one notification to the given devices. Blocking — callers that sit on
-    a request thread should use the notify_*/broadcast helpers below, which
-    hand this off to a background thread.
+    Send one notification to the given devices. Blocking — alerts/manual_push.py
+    runs it on a background thread after its guard has approved the send.
 
     Returns {"attempted", "sent", "failed", "pruned"}.
     """
@@ -212,15 +216,6 @@ def send_to_devices(
     return result
 
 
-def _in_background(fn, *args, **kwargs) -> None:
-    def _run():
-        try:
-            fn(*args, **kwargs)
-        except Exception as e:      # never let a push problem surface anywhere
-            print(f"   ⚠️   Push: unexpected error — {e}")
-    threading.Thread(target=_run, daemon=True).start()
-
-
 # ── Wording ──────────────────────────────────────────────────────────────────
 
 _NEW_PICK = [
@@ -239,6 +234,12 @@ _REVISED = [
     ("Updated Signal", "Check the latest details."),
     ("Setup Updated",  "The setup has been updated."),
     ("Pick Updated",   "Open Signals for the change."),
+]
+
+_ENTRY_REACHED = [
+    ("Level Reached",       "has reached its entry level."),
+    ("Entry Level Reached", "touched its entry level."),
+    ("Entry Update",        "reached its entry level."),
 ]
 
 _EXIT_PROFIT = ["Book Profit", "Exit Signal", "Time to Exit", "Sell Signal", "Take Profit"]
@@ -279,6 +280,12 @@ def build_revised_signal_text(symbol: str) -> tuple[str, str]:
     return f"{heading}: {symbol}", line
 
 
+def build_entry_reached_text(symbol: str) -> tuple[str, str]:
+    """Informational wording only ("level reached"), never advice."""
+    heading, line = _pick("entry_reached", _ENTRY_REACHED)
+    return f"{heading}: {symbol}", f"{symbol} {line} Open Signals for details."
+
+
 def build_exit_text(stock: str, profit: float, exit_price: float) -> tuple[str, str]:
     loss = profit < 0
     heading = _pick("exit-loss" if loss else "exit", _EXIT_LOSS if loss else _EXIT_PROFIT)
@@ -287,103 +294,3 @@ def build_exit_text(stock: str, profit: float, exit_price: float) -> tuple[str, 
         f"{heading}: {stock}",
         f"{label} {format_rupees(abs(profit))} | Exit {format_rupees(exit_price)}",
     )
-
-
-# ── Public entry points ──────────────────────────────────────────────────────
-
-def notify_new_signal(signal: dict) -> None:
-    """
-    Push a newly published admin signal to every device that opted in to
-    signal alerts. Fire-and-forget: returns immediately.
-    """
-    if not is_configured():
-        return
-
-    symbol = str(signal.get("symbol") or "").strip().upper()
-    if not symbol:
-        return
-    title, body = build_new_signal_text(symbol)
-
-    _in_background(
-        lambda: send_to_devices(
-            list_devices(topic="signals"),
-            title=title,
-            body=body,
-            data={
-                "type"     : "signal",
-                "symbol"   : symbol,
-                "signal_id": signal.get("id"),
-            },
-        )
-    )
-
-
-def notify_revised_signal(signal: dict) -> None:
-    """
-    Push a separate "this pick changed" notification for a signal that was
-    already announced. Same audience as notify_new_signal. Fire-and-forget.
-    """
-    if not is_configured():
-        return
-
-    symbol = str(signal.get("symbol") or "").strip().upper()
-    if not symbol:
-        return
-    title, body = build_revised_signal_text(symbol)
-
-    _in_background(
-        lambda: send_to_devices(
-            list_devices(topic="signals"),
-            title=title,
-            body=body,
-            data={
-                "type"     : "signal_update",
-                "symbol"   : symbol,
-                "signal_id": signal.get("id"),
-            },
-        )
-    )
-
-
-def notify_exit(stock_name: str, profit: float, exit_price: float) -> None:
-    """
-    Push an exit call to every registered device. Fire-and-forget.
-
-    Only three values are needed: the stock name, the profit (negative for a
-    loss) and the exit price. The app shows it in its Alerts section and
-    tapping the notification opens that screen.
-    """
-    if not is_configured():
-        return
-
-    stock = " ".join(str(stock_name or "").split()).upper()
-    if not stock:
-        return
-    try:
-        profit = float(profit)
-        exit_price = float(exit_price)
-    except (TypeError, ValueError):
-        return
-    title, body = build_exit_text(stock, profit, exit_price)
-
-    _in_background(
-        lambda: send_to_devices(
-            list_devices(),
-            title=title,
-            body=body,
-            data={
-                "type"      : "exit",
-                "symbol"    : stock,
-                "profit"    : profit,
-                "exit_price": exit_price,
-            },
-        )
-    )
-
-
-def broadcast(title: str, body: str, data: dict | None = None) -> None:
-    """Push a custom message to every registered device. Fire-and-forget."""
-    if not is_configured():
-        return
-    payload = {"type": "general", **(data or {})}
-    _in_background(send_to_devices, list_devices(), title, body, payload)

@@ -91,7 +91,7 @@ from alerts import manual_push
 from data import push_audit
 from data.app_signals import (
     load_signals, add_signal, update_signal, delete_signal, set_published,
-    set_notification_state,
+    set_notification_state, set_entry_reached, ENTRY_REACHED_ADMIN_FIELDS,
 )
 from data.app_devices import (
     register_device, unregister_device, device_count,
@@ -1425,6 +1425,92 @@ def api_sweep_shadow():
     })
 
 
+def _dir_bytes(path: str) -> int:
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+@app.route("/api/system/overview", methods=["GET"])
+def api_system_overview():
+    """
+    Admin-only. ONE place for the whole picture: Fyers calls per minute, history
+    store, active mode and sweep timing, entry detection (armed, last hit),
+    push summary (from the audit log), publication counts and the size of every
+    file this work added. Read-only; sends nothing, changes nothing.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+
+    signals = load_signals()
+    counts = {"published": 0, "draft": 0, "hidden": 0, "entry_reached_live": 0}
+    for sg in signals:
+        if sg.get("enabled") is False or sg.get("active") is False:
+            counts["hidden"] += 1
+        elif sg.get("published"):
+            counts["published"] += 1
+        else:
+            counts["draft"] += 1
+        if sg.get("entry_reached_at"):
+            counts["entry_reached_live"] += 1
+
+    def _size(path):
+        try:
+            return round(os.path.getsize(path) / 1024, 1)
+        except OSError:
+            return None
+
+    try:
+        import psutil
+        mem_mb = round(psutil.Process(os.getpid()).memory_info().rss / 1_048_576, 1)
+    except Exception:
+        mem_mb = None
+
+    sweep_health = _sweep.health()
+    audit = push_audit.recent(5)
+    return jsonify({
+        "fyers": {
+            "calls_last_minute": sweep_health.get("fyers_calls_last_minute"),
+            "cap_per_minute": sweep_health.get("fyers_calls_per_minute_cap"),
+            "last_sweep_calls": sweep_health.get("last_sweep_calls"),
+        },
+        "mode": {
+            "sweep_mode": _cfg.SWEEP_MODE,
+            "serving_live": _sweep.serving_live(),
+            "entry_detection_enabled": bool(_cfg.ENTRY_DETECTION_ENABLED),
+            "live_feed_speedup": "not built (sweep-only detection)",
+        },
+        "history_store": history_store.health(),
+        "sweep": sweep_health,
+        "entry_detection": entry_detect.status(),
+        "push": {
+            "configured": push_alerts.is_configured(),
+            "devices": device_count(),
+            "sends_today": push_audit.sends_today(),
+            "daily_cap": _cfg.PUSH_DAILY_MAX_MANUAL,
+            "latest": audit,
+            "automatic_push": False,     # structural: no code path sends without an admin button
+        },
+        "signals": counts,
+        "storage_kb": {
+            "app_signals": _size(_cfg.APP_SIGNALS_FILE),
+            "entry_hits": _size(_cfg.ENTRY_HITS_FILE),
+            "push_audit_log": _size(_cfg.PUSH_AUDIT_LOG_FILE),
+            "alert_log": _size(_cfg.ALERT_LOG_FILE),
+            "scan_results_folder": round(_dir_bytes(_cfg.SCAN_RESULTS_DIR) / 1024, 1),
+        },
+        "memory_mb": mem_mb,
+    })
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry detection (Phase 5) — ADMIN ONLY.
 # None of these routes is in _APP_READABLE_RULES, so the mobile app can never
@@ -1461,25 +1547,65 @@ def api_entries_hits():
     signals = {s["id"]: s for s in load_signals()}
     with _sweep.lock:
         rows = dict(_sweep.rows)
-    now_ist = datetime.datetime.now(_IST)
     out = []
     for h in entry_hits.hits(days):
         row = rows.get(f"NSE:{h['symbol']}-EQ") or {}
         item = dict(h)
-        item["price_now"] = row.get("lp")
-        try:
-            at = datetime.datetime.fromisoformat(h["detected_at"])
-            item["age_minutes"] = max(0, int((now_ist - at).total_seconds() // 60))
-        except (KeyError, ValueError):
-            item["age_minutes"] = None
         sig = signals.get(h.get("signal_id") or "")
         if sig is not None:
             if sig.get("enabled") is False or sig.get("active") is False:
                 item["signal_state"] = "Hidden"
             else:
                 item["signal_state"] = "Published" if sig.get("published") else "Draft"
+            item["entry_reached_live"] = bool(
+                sig.get("entry_reached_at") and sig.get("entry_reached_hit_id") == h.get("id"))
+            item["signal_entry_price"] = sig.get("entry_price")
+        item.update(_entry_staleness(h, row))
         out.append(item)
-    return jsonify({"hits": out, "detection": entry_detect.status()})
+    return jsonify({
+        "hits": out, "detection": entry_detect.status(),
+        "stale_minutes": _cfg.ENTRY_STALE_MINUTES,
+        "market_open": _is_market_open(),
+    })
+
+
+def _entry_staleness(hit: dict, row: dict | None) -> dict:
+    """
+    How old a hit is and how far the price has run past its level (price from
+    the latest sweep — no Fyers call). Used by the hits list AND enforced by the
+    publish-entry-reached endpoint, so the website can only display what the
+    server will require.
+    """
+    out = {"age_minutes": None, "price_now": None, "now_extended_pct": None,
+           "stale": False, "stale_reasons": []}
+    try:
+        at = datetime.datetime.fromisoformat(hit["detected_at"])
+        out["age_minutes"] = max(0, int((datetime.datetime.now(_IST) - at).total_seconds() // 60))
+    except (KeyError, TypeError, ValueError):
+        pass
+    lp = (row or {}).get("lp")
+    out["price_now"] = lp
+    level, direction = hit.get("level"), hit.get("direction")
+    try:
+        if lp and level and direction in ("up", "down"):
+            level, lp = float(level), float(lp)
+            pct_past = (lp - level) / level * 100.0 if direction == "up" else (level - lp) / level * 100.0
+            out["now_extended_pct"] = round(max(pct_past, 0.0), 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    reasons = []
+    if out["age_minutes"] is not None and out["age_minutes"] > _cfg.ENTRY_STALE_MINUTES:
+        reasons.append(f"The level was reached {out['age_minutes']} minutes ago "
+                       f"(limit {_cfg.ENTRY_STALE_MINUTES}).")
+    if hit.get("extended"):
+        reasons.append("The price was already past the level when it was detected.")
+    if (out["now_extended_pct"] or 0) > _cfg.ENTRY_EXTENDED_PCT:
+        reasons.append(f"The price is now {out['now_extended_pct']}% past the level.")
+    if hit.get("late_start"):
+        reasons.append("Detection started late today, so the detection time is not the touch time.")
+    out["stale"] = bool(reasons)
+    out["stale_reasons"] = reasons
+    return out
 
 
 def _hit_status_change(hit_id: str, status: str):
@@ -1514,6 +1640,140 @@ def api_signals_rearm(signal_id: str):
         return jsonify({"error": "This signal is not armed (needs an entry price, enabled, "
                                  "and a sweep with detection on)."}), 409
     return jsonify({"rearmed": True, "id": signal_id})
+
+
+@app.route("/api/entries/signal-states", methods=["GET"])
+def api_entries_signal_states():
+    """
+    Admin-only. Per admin signal: is detection armed, its direction, today's hit
+    and whether entry-reached is published. Lives here (not in /api/signals) so
+    the app-facing signals feed never reads the entry-hit store.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    arms = entry_hits.arms_snapshot()
+    latest: dict[str, dict] = {}
+    for h in reversed(entry_hits.hits(1)):          # oldest first, newest wins
+        if h.get("signal_id"):
+            latest[h["signal_id"]] = h
+    out = {}
+    for s in load_signals():
+        sid = s["id"]
+        arm, hit = arms.get(sid), latest.get(sid)
+        if arm is None and hit is None and not s.get("entry_reached_at"):
+            continue
+        out[sid] = {
+            "armed": bool(arm and not arm.get("done") and arm.get("direction")),
+            "done": bool(arm and arm.get("done")),
+            "direction": (arm or {}).get("direction"),
+            "hit": ({"id": hit["id"], "status": hit.get("status"), "detected_at": hit.get("detected_at"),
+                     "level": hit.get("level")} if hit else None),
+            "entry_reached_published": bool(s.get("entry_reached_at")),
+            "entry_reached_at": s.get("entry_reached_at"),
+        }
+    return jsonify({"states": out})
+
+
+@app.route("/api/entries/hits/<string:hit_id>/publish-entry-reached", methods=["POST"])
+def api_entries_publish_reached(hit_id: str):
+    """
+    Admin-only. Publish "entry reached" for an ADMIN signal to the app, with an
+    optional phone notification (type "entry_reached"). Never automatic.
+
+    Body: {"confirm": true, "notify": false, "acknowledge_stale": false,
+           "send_again": false}
+    Rules: the signal must be Published and live; the hit must describe the
+    signal's current entry price; a stale / extended hit needs
+    "acknowledge_stale"; a notification is refused after the market close and
+    goes through the shared Phase 4 guard (duplicate window, one per signal per
+    day unless "send_again", daily cap, audit log). The fact is published first;
+    a refused notification never undoes it.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    payload = request.get_json(silent=True) or {}
+    if payload.get("confirm") is not True:
+        return jsonify({"error": "Confirmation required", "code": "confirm_required"}), 400
+    notify = payload.get("notify") is True
+    admin = session.get("username")
+
+    hit = entry_hits.get_hit(hit_id)
+    if hit is None:
+        return jsonify({"error": "Hit not found"}), 404
+    if hit.get("kind") != "admin" or not hit.get("signal_id"):
+        return jsonify({"error": "Only a hit on an admin signal can be published as entry reached. "
+                                 "For a scanner hit, create a draft signal first.",
+                        "code": "not_admin_hit"}), 409
+    signal = next((s for s in load_signals() if s.get("id") == hit["signal_id"]), None)
+    if signal is None:
+        return jsonify({"error": "The signal for this hit no longer exists.", "code": "no_signal"}), 404
+    if not push_is_live_signal(signal):
+        return jsonify({"error": "Publish the signal to the app first (it is a Draft, hidden or "
+                                 "outside its visibility window).", "code": "not_published"}), 409
+    try:
+        same_level = abs(float(signal.get("entry_price")) - float(hit.get("level"))) < 1e-9
+    except (TypeError, ValueError):
+        same_level = False
+    if not same_level or str(signal.get("symbol", "")).upper() != str(hit.get("symbol", "")).upper():
+        return jsonify({"error": "The signal's entry price was changed after this hit. "
+                                 "This hit describes the old level and cannot be published.",
+                        "code": "level_changed"}), 409
+
+    already = bool(signal.get("entry_reached_at") and signal.get("entry_reached_hit_id") == hit_id)
+    if already and not notify:
+        return jsonify({"signal": signal, "changed": False})
+
+    # Staleness (server-enforced; price from the sweep, no Fyers call)
+    with _sweep.lock:
+        row = dict(_sweep.rows.get(f"NSE:{hit['symbol']}-EQ") or {})
+    info = _entry_staleness(hit, row)
+    if info["stale"] and not already and payload.get("acknowledge_stale") is not True:
+        return jsonify({"error": "This hit is old or extended. Confirm \"I understand\" to publish it.",
+                        "code": "stale_ack_required", "reasons": info["stale_reasons"],
+                        "age_minutes": info["age_minutes"], "price_now": info["price_now"]}), 409
+    # Phone notifications are never sent after the close (checked BEFORE anything changes).
+    if notify and not _is_market_open():
+        return jsonify({"error": "The market is closed. A notification cannot be sent now; "
+                                 "you can still publish the fact without one.",
+                        "code": "market_closed"}), 409
+
+    entry = signal
+    if not already:
+        entry = set_entry_reached(signal["id"], {
+            "at": hit.get("exact_minute") or hit.get("detected_at"),
+            "price": hit.get("price_at_detection"),
+            "extended": bool(hit.get("extended")),
+            "level": hit.get("level"),
+            "hit_id": hit_id,
+            "by": admin,
+        })
+        if entry is None:
+            return jsonify({"error": "Signal not found"}), 404
+        entry_hits.set_status(hit_id, "entry_reached_published", admin)
+
+    notification = None
+    if notify:
+        key = str(entry.get("symbol") or "").strip().upper()
+        again = payload.get("send_again") is True
+        if push_audit.sent_today("entry_reached", key) and not again:
+            notification = {"ok": False, "code": "already_sent",
+                            "error": "An entry-reached notification for this stock was already sent today. "
+                                     "Confirm \"send again\" to repeat it."}
+        else:
+            try:
+                res = manual_push.send_entry_reached(entry, admin, True, send_again=again)
+                notification = {"ok": True, "audience": res["audience"]}
+            except manual_push.SendRefused as refused:
+                notification = {"ok": False, "code": refused.code, "error": refused.message,
+                                "status": refused.status}
+
+    print(f"   📣  Entry reached for {entry.get('symbol')} "
+          f"{'already published' if already else 'PUBLISHED to the app'} by {admin} — "
+          f"{('notification ' + ('sent' if notification and notification.get('ok') else 'not sent')) if notify else 'no notification requested'}")
+    body = {"signal": entry, "changed": not already, "stale": info["stale"]}
+    if notification is not None:
+        body["notification"] = notification
+    return jsonify(body)
 
 
 @app.route("/api/entries/hits/<string:hit_id>/create-draft", methods=["POST"])
@@ -1936,7 +2196,7 @@ _SIGNAL_ADMIN_ONLY_FIELDS = (
     "published", "published_at", "published_by", "unpublished_at",
     # Phase 4: manual-notification bookkeeping, admin website only.
     "notified_at", "notified_levels", "update_notified_at",
-)
+) + tuple(ENTRY_REACHED_ADMIN_FIELDS)   # Phase 6: only the public entry_reached_* facts reach the app
 
 
 def _signal_push_state(signal: dict) -> dict:

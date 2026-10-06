@@ -13,6 +13,7 @@ import { postGuarded, usePushStatus, whenIST } from '../pushApi'
 const TYPE_LABEL: Record<string, string> = {
   signal: 'New signal',
   signal_update: 'Signal update',
+  entry_reached: 'Entry reached',
   exit: 'Exit call',
   general: 'Custom message',
 }

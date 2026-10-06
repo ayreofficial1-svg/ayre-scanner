@@ -96,6 +96,18 @@ def is_visible(entry: dict, now: datetime.datetime | None = None) -> bool:
 _PUBLICATION_FIELDS = ("published", "published_at", "published_by", "unpublished_at")
 
 
+# Entry-reached publication (Phase 6). Only set_entry_reached() writes these;
+# a client save can never set them.
+#   public (shown in the app feed once published): entry_reached_at,
+#     entry_reached_price, entry_reached_extended
+#   admin only (stripped from the app feed): entry_reached_level,
+#     entry_reached_hit_id, entry_reached_by, entry_reached_published_at
+ENTRY_REACHED_PUBLIC_FIELDS = ("entry_reached_at", "entry_reached_price", "entry_reached_extended")
+ENTRY_REACHED_ADMIN_FIELDS = ("entry_reached_level", "entry_reached_hit_id",
+                              "entry_reached_by", "entry_reached_published_at")
+ENTRY_REACHED_FIELDS = ENTRY_REACHED_PUBLIC_FIELDS + ENTRY_REACHED_ADMIN_FIELDS
+
+
 def _is_published(entry: dict) -> bool:
     """Legacy records (no "published" field) count as Published."""
     value = entry.get("published")
@@ -110,7 +122,8 @@ def is_live(entry: dict, now: datetime.datetime | None = None) -> bool:
 
 
 def _without_publication_fields(fields: dict) -> dict:
-    return {k: v for k, v in fields.items() if k not in _PUBLICATION_FIELDS}
+    return {k: v for k, v in fields.items()
+            if k not in _PUBLICATION_FIELDS and k not in ENTRY_REACHED_FIELDS}
 
 
 def _normalize_signal(entry: dict) -> dict:
@@ -208,6 +221,15 @@ def add_signal(symbol: str, rationale: str, added_by: str, **fields) -> dict:
     return entry
 
 
+def _level_changed(before, after) -> bool:
+    a, b = _to_float_or_none(before), _to_float_or_none(after)
+    if a is None and b is None:
+        return False
+    if a is None or b is None:
+        return True
+    return abs(a - b) > 1e-9
+
+
 def update_signal(signal_id: str, **fields) -> dict | None:
     """Edit a signal. Never changes its publication state."""
     fields = _without_publication_fields(fields)
@@ -215,6 +237,14 @@ def update_signal(signal_id: str, **fields) -> dict | None:
     for idx, signal in enumerate(signals):
         if signal.get("id") == signal_id:
             updated = {**signal, **fields, "updated_at": _now_iso()}
+            # Edit rule (Phase 6): published entry-reached facts described the OLD
+            # level, so they are withdrawn from the app view at save time.
+            if signal.get("entry_reached_at") and (
+                _level_changed(signal.get("entry_price"), updated.get("entry_price"))
+                or str(updated.get("symbol") or "").strip().upper() != str(signal.get("symbol") or "").strip().upper()
+            ):
+                for k in ENTRY_REACHED_FIELDS:
+                    updated.pop(k, None)
             if "symbol" in fields:
                 updated["symbol"] = str(fields["symbol"]).strip().upper()
             if "enabled" in fields:
@@ -267,6 +297,9 @@ def set_published(signal_id: str, published: bool, by: str | None = None) -> dic
             updated.pop("unpublished_at", None)
         else:
             updated["unpublished_at"] = _now_iso()
+            # Unpublish rule (Phase 6): entry-reached facts leave with the signal.
+            for k in ENTRY_REACHED_FIELDS:
+                updated.pop(k, None)
         signals[idx] = _normalize_signal(updated)
         save_signals(signals)
         return signals[idx]
@@ -304,38 +337,29 @@ def set_notification_state(signal_id: str, kind: str) -> None:
         return
 
 
-def set_push_state(
-    signal_id: str,
-    *,
-    sent: bool | None = None,
-    pending: bool | None = None,
-) -> None:
+def set_entry_reached(signal_id: str, fields: dict | None) -> dict | None:
     """
-    Record push-notification bookkeeping on a signal:
-
-      push_sent_at  — set once the "new signal" push has gone out, so an edit
-                      or re-save can never announce the same pick twice.
-      push_pending  — the signal is enabled but scheduled for later
-                      (start_at in the future); the push loop in main.py
-                      sends it the moment it goes live.
-
-    Deliberately does NOT touch updated_at: this is bookkeeping, not an edit,
-    and bumping it would reorder the feed.
+    Publish (fields = {at, price, extended, level, hit_id, by}) or withdraw
+    (fields = None) the "entry reached" facts on a signal. Called only from an
+    admin endpoint. Bookkeeping only: does not touch updated_at, the
+    publication state, or send anything. Returns the signal or None.
     """
     signals = load_signals()
     for idx, signal in enumerate(signals):
         if signal.get("id") != signal_id:
             continue
         updated = dict(signal)
-        if sent is not None:
-            if sent:
-                updated["push_sent_at"] = _now_iso()
-                updated["push_pending"] = False
-            else:
-                updated.pop("push_sent_at", None)
-        if pending is not None:
-            updated["push_pending"] = bool(pending)
+        for k in ENTRY_REACHED_FIELDS:
+            updated.pop(k, None)
+        if fields:
+            updated["entry_reached_at"] = fields.get("at")
+            updated["entry_reached_price"] = fields.get("price")
+            updated["entry_reached_extended"] = bool(fields.get("extended"))
+            updated["entry_reached_level"] = fields.get("level")
+            updated["entry_reached_hit_id"] = fields.get("hit_id")
+            updated["entry_reached_by"] = fields.get("by") or "unknown"
+            updated["entry_reached_published_at"] = _now_iso()
         signals[idx] = _normalize_signal(updated)
         save_signals(signals)
-        return
-
+        return signals[idx]
+    return None
