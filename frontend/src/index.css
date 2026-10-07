@@ -1687,15 +1687,18 @@ tbody tr {
 .date-picker-clear-btn:hover { color: var(--red); }
 .date-picker-today-btn:disabled { color: var(--text-dim); cursor: not-allowed; }
 
-/* ── Entry hits rows (Signals > Entry hits). Look only; scoped to .eh-* ── */
+/* ── Entry hits rows (Signals > Entry hits). Look only; scoped to .eh-* ──
+   Two lines per stock: [symbol + tags ........ actions] then a full-width
+   metrics strip whose columns line up identically on every row. */
 .eh-list { border-top: 1px solid var(--border-hover); }
 
 .eh-row {
   display: grid;
-  grid-template-columns: minmax(200px, 270px) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "id actions" "metrics metrics";
   align-items: center;
-  gap: 1rem 2rem;
-  padding: 1.1rem 0.5rem 1.1rem 1.1rem;
+  gap: 0.9rem 1.5rem;
+  padding: 1.15rem 0.5rem 1.15rem 1.1rem;
   border-left: 2px solid transparent;
 }
 .eh-row:hover { background: var(--bg-surface); }
@@ -1707,42 +1710,50 @@ tbody tr {
   background: linear-gradient(90deg, var(--green-dim), var(--bg-surface) 60%);
 }
 
-.eh-id { display: flex; flex-direction: column; gap: 0.55rem; min-width: 0; }
+.eh-id {
+  grid-area: id; min-width: 0;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1rem;
+}
 .eh-sym {
   font-size: 1.3rem; font-weight: 600; line-height: 1.1;
   letter-spacing: -0.02em; color: var(--text-main);
-  overflow-wrap: anywhere;
 }
-.eh-tags { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.eh-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
 .eh-tags > span { white-space: nowrap; line-height: 1.3; }
 
-.eh-metrics {
-  display: grid;
-  grid-template-columns:
-    minmax(0, 1fr) minmax(0, 0.9fr) minmax(0, 1.35fr) minmax(0, 1fr)
-    minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.8fr);
-  gap: 0.9rem 1.25rem;
-  align-items: start;
-}
-.eh-metric { gap: 0.3rem; min-width: 0; }
-.eh-metric strong { white-space: nowrap; font-size: 0.8rem; }
-.eh-metric small { white-space: nowrap; }
-
 .eh-actions {
-  margin-left: 0;
-  justify-content: flex-end;
-  flex-wrap: nowrap;
-  min-width: 250px;
+  grid-area: actions; margin-left: 0;
+  justify-content: flex-end; flex-wrap: nowrap;
 }
 .eh-actions button { white-space: nowrap; }
 
-@media (max-width: 1280px) {
-  .eh-row { grid-template-columns: minmax(150px, 200px) minmax(0, 1fr); }
-  .eh-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .eh-actions { grid-column: 1 / -1; justify-content: flex-start; min-width: 0; }
+.eh-metrics {
+  grid-area: metrics;
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1fr)
+    minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.9rem 1.5rem;
+  align-items: start;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--border);
+}
+.eh-metric { gap: 0.35rem; min-width: 0; }
+.eh-metric small { white-space: nowrap; }
+.eh-metric strong {
+  white-space: nowrap; font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 1000px) {
+  .eh-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 640px) {
-  .eh-row { grid-template-columns: 1fr; padding-left: 0.85rem; }
+  .eh-row {
+    grid-template-columns: 1fr;
+    grid-template-areas: "id" "metrics" "actions";
+    padding-left: 0.85rem;
+  }
   .eh-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .eh-actions { flex-wrap: wrap; }
+  .eh-actions { flex-wrap: wrap; justify-content: flex-start; }
 }

@@ -62,7 +62,8 @@ export default function SignalsPanel() {
       const res  = await fetch('/api/signals?all=1')
       const data = await res.json() as { signals: SignalPick[]; error?: string }
       if (!res.ok) throw new Error(data.error || 'Failed to load signals')
-      setSignals(data.signals)
+      // Removed signals are only deactivated server-side; don't list them.
+      setSignals(data.signals.filter(s => s.active !== false))
       setError(null)
       try {   // detection state is informational; never blocks the list
         const r = await fetch('/api/entries/signal-states')

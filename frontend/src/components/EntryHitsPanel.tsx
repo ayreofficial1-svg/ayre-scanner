@@ -215,7 +215,6 @@ export default function EntryHitsPanel() {
                 </div>
                 <div className="eh-metrics">
                   <span className="price-tag eh-metric"><small>Level</small><strong>{h.level != null ? inr(h.level) : '—'}</strong></span>
-                  <span className="price-tag eh-metric"><small>Direction</small><strong>{h.direction === 'up' ? 'Rose to' : h.direction === 'down' ? 'Fell to' : 'Touch'}</strong></span>
                   <span className="price-tag eh-metric"><small>Reached</small><strong>{whenIST(h.exact_minute || h.detected_at)}</strong></span>
                   <span className="price-tag eh-metric">
                     <small>Age</small>
@@ -223,7 +222,6 @@ export default function EntryHitsPanel() {
                   </span>
                   <span className="price-tag eh-metric"><small>At detection</small><strong>{inr(h.price_at_detection)}</strong></span>
                   <span className="price-tag eh-metric"><small>Price now</small><strong>{inr(h.price_now)}</strong></span>
-                  <span className="price-tag eh-metric"><small>Source</small><strong>{h.source ?? '—'}</strong></span>
                 </div>
                 <div className="signal-row-actions eh-actions">
                   {h.kind === 'admin' && !h.entry_reached_live && h.status !== 'dismissed' && (
