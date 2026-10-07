@@ -10,6 +10,7 @@ import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
 import SignalsPanel from './components/SignalsPanel'
 import EntryHitsPanel from './components/EntryHitsPanel'
+import EntryHitsWatcher from './components/EntryHitsWatcher'
 import ExitCallsPanel from './components/ExitCallsPanel'
 import NotificationsPanel from './components/NotificationsPanel'
 import MarketInsightPanel from './components/MarketInsightPanel'
@@ -552,6 +553,7 @@ export default function App() {
           <div className="header-top">
             <h1>Ayre.</h1>
             <div className="header-right">
+              <EntryHitsWatcher onOpen={() => setView('signals')} />
               <Clock />
               <button className="theme-btn" onClick={toggleTheme}>{theme === 'dark' ? 'Light' : 'Dark'}</button>
               <button className="theme-btn" onClick={logout}>Logout</button>

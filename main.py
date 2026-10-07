@@ -1565,6 +1565,17 @@ def api_entries_hits():
             item["entry_reached_live"] = bool(
                 sig.get("entry_reached_at") and sig.get("entry_reached_hit_id") == h.get("id"))
             item["signal_entry_price"] = sig.get("entry_price")
+        # A scanner hit that was turned into a draft: report that draft's state. A draft
+        # that was removed (or hidden) frees the hit, so a new draft can be created.
+        draft_id = h.get("draft_signal_id")
+        if draft_id and h.get("kind") == "scanner":
+            dsig = signals.get(draft_id)
+            if dsig is None or dsig.get("enabled") is False or dsig.get("active") is False:
+                item["draft_removed"] = True
+                item["draft_signal_id"] = None
+            else:
+                item["draft_signal_state"] = "Published" if dsig.get("published") else "Draft"
+                item["signal_state"] = item["draft_signal_state"]
         item.update(_entry_staleness(h, row))
         out.append(item)
     return jsonify({
@@ -1630,8 +1641,46 @@ def api_entries_review(hit_id: str):
 
 @app.route("/api/entries/hits/<string:hit_id>/dismiss", methods=["POST"])
 def api_entries_dismiss(hit_id: str):
-    """Admin-only. Dismiss a hit. For an admin signal this also stops detection for it until re-armed or its entry price is edited."""
-    return _hit_status_change(hit_id, "dismissed")
+    """
+    Admin-only. Dismiss a hit. For an admin signal this also stops detection for it
+    until re-armed or its entry price is edited.
+
+    Scanner hit that was turned into a draft: dismissing dismisses only THAT draft.
+      * the draft is still an unpublished Draft -> it is hidden (deactivated, nothing
+        is sent, the app never saw it) and the hit is unlinked from it;
+      * the draft is already gone -> the hit is simply unlinked;
+      * the signal is Published (live in the app) -> it is left exactly as it is.
+    Once unlinked, "Create draft signal" is available again for this stock.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    hit = entry_hits.get_hit(hit_id)
+    if hit is None:
+        return jsonify({"error": "Hit not found"}), 404
+    admin = session.get("username")
+    linked = hit.get("draft_signal_id")
+    clear: tuple = ()
+    draft_removed = False
+    draft_left_live = False
+    if hit.get("kind") == "scanner" and linked:
+        sig = next((s for s in load_signals() if s.get("id") == linked), None)
+        active = sig is not None and sig.get("enabled") is not False and sig.get("active") is not False
+        if not active:
+            clear = ("draft_signal_id",)
+        elif not sig.get("published"):
+            delete_signal(linked)               # soft: hides the unpublished draft only
+            draft_removed = True
+            clear = ("draft_signal_id",)
+            print(f"   📝  Draft {hit.get('symbol')} removed by {admin} (hit dismissed) — nothing sent")
+        else:
+            draft_left_live = True              # live in the app: never touched by a dismiss
+    rec = entry_hits.set_status(
+        hit_id, "dismissed", admin, clear=clear,
+        last_draft_signal_id=(linked if clear else None),
+    )
+    if rec is None:
+        return jsonify({"error": "Hit not found"}), 404
+    return jsonify({"hit": rec, "draft_removed": draft_removed, "draft_left_live": draft_left_live})
 
 
 @app.route("/api/signals/<string:signal_id>/rearm", methods=["POST"])
@@ -1795,14 +1844,21 @@ def api_entries_create_draft(hit_id: str):
         return jsonify({"error": "Hit not found"}), 404
     if hit.get("kind") != "scanner":
         return jsonify({"error": "Only scanner hits can be turned into a draft signal."}), 409
-    if hit.get("draft_signal_id"):
-        return jsonify({"error": "A draft was already created from this hit."}), 409
+    linked = hit.get("draft_signal_id")
+    if linked:
+        existing = next((s for s in load_signals() if s.get("id") == linked), None)
+        if existing is not None and existing.get("enabled") is not False and existing.get("active") is not False:
+            return jsonify({"error": "This hit already has a signal in the Signals panel. "
+                                     "Dismiss the hit or remove that signal first to create a new draft.",
+                            "code": "draft_exists"}), 409
+        # the earlier draft was removed or hidden: a new one may be created
     level = hit.get("level")
     fields = {"enabled": True}
     if isinstance(level, (int, float)) and level > 0:
         fields["entry_price"] = round(float(level), 2)
     entry = add_signal(symbol=hit["symbol"], rationale="", added_by=session.get("username"), **fields)
-    entry_hits.set_status(hit_id, "draft_created", session.get("username"), draft_signal_id=entry["id"])
+    entry_hits.set_status(hit_id, "draft_created", session.get("username"), draft_signal_id=entry["id"],
+                          previous_draft_signal_id=linked)
     print(f"   📝  Draft signal created from scanner hit {hit['symbol']} by {session.get('username')} — Draft, nothing sent")
     return jsonify({"signal": entry}), 201
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { EntryHit, EntryHitsResponse } from '../types'
 import { inr } from '../utils'
 import { whenIST } from '../pushApi'
@@ -9,12 +9,12 @@ import { whenIST } from '../pushApi'
 // Lists the entry touches the backend detected by itself. Detection is
 // admin-only: nothing here reaches app users until you press a button and
 // confirm. The panel asks OUR backend every 12 s while the tab is visible
-// (never Fyers). Actions: Publish entry reached (admin signals), Create draft
+// (never Fyers). The beep, the sound switch and the tab-title counter live in
+// EntryHitsWatcher (page header, runs on every tab). Actions: Publish entry reached (admin signals), Create draft
 // signal (scanner hits), Dismiss, Re-arm.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const POLL_MS = 12000
-const BASE_TITLE = typeof document !== 'undefined' ? document.title : ''
 
 const STATUS_LABEL: Record<EntryHit['status'], string> = {
   new: 'New',
@@ -36,36 +36,15 @@ async function post(url: string, body: Record<string, unknown> = {}) {
   return { ok: res.ok, status: res.status, data }
 }
 
-function beep() {
-  try {
-    const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-    const ctx = new Ctx()
-    const osc = ctx.createOscillator()
-    const gain = ctx.createGain()
-    osc.frequency.value = 880
-    gain.gain.value = 0.08
-    osc.connect(gain)
-    gain.connect(ctx.destination)
-    osc.start()
-    osc.stop(ctx.currentTime + 0.25)
-    window.setTimeout(() => ctx.close().catch(() => {}), 500)
-  } catch { /* sound is optional */ }
-}
-
 export default function EntryHitsPanel() {
   const [data, setData] = useState<EntryHitsResponse | null>(null)
   const [days, setDays] = useState(1)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
-  const [sound, setSound] = useState(false)
-  const [unseen, setUnseen] = useState(0)
   const [target, setTarget] = useState<EntryHit | null>(null)
   const [alsoNotify, setAlsoNotify] = useState(false)
   const [understand, setUnderstand] = useState(false)
-  const seen = useRef<Set<string> | null>(null)
-  const soundRef = useRef(false)
-  soundRef.current = sound
 
   const load = useCallback(async () => {
     try {
@@ -74,18 +53,6 @@ export default function EntryHitsPanel() {
       if (!res.ok) throw new Error(body.error || 'Failed to load entry hits')
       setData(body)
       setError(null)
-
-      const ids = new Set(body.hits.map(h => h.id))
-      if (seen.current === null) {
-        seen.current = ids                       // first load: nothing counts as new
-      } else {
-        const fresh = body.hits.filter(h => !seen.current!.has(h.id) && h.status === 'new')
-        if (fresh.length) {
-          if (document.hidden) setUnseen(n => n + fresh.length)
-          if (soundRef.current) beep()
-        }
-        seen.current = ids
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load entry hits')
     }
@@ -94,18 +61,13 @@ export default function EntryHitsPanel() {
   useEffect(() => {
     load()
     const timer = window.setInterval(() => { if (!document.hidden) load() }, POLL_MS)
-    const onVisible = () => { if (!document.hidden) { setUnseen(0); load() } }
+    const onVisible = () => { if (!document.hidden) load() }
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', onVisible)
     }
   }, [load])
-
-  useEffect(() => {
-    document.title = unseen > 0 ? `(${unseen}) ${BASE_TITLE}` : BASE_TITLE
-    return () => { document.title = BASE_TITLE }
-  }, [unseen])
 
   const run = async (hit: EntryHit, fn: () => Promise<void>) => {
     if (busyId) return
@@ -215,15 +177,6 @@ export default function EntryHitsPanel() {
           <small>Market</small>
           <strong>{data ? (data.market_open ? 'Open' : 'Closed') : '—'}</strong>
         </span>
-        <label className="switch-field">
-          <input
-            type="checkbox"
-            checked={sound}
-            onChange={e => { setSound(e.target.checked); if (e.target.checked) beep() }}
-          />
-          <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>
-          <span className="switch-label">Sound on new hit</span>
-        </label>
         <select value={days} onChange={e => setDays(Number(e.target.value))} className="theme-btn">
           <option value={1}>Today</option>
           <option value={3}>Last 3 days</option>

@@ -160,8 +160,12 @@ def add_hit(hit: dict) -> dict | None:
     return result.get("rec")
 
 
-def set_status(hit_id: str, status: str, by: str | None, **extra) -> dict | None:
-    """Change a hit's admin status (and stop/continue detection for its signal)."""
+def set_status(hit_id: str, status: str, by: str | None, *, clear: tuple = (), **extra) -> dict | None:
+    """
+    Change a hit's admin status (and stop/continue detection for its signal).
+    `extra` values (when not None) are stored on the hit; field names in `clear`
+    are removed from it (used to unlink a draft signal so a new one can be made).
+    """
     if status not in VALID_STATUSES:
         return None
     result: dict = {}
@@ -174,6 +178,8 @@ def set_status(hit_id: str, status: str, by: str | None, **extra) -> dict | None
             h["status_at"] = now_ist_iso()
             h["status_by"] = by or "unknown"
             h.update({k: v for k, v in extra.items() if v is not None})
+            for field in clear:
+                h.pop(field, None)
             sid = h.get("signal_id")
             arm = state["arms"].get(sid) if sid else None
             if arm is not None and h.get("kind") == "admin":
