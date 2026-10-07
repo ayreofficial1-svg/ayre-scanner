@@ -1686,3 +1686,63 @@ tbody tr {
 .date-picker-today-btn:hover { color: var(--text-main); }
 .date-picker-clear-btn:hover { color: var(--red); }
 .date-picker-today-btn:disabled { color: var(--text-dim); cursor: not-allowed; }
+
+/* ── Entry hits rows (Signals > Entry hits). Look only; scoped to .eh-* ── */
+.eh-list { border-top: 1px solid var(--border-hover); }
+
+.eh-row {
+  display: grid;
+  grid-template-columns: minmax(200px, 270px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem 2rem;
+  padding: 1.1rem 0.5rem 1.1rem 1.1rem;
+  border-left: 2px solid transparent;
+}
+.eh-row:hover { background: var(--bg-surface); }
+.eh-row.hit-new {
+  border-left: 2px solid var(--green);
+  background: linear-gradient(90deg, var(--green-dim), transparent 45%);
+}
+.eh-row.hit-new:hover {
+  background: linear-gradient(90deg, var(--green-dim), var(--bg-surface) 60%);
+}
+
+.eh-id { display: flex; flex-direction: column; gap: 0.55rem; min-width: 0; }
+.eh-sym {
+  font-size: 1.3rem; font-weight: 600; line-height: 1.1;
+  letter-spacing: -0.02em; color: var(--text-main);
+  overflow-wrap: anywhere;
+}
+.eh-tags { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.eh-tags > span { white-space: nowrap; line-height: 1.3; }
+
+.eh-metrics {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr) minmax(0, 0.9fr) minmax(0, 1.35fr) minmax(0, 1fr)
+    minmax(0, 1fr) minmax(0, 1fr) minmax(0, 0.8fr);
+  gap: 0.9rem 1.25rem;
+  align-items: start;
+}
+.eh-metric { gap: 0.3rem; min-width: 0; }
+.eh-metric strong { white-space: nowrap; font-size: 0.8rem; }
+.eh-metric small { white-space: nowrap; }
+
+.eh-actions {
+  margin-left: 0;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+  min-width: 250px;
+}
+.eh-actions button { white-space: nowrap; }
+
+@media (max-width: 1280px) {
+  .eh-row { grid-template-columns: minmax(150px, 200px) minmax(0, 1fr); }
+  .eh-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .eh-actions { grid-column: 1 / -1; justify-content: flex-start; min-width: 0; }
+}
+@media (max-width: 640px) {
+  .eh-row { grid-template-columns: 1fr; padding-left: 0.85rem; }
+  .eh-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .eh-actions { flex-wrap: wrap; }
+}

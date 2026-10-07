@@ -192,14 +192,15 @@ export default function EntryHitsPanel() {
           {data.detection.enabled ? 'No entry hits yet.' : 'Entry detection is switched off on the server.'}
         </div>
       ) : (
-        <div className="signal-list">
+        <div className="signal-list eh-list">
           {hits.map(h => {
             const busy = busyId === h.id
             const done = h.status === 'dismissed' || h.status === 'entry_reached_published'
             return (
-              <div className={`signal-row${h.status === 'new' ? ' hit-new' : ''}`} key={h.id}>
-                <div className="signal-row-main">
-                  <span className="card-sym">{h.symbol}</span>
+              <div className={`signal-row eh-row${h.status === 'new' ? ' hit-new' : ''}`} key={h.id}>
+                <div className="eh-id">
+                  <span className="eh-sym">{h.symbol}</span>
+                  <div className="eh-tags">
                   <span className="tag-hit">{h.kind === 'admin' ? 'Admin signal' : 'Scanner'}</span>
                   <span className="tag-disabled">{STATUS_LABEL[h.status]}</span>
                   {h.signal_state && (
@@ -210,20 +211,21 @@ export default function EntryHitsPanel() {
                   {h.entry_reached_live && <span className="tag-published">Live in app</span>}
                   {h.extended && <span className="tag-changed">Extended</span>}
                   {h.late_start && <span className="tag-draft">Late start</span>}
+                  </div>
                 </div>
-                <div className="signal-row-prices">
-                  <span className="price-tag"><small>Level</small><strong>{h.level != null ? inr(h.level) : '—'}</strong></span>
-                  <span className="price-tag"><small>Direction</small><strong>{h.direction === 'up' ? 'Rose to' : h.direction === 'down' ? 'Fell to' : 'Touch'}</strong></span>
-                  <span className="price-tag"><small>Reached</small><strong>{whenIST(h.exact_minute || h.detected_at)}</strong></span>
-                  <span className="price-tag">
+                <div className="eh-metrics">
+                  <span className="price-tag eh-metric"><small>Level</small><strong>{h.level != null ? inr(h.level) : '—'}</strong></span>
+                  <span className="price-tag eh-metric"><small>Direction</small><strong>{h.direction === 'up' ? 'Rose to' : h.direction === 'down' ? 'Fell to' : 'Touch'}</strong></span>
+                  <span className="price-tag eh-metric"><small>Reached</small><strong>{whenIST(h.exact_minute || h.detected_at)}</strong></span>
+                  <span className="price-tag eh-metric">
                     <small>Age</small>
                     <strong>{h.age_minutes == null ? '—' : h.age_minutes < 1 ? 'just now' : `${h.age_minutes} min ago`}</strong>
                   </span>
-                  <span className="price-tag"><small>At detection</small><strong>{inr(h.price_at_detection)}</strong></span>
-                  <span className="price-tag"><small>Price now</small><strong>{inr(h.price_now)}</strong></span>
-                  <span className="price-tag"><small>Source</small><strong>{h.source ?? '—'}</strong></span>
+                  <span className="price-tag eh-metric"><small>At detection</small><strong>{inr(h.price_at_detection)}</strong></span>
+                  <span className="price-tag eh-metric"><small>Price now</small><strong>{inr(h.price_now)}</strong></span>
+                  <span className="price-tag eh-metric"><small>Source</small><strong>{h.source ?? '—'}</strong></span>
                 </div>
-                <div className="signal-row-actions">
+                <div className="signal-row-actions eh-actions">
                   {h.kind === 'admin' && !h.entry_reached_live && h.status !== 'dismissed' && (
                     <button className="rescan-btn" disabled={busy} onClick={() => openPublish(h)}>
                       {busy ? 'Working...' : 'Publish entry reached…'}
