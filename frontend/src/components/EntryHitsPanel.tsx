@@ -28,6 +28,16 @@ export interface DraftOpenRequest {
 
 const POLL_MS = 12000
 
+// "just now", "35m ago", "2h 05m ago"
+function ageLabel(minutes: number | null | undefined): string {
+  if (minutes == null) return '—'
+  if (minutes < 1) return 'just now'
+  if (minutes < 60) return `${minutes}m ago`
+  const h = Math.floor(minutes / 60)
+  const m = minutes % 60
+  return `${h}h ${String(m).padStart(2, '0')}m ago`
+}
+
 const STATUS_LABEL: Record<EntryHit['status'], string> = {
   new: 'New',
   reviewed: 'Reviewed',
@@ -107,17 +117,16 @@ export default function EntryHitsPanel({ onOpenDraft }: { onOpenDraft?: (request
   })
 
   const createDraft = (hit: EntryHit) => run(hit, async () => {
-    if (!window.confirm(`Create a Draft signal for ${hit.symbol}?\n\nIt is saved as a Draft with an entry range calculated from the latest price. It is not visible in the app and nothing is sent. You will be taken to the Notifications tab to review it, publish it and send the notification yourself.`)) return
     const { ok, data: d } = await post(`/api/entries/hits/${hit.id}/create-draft`)
     if (!ok) throw new Error(d.error || 'Failed to create draft')
     const signal = d.signal as { id?: string } | undefined
     const suggestion = (d.suggestion ?? null) as RangeSuggestion | null
-    await load()
     if (signal?.id && onOpenDraft) {
       onOpenDraft({ signalId: signal.id, symbol: hit.symbol, created: true, suggestion })
     } else {
-      setNotice(`Draft signal created for ${hit.symbol}. Find it under "Draft & publish signals" on the Notifications tab.`)
+      setNotice(`Draft created for ${hit.symbol}`)
     }
+    await load()
   })
 
   const openPublish = (hit: EntryHit) => {
@@ -176,7 +185,6 @@ export default function EntryHitsPanel({ onOpenDraft }: { onOpenDraft?: (request
     <div className="section">
       <div className="section-header">
         <div className="section-title">Entry hits</div>
-        <div className="section-sub">Detected automatically. Admin only. Nothing reaches the app until you publish it.</div>
       </div>
 
       {error && <div className="error-bar">{error}</div>}
@@ -236,7 +244,7 @@ export default function EntryHitsPanel({ onOpenDraft }: { onOpenDraft?: (request
                   <span className="price-tag eh-metric"><small>Reached</small><strong>{whenIST(h.exact_minute || h.detected_at)}</strong></span>
                   <span className="price-tag eh-metric">
                     <small>Age</small>
-                    <strong>{h.age_minutes == null ? '—' : h.age_minutes < 1 ? 'just now' : `${h.age_minutes} min ago`}</strong>
+                    <strong>{ageLabel(h.age_minutes)}</strong>
                   </span>
                   <span className="price-tag eh-metric"><small>At detection</small><strong>{inr(h.price_at_detection)}</strong></span>
                   <span className="price-tag eh-metric"><small>Price now</small><strong>{inr(h.price_now)}</strong></span>
@@ -286,7 +294,7 @@ export default function EntryHitsPanel({ onOpenDraft }: { onOpenDraft?: (request
               {target.entry_reached_live ? 'Send notification for' : 'Publish entry reached for'} {target.symbol}?
             </div>
             <p className="modal-text">
-              Level {inr(target.level)} was reached {target.age_minutes == null ? '' : target.age_minutes < 1 ? 'just now' : `${target.age_minutes} min ago`}
+              Level {inr(target.level)} was reached {target.age_minutes == null ? '' : ageLabel(target.age_minutes)}
               {' '}at {inr(target.price_at_detection)}. Price now {inr(target.price_now)}.
               {target.entry_reached_live ? '' : ' App users will see "entry reached" on this signal the next time they open Signals.'}
             </p>

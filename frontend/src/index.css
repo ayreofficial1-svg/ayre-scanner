@@ -1757,3 +1757,51 @@ tbody tr {
   .eh-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .eh-actions { flex-wrap: wrap; justify-content: flex-start; }
 }
+
+/* ── Draft & publish signals (Notifications tab). Look only; scoped to .sg-* ──
+   Entry/exit fields sit in a fixed 3-column grid; the signal lists are grouped
+   (Draft / Published / Hidden) and each row reuses the Entry hits row layout:
+   [symbol + tags ........ actions] then a metrics strip that lines up on every row. */
+.sg-form-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.sg-group { margin-bottom: 2rem; }
+.sg-group:last-child { margin-bottom: 0; }
+
+.sg-group-head {
+  display: flex; align-items: center; gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+.sg-group-title {
+  font-family: var(--mono); font-size: 0.72rem;
+  text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--text-muted);
+}
+.sg-group-count {
+  font-family: var(--mono); font-size: 0.65rem;
+  color: var(--text-dim);
+  border: 1px solid var(--border-hover); border-radius: 99px;
+  padding: 0.05rem 0.5rem;
+}
+
+.sg-metrics {
+  grid-template-columns:
+    minmax(0, 1.2fr) minmax(0, 1.5fr) minmax(0, 1fr)
+    minmax(0, 1.5fr) minmax(0, 1fr);
+}
+.sg-up   { color: var(--green); }
+.sg-down { color: var(--red); }
+
+@media (max-width: 1000px) {
+  .sg-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+  .sg-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  .sg-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 460px) {
+  .sg-form-grid { grid-template-columns: 1fr; }
+}

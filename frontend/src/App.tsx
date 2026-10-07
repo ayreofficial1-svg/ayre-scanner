@@ -213,10 +213,7 @@ export default function App() {
       id: request.signalId,
       nonce: Date.now(),
       suggestion: request.suggestion ?? null,
-      message: request.created
-        ? `Draft created for ${request.symbol}. The entry range below is calculated from the latest price — edit it if you like, `
-          + 'then use "Publish to app" and "Send notification". Nothing has been published or sent yet.'
-        : `Draft for ${request.symbol} opened. Review it, then use "Publish to app" and "Send notification".`,
+      message: request.created ? `Draft created for ${request.symbol}` : undefined,
     })
     setView('notifications')
     window.scrollTo({ top: 0 })

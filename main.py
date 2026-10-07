@@ -2141,7 +2141,7 @@ def _signal_price_fields(payload: dict) -> tuple[dict, str | None]:
     than silently dropping it.
     """
     fields: dict = {}
-    for key in ("entry_price", "exit_price", "stop_loss", "entry_low", "entry_high"):
+    for key in ("entry_price", "exit_price", "stop_loss", "entry_low", "entry_high", "exit_low", "exit_high"):
         if key not in payload:
             continue
         raw = payload.get(key)
@@ -2169,6 +2169,18 @@ def _signal_price_fields(payload: dict) -> tuple[dict, str | None]:
             if low > high:
                 return {}, "entry range low cannot be higher than the high"
             fields["entry_price"] = round((low + high) / 2.0, 2)
+
+    # Exit range: both ends or neither. Unlike the entry range, exit_price is NOT
+    # replaced by the middle — it stays the single price the admin entered.
+    if "exit_low" in fields or "exit_high" in fields:
+        low, high = fields.get("exit_low"), fields.get("exit_high")
+        if (low is None) != (high is None):
+            return {}, "exit range needs both a low and a high price"
+        if low is not None:
+            if low <= 0 or high <= 0:
+                return {}, "exit range prices must be greater than zero"
+            if low > high:
+                return {}, "exit range low cannot be higher than the high"
     return fields, None
 
 
@@ -2293,6 +2305,38 @@ def api_ranges_suggest():
         return jsonify({"error": f"No price is available for {symbol} right now. Enter the range by hand.",
                         "code": "no_price"}), 404
     return jsonify(suggestion)
+
+
+@app.route("/api/ranges/exit", methods=["GET"])
+def api_ranges_exit():
+    """
+    Website-only. Exit range around ONE exit price the admin typed, using exactly the
+    same rules as the exit range in /api/ranges/suggest (stock's ATR14, tick snapping,
+    always narrower than an entry range). ?symbol=RELIANCE&price=3050.
+    Response: {symbol, price, atr, basis, tick, exit: {low, high}}.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    symbol = " ".join(str(request.args.get("symbol", "")).split()).upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+    try:
+        price = float(request.args.get("price", ""))
+    except (TypeError, ValueError):
+        return jsonify({"error": "price must be numeric"}), 400
+    if not math.isfinite(price) or price <= 0:
+        return jsonify({"error": "price must be greater than zero"}), 400
+    suggestion = _suggest_ranges_for(symbol, price_override=price)
+    if suggestion is None:
+        return jsonify({"error": "Could not calculate an exit range. Enter it by hand."}), 404
+    return jsonify({
+        "symbol": symbol,
+        "price": suggestion["price"],
+        "atr": suggestion["atr"],
+        "basis": suggestion["basis"],
+        "tick": suggestion["tick"],
+        "exit": suggestion["exit"],
+    })
 
 
 @app.route("/api/uploads", methods=["POST"])
@@ -2536,6 +2580,18 @@ def api_signals_add():
     price_fields, price_err = _signal_price_fields(payload)
     if price_err:
         return jsonify({"error": price_err}), 400
+
+    # Safety net: an exit price saved without an exit range gets one calculated by the
+    # same rules (the website always sends the range it shows, so this rarely applies).
+    if (price_fields.get("exit_price") is not None
+            and "exit_low" not in payload and "exit_high" not in payload):
+        auto = _suggest_ranges_for(symbol, price_override=price_fields["exit_price"])
+        if auto is not None:
+            price_fields["exit_low"] = auto["exit"]["low"]
+            price_fields["exit_high"] = auto["exit"]["high"]
+    elif "exit_price" in price_fields and price_fields["exit_price"] is None:
+        price_fields["exit_low"] = None
+        price_fields["exit_high"] = None
 
     fields = {**_content_fields(payload), **price_fields}
     if signal_id:
@@ -2821,7 +2877,7 @@ def api_exits_delete(exit_id: str):
 _SIGNAL_REVISION_FIELDS = ("symbol", "entry_price", "exit_price", "stop_loss")
 # Range ends are compared only when the last notification recorded them, so signals
 # announced before ranges existed never show a false "changed since last notification".
-_SIGNAL_RANGE_FIELDS = ("entry_low", "entry_high")
+_SIGNAL_RANGE_FIELDS = ("entry_low", "entry_high", "exit_low", "exit_high")
 
 
 def _signal_was_revised(previous: dict | None, entry: dict) -> bool:

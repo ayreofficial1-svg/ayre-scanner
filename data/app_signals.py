@@ -19,6 +19,8 @@ Entry schema (JSON list, newest first)
       "entry_low"  : 2840.0,          # optional entry range; entry_price = its middle
       "entry_high" : 2860.0,
       "exit_price" : 3050.0,          # optional
+      "exit_low"   : 3045.0,          # optional exit range around exit_price
+      "exit_high"  : 3055.0,
       "stop_loss"  : 2760.0           # optional
     },
     ...
@@ -151,6 +153,9 @@ def _normalize_signal(entry: dict) -> dict:
         "entry_low": _to_float_or_none(entry.get("entry_low")),
         "entry_high": _to_float_or_none(entry.get("entry_high")),
         "exit_price": _to_float_or_none(entry.get("exit_price")),
+        # Exit range around exit_price (same rules as the exit alert's range).
+        "exit_low": _to_float_or_none(entry.get("exit_low")),
+        "exit_high": _to_float_or_none(entry.get("exit_high")),
         "stop_loss": _to_float_or_none(entry.get("stop_loss")),
     }
 
@@ -338,6 +343,8 @@ def set_notification_state(signal_id: str, kind: str) -> None:
             "entry_low": updated.get("entry_low"),
             "entry_high": updated.get("entry_high"),
             "exit_price": updated.get("exit_price"),
+            "exit_low": updated.get("exit_low"),
+            "exit_high": updated.get("exit_high"),
             "stop_loss": updated.get("stop_loss"),
         }
         signals[idx] = _normalize_signal(updated)

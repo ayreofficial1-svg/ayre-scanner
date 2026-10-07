@@ -61,7 +61,6 @@ export default function CustomMessagePanel({
     <div className="section" id="panel-custom-message">
       <div className="section-header">
         <div className="section-title">Custom message to phones</div>
-        <div className="section-sub">Every notification is sent by hand</div>
       </div>
 
       {error && <div className="error-bar">{error}</div>}
@@ -114,7 +113,7 @@ export default function CustomMessagePanel({
           </label>
         </div>
         <div className="clean-form-footer">
-          <span className="switch-label">Goes to every registered phone</span>
+          <span />
           <div className="clean-form-actions">
             <button className="rescan-btn" type="submit" disabled={submitting}>
               {submitting ? 'Sending...' : 'Send message'}

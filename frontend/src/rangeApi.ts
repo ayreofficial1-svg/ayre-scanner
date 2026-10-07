@@ -1,4 +1,4 @@
-import type { RangeSuggestion } from './types'
+import type { PriceRange, RangeSuggestion } from './types'
 import { inr } from './utils'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,6 +23,25 @@ export async function fetchRangeSuggestion(symbol: string): Promise<SuggestResul
     return { ok: true, suggestion: data as RangeSuggestion }
   } catch {
     return { ok: false, error: 'Could not calculate a range' }
+  }
+}
+
+export type ExitRangeResult =
+  | { ok: true; exit: PriceRange; atr: number; basis: 'atr14' | 'estimate' }
+  | { ok: false; error: string }
+
+/** Exit range around ONE exit price, by the same rules as the exit alert's range. */
+export async function fetchExitRange(symbol: string, price: number): Promise<ExitRangeResult> {
+  const sym = symbol.trim().toUpperCase()
+  if (!sym) return { ok: false, error: 'Pick a stock first' }
+  if (!Number.isFinite(price) || price <= 0) return { ok: false, error: 'Enter a valid exit price' }
+  try {
+    const res = await fetch(`/api/ranges/exit?symbol=${encodeURIComponent(sym)}&price=${encodeURIComponent(String(price))}`)
+    const data = await res.json().catch(() => ({})) as { exit?: PriceRange; atr?: number; basis?: 'atr14' | 'estimate'; error?: string }
+    if (!res.ok || !data.exit) return { ok: false, error: data.error || 'Could not calculate an exit range' }
+    return { ok: true, exit: data.exit, atr: data.atr ?? 0, basis: data.basis ?? 'estimate' }
+  } catch {
+    return { ok: false, error: 'Could not calculate an exit range' }
   }
 }
 

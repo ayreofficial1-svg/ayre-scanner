@@ -74,6 +74,8 @@ export interface SignalPick {
   entry_low?: number | null     // entry range, low end
   entry_high?: number | null    // entry range, high end
   exit_price?: number | null
+  exit_low?: number | null      // exit range around exit_price, low end
+  exit_high?: number | null     // exit range around exit_price, high end
   stop_loss?: number | null
 }
 

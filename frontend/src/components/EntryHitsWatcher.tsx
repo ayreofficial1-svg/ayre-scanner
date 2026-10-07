@@ -1,15 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { EntryHitsResponse } from '../types'
-import { beep, readSound, unlockAudio, writeSound } from '../entrySound'
+import {
+  beep, claimHits, readSound, startKeepAlive, startTicker, stopKeepAlive,
+  unlockAudio, unlockOnInteraction, writeSound,
+} from '../entrySound'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EntryHitsWatcher (admin only)
 //
 // Lives in the page header, so it keeps running on EVERY tab (Scanner, Backtest,
-// Signals ...). It asks OUR backend (never Fyers) every 12 s for today's entry
-// hits, beeps when a new one appears (if the sound switch is on), shows how many
-// are still "New", and puts an unseen counter in the browser tab title while the
-// tab is hidden. The sound choice is saved in this browser.
+// Signals ...) and does not depend on any panel being open. It asks OUR backend
+// (never Fyers) every 12 s for today's entry hits and sounds the alert once for each
+// hit it has not seen before (if the sound switch is on), shows how many are still
+// "New", and puts an unseen counter in the browser tab title while the tab is hidden.
+//
+// Background reliability (tab in the background or window minimized): the 12 s tick
+// runs in a Web Worker (not throttled like page timers), the audio engine is unlocked
+// on the first interaction and kept awake, and a Web Lock + inaudible audio stream stop
+// the browser from freezing the tab. Each hit id is sounded once, also across tabs.
 // The hit list and the action buttons stay in the Entry hits panel (Signals tab).
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -22,21 +30,27 @@ export default function EntryHitsWatcher({ onOpen }: { onOpen: () => void }) {
   const [unseen, setUnseen] = useState(0)
   const seen = useRef<Set<string> | null>(null)
   const soundRef = useRef(false)
+  const loading = useRef(false)
   soundRef.current = sound
 
-  // Sound restored after a refresh: unlock audio on the first click / key press.
+  // Sound on (also restored after a refresh): unlock audio on the first interaction and
+  // keep the tab awake while it stays on.
   useEffect(() => {
-    if (!sound) return
-    const unlock = () => unlockAudio()
-    window.addEventListener('pointerdown', unlock, { once: true })
-    window.addEventListener('keydown', unlock, { once: true })
+    if (!sound) { stopKeepAlive(); return }
+    const removeUnlock = unlockOnInteraction()
+    startKeepAlive()
+    const onVisible = () => { if (!document.hidden) { unlockAudio(); startKeepAlive() } }
+    document.addEventListener('visibilitychange', onVisible)
     return () => {
-      window.removeEventListener('pointerdown', unlock)
-      window.removeEventListener('keydown', unlock)
+      removeUnlock()
+      document.removeEventListener('visibilitychange', onVisible)
+      stopKeepAlive()
     }
   }, [sound])
 
   const load = useCallback(async () => {
+    if (loading.current) return
+    loading.current = true
     try {
       const res = await fetch('/api/entries/hits?days=1')
       if (!res.ok) return
@@ -44,29 +58,35 @@ export default function EntryHitsWatcher({ onOpen }: { onOpen: () => void }) {
       if (!body || !Array.isArray(body.hits)) return
       setNewCount(body.hits.filter(h => h.status === 'new').length)
 
-      const ids = new Set(body.hits.map(h => h.id))
       if (seen.current === null) {
-        seen.current = ids                       // first load: nothing counts as new
+        seen.current = new Set(body.hits.map(h => h.id))   // first load: nothing counts as new
       } else {
-        const fresh = body.hits.filter(h => !seen.current!.has(h.id) && h.status === 'new')
+        const known = seen.current
+        // Genuinely new = an id never seen before. A hit that is dismissed / reviewed
+        // later keeps its id, so it can never sound twice; a fresh entry event has a new id.
+        const fresh = body.hits.filter(h => !known.has(h.id) && h.status === 'new')
+        body.hits.forEach(h => known.add(h.id))
         if (fresh.length) {
           if (document.hidden) setUnseen(n => n + fresh.length)
-          if (soundRef.current) beep()
+          if (soundRef.current && claimHits(fresh.map(h => h.id))) beep()
         }
-        seen.current = ids
       }
     } catch { /* the next poll tries again */ }
+    finally { loading.current = false }
   }, [])
 
   useEffect(() => {
     load()
-    // Keeps polling when the tab is hidden too (browsers slow hidden tabs to about once a minute).
-    const timer = window.setInterval(load, POLL_MS)
+    // Worker-driven tick: keeps its pace while the tab is hidden or the window minimized.
+    const stopTicker = startTicker(load, POLL_MS)
     const onVisible = () => { if (!document.hidden) { setUnseen(0); load() } }
+    const onOnline = () => load()
     document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('online', onOnline)
     return () => {
-      window.clearInterval(timer)
+      stopTicker()
       document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('online', onOnline)
     }
   }, [load])
 
@@ -86,14 +106,14 @@ export default function EntryHitsWatcher({ onOpen }: { onOpen: () => void }) {
           {newCount} new hit{newCount === 1 ? '' : 's'}
         </button>
       )}
-      <label className="switch-field" title="Beep when a new entry hit is detected (works on every tab)">
+      <label className="switch-field" title="Sound when a new entry hit is detected (works on every tab, also in the background)">
         <input
           type="checkbox"
           checked={sound}
           onChange={e => {
             setSound(e.target.checked)
             writeSound(e.target.checked)
-            if (e.target.checked) { unlockAudio(); beep() }
+            if (e.target.checked) { unlockAudio(); startKeepAlive(); beep() }
           }}
         />
         <span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span>

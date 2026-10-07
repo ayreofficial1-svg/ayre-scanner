@@ -4,7 +4,7 @@ import type { SignalPick, SignalEntryState, RangeSuggestion } from '../types'
 import { inr, pct } from '../utils'
 import StockPicker from './StockPicker'
 import { postGuarded, usePushStatus, whenIST } from '../pushApi'
-import { fetchRangeSuggestion, priceText, rangeError, rangeLabel, suggestionNote } from '../rangeApi'
+import { fetchExitRange, fetchRangeSuggestion, priceText, rangeError, rangeLabel, suggestionNote } from '../rangeApi'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SignalsPanel — shown on the Notifications tab as "Draft & publish signals"
@@ -22,6 +22,10 @@ import { fetchRangeSuggestion, priceText, rangeError, rangeLabel, suggestionNote
 // "entry price" (used by entry detection and the app) equal to the middle of
 // the range.
 //
+// Exit range: type ONE exit price and the server works out the exit range around it
+// by the same rules as the exit alert's range (stock's own ATR14, tick snapping). Both
+// ends stay editable; typing a new exit price calculates a fresh range.
+//
 // Publication gate: a saved signal is a DRAFT (admin only). Only the
 // "Publish to app" button makes it visible to app users. Saving, editing and
 // publishing never send a notification. Phone notifications are separate,
@@ -36,6 +40,8 @@ function emptyForm() {
     entry_low: '',
     entry_high: '',
     exit_price: '',
+    exit_low: '',
+    exit_high: '',
     stop_loss: '',
     enabled: true,
     live: false,   // editing a signal that app users currently see
@@ -84,11 +90,16 @@ export default function SignalsPanel({
   const [suggestion, setSuggestion] = useState<RangeSuggestion | null>(null)
   const [suggestBusy, setSuggestBusy] = useState(false)
   const [suggestMsg, setSuggestMsg] = useState<string | null>(null)
+  const [exitBusy, setExitBusy] = useState(false)
+  const [exitMsg, setExitMsg] = useState<string | null>(null)
   const { status: pushStatus, refresh: refreshPush } = usePushStatus()
   const panelRef = useRef<HTMLDivElement>(null)
   const suggestSeq = useRef(0)         // invalidates an answer that arrives after the stock changed
   const rangeEdited = useRef(false)    // admin typed in the range: never overwrite it automatically
   const handledFocus = useRef(0)
+  const exitSeq = useRef(0)             // invalidates an exit-range answer that arrives late
+  const exitTimer = useRef<number | null>(null)
+  const exitEdited = useRef(false)      // admin typed in the exit range: not overwritten by a stock change
 
   const load = async () => {
     setLoading(true)
@@ -111,6 +122,7 @@ export default function SignalsPanel({
   }
 
   useEffect(() => { load() }, [])
+  useEffect(() => () => { if (exitTimer.current) window.clearTimeout(exitTimer.current) }, [])
 
   const clearSuggestion = () => {
     suggestSeq.current += 1
@@ -118,6 +130,11 @@ export default function SignalsPanel({
     setSuggestion(null)
     setSuggestMsg(null)
     setSuggestBusy(false)
+    exitSeq.current += 1
+    exitEdited.current = false
+    if (exitTimer.current) { window.clearTimeout(exitTimer.current); exitTimer.current = null }
+    setExitMsg(null)
+    setExitBusy(false)
   }
 
   const resetForm = () => {
@@ -141,6 +158,8 @@ export default function SignalsPanel({
       entry_low: priceText(low),
       entry_high: priceText(high),
       exit_price: signal.exit_price != null ? String(signal.exit_price) : '',
+      exit_low: priceText(signal.exit_low),
+      exit_high: priceText(signal.exit_high),
       stop_loss: signal.stop_loss != null ? String(signal.stop_loss) : '',
       enabled: signal.enabled ?? signal.active ?? true,
       live: signalState(signal) === 'Published',
@@ -148,6 +167,48 @@ export default function SignalsPanel({
       entry_was: signal.entry_price != null ? String(signal.entry_price) : '',
     })
     scrollToPanel()
+    // A signal saved before exit ranges existed: work the range out now, editable like any other.
+    if (signal.exit_price != null && (signal.exit_low == null || signal.exit_high == null)) {
+      requestExitRange(signal.symbol, String(signal.exit_price))
+    }
+  }
+
+  // Exit range around the single exit price the admin typed (same rules as the exit alert).
+  const requestExitRange = async (symbol: string, priceStr: string) => {
+    const sym = symbol.trim().toUpperCase()
+    const price = Number(priceStr)
+    if (!sym || priceStr.trim() === '' || !Number.isFinite(price) || price <= 0) return
+    const seq = ++exitSeq.current
+    setExitBusy(true)
+    setExitMsg(null)
+    const result = await fetchExitRange(sym, price)
+    if (seq !== exitSeq.current) return          // price / stock changed meanwhile
+    setExitBusy(false)
+    if (!result.ok) {
+      setExitMsg(result.error)
+      return
+    }
+    exitEdited.current = false
+    setForm(f => ({
+      ...f,
+      exit_low: priceText(result.exit.low),
+      exit_high: priceText(result.exit.high),
+    }))
+  }
+
+  // Typing a new exit price calculates a fresh range shortly after the admin stops typing.
+  const onExitPriceChange = (value: string) => {
+    if (exitTimer.current) { window.clearTimeout(exitTimer.current); exitTimer.current = null }
+    exitSeq.current += 1
+    if (value.trim() === '') {
+      setExitBusy(false)
+      setExitMsg(null)
+      setForm(f => ({ ...f, exit_price: value, exit_low: '', exit_high: '' }))
+      return
+    }
+    setForm(f => ({ ...f, exit_price: value }))
+    const symbol = form.symbol
+    exitTimer.current = window.setTimeout(() => requestExitRange(symbol, value), 450)
   }
 
   // Ask the server for an entry range from the latest price. `force` = the admin
@@ -208,7 +269,14 @@ export default function SignalsPanel({
     }
     const entry_low = numOrNull(form.entry_low)
     const entry_high = numOrNull(form.entry_high)
+    const exitProblem = rangeError('Exit range', form.exit_low, form.exit_high)
+    if (exitProblem) {
+      setError(exitProblem)
+      return
+    }
     const exit_price = numOrNull(form.exit_price)
+    const exit_low = exit_price === null ? null : numOrNull(form.exit_low)
+    const exit_high = exit_price === null ? null : numOrNull(form.exit_high)
     const stop_loss = numOrNull(form.stop_loss)
     if ([exit_price, stop_loss].some(v => v !== null && Number.isNaN(v))) {
       setError('Exit and stop loss must be numeric')
@@ -229,6 +297,8 @@ export default function SignalsPanel({
           entry_high,
           ...(entry_low === null ? { entry_price: null } : {}),
           exit_price,
+          // No exit range yet (calculation failed): leave it out and the server calculates it.
+          ...(exit_price === null || exit_low !== null ? { exit_low, exit_high } : {}),
           stop_loss,
         }),
       })
@@ -362,15 +432,121 @@ export default function SignalsPanel({
     }
   }
 
+  // One signal: [symbol + status tags ........ actions], then a metrics strip whose
+  // columns line up identically on every row (same look as the Entry hits rows).
+  const renderRow = (s: SignalPick) => {
+    const state = signalState(s)
+    const busy = busyId === s.id
+    const hasEntryRange = s.entry_low != null && s.entry_high != null
+    const hasExitRange = s.exit_low != null && s.exit_high != null
+    const up = (s.change_pct ?? 0) >= 0
+    return (
+      <div
+        className={`signal-row eh-row sg-row${state === 'Hidden' ? ' disabled' : ''}${highlightId === s.id ? ' hit-new' : ''}`}
+        key={s.id}
+      >
+        <div className="eh-id">
+          <span className="eh-sym">{s.symbol}</span>
+          <div className="eh-tags">
+            {state === 'Hidden' && <span className="tag-disabled">Hidden</span>}
+            {state === 'Draft' && <span className="tag-draft">Draft</span>}
+            {state === 'Published' && <span className="tag-published">Published</span>}
+            {state === 'Published' && s.push_state?.announced && (
+              <span className="tag-sent">
+                Notified{s.push_state.announced_at ? ` ${whenIST(s.push_state.announced_at)}` : ''}
+              </span>
+            )}
+            {state === 'Published' && s.push_state?.changed_since && (
+              <span className="tag-changed">Changed since last notification</span>
+            )}
+            {entryStates[s.id]?.armed && (
+              <span className="tag-sent">
+                Armed · {entryStates[s.id].direction === 'up' ? 'waiting to rise to entry' : 'waiting to fall to entry'}
+              </span>
+            )}
+            {entryStates[s.id]?.done && <span className="tag-disabled">Detection paused</span>}
+            {entryStates[s.id]?.hit && !s.entry_reached_at && (
+              <span className="tag-hit">Entry hit {whenIST(entryStates[s.id].hit!.detected_at)}</span>
+            )}
+            {s.entry_reached_at && (
+              <span className="tag-published">Entry reached live {whenIST(s.entry_reached_at)}</span>
+            )}
+          </div>
+        </div>
+
+        <div className="signal-row-actions eh-actions">
+          {state === 'Draft' && (
+            <button className="rescan-btn" disabled={busy} onClick={() => openPublish(s)}>
+              {busy ? 'Working...' : 'Publish to app'}
+            </button>
+          )}
+          {state === 'Published' && (
+            <button className="theme-btn" disabled={busy} onClick={() => unpublish(s)}>
+              {busy ? 'Working...' : 'Unpublish'}
+            </button>
+          )}
+          {state === 'Published' && !s.push_state?.announced && (
+            <button className="rescan-btn" disabled={busy} onClick={() => sendNotification(s, 'new')}>
+              Send notification
+            </button>
+          )}
+          {state === 'Published' && s.push_state?.announced && (
+            <button
+              className="theme-btn"
+              disabled={busy}
+              title="Already announced. Sends it again after an extra confirmation."
+              onClick={() => sendNotification(s, 'new', true)}
+            >
+              Send again
+            </button>
+          )}
+          {state === 'Published' && s.push_state?.announced && s.push_state.changed_since && (
+            <button className="rescan-btn" disabled={busy} onClick={() => sendNotification(s, 'update')}>
+              Send update notification
+            </button>
+          )}
+          <button className="theme-btn" onClick={() => editSignal(s)}>Edit</button>
+          <button className="theme-btn" onClick={() => removeSignal(s.id)}>Remove</button>
+        </div>
+
+        <div className="eh-metrics sg-metrics">
+          <span className="price-tag eh-metric">
+            <small>Last price</small>
+            <strong>
+              {inr(s.last_price)}
+              {s.change_pct != null && (
+                <span className={up ? 'sg-up' : 'sg-down'}> {pct(s.change_pct)}</span>
+              )}
+            </strong>
+          </span>
+          <PriceTag
+            label={hasEntryRange ? 'Entry range' : 'Entry'}
+            text={hasEntryRange ? rangeLabel(s.entry_low, s.entry_high) : undefined}
+            value={s.entry_price}
+          />
+          <PriceTag label="Exit price" value={s.exit_price} />
+          <PriceTag
+            label="Exit range"
+            text={hasExitRange ? rangeLabel(s.exit_low, s.exit_high) : undefined}
+          />
+          <PriceTag label="Stop loss" value={s.stop_loss} />
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="section" id="panel-draft-publish-signals" ref={panelRef}>
       <div className="section-header">
         <div className="section-title">Draft &amp; publish signals</div>
-        <div className="section-sub">Set the entry range, publish to the app, then send the notification</div>
       </div>
 
       {error && <div className="error-bar">{error}</div>}
-      {notice && <div className="notice-bar">{notice}</div>}
+      {notice && (
+        <div className="notice-bar">
+          {notice.startsWith('Draft created for ') ? <strong>{notice}</strong> : notice}
+        </div>
+      )}
       {form.id && form.live && (
         <div className="warn-bar">
           This signal is live. Saving changes what app users see. No notification is sent.
@@ -382,14 +558,9 @@ export default function SignalsPanel({
           it is withdrawn from the app at save time and entry detection starts again.
         </div>
       )}
-      {!form.id && (
-        <div className="notice-bar">
-          New signals are saved as Drafts and are not visible in the app until you publish them.
-        </div>
-      )}
 
       <form className="clean-form" onSubmit={addSignal}>
-        <div className="clean-form-grid">
+        <div className="clean-form-grid sg-form-grid">
           <StockPicker
             label="Stock"
             value={form.symbol}
@@ -397,8 +568,12 @@ export default function SignalsPanel({
               suggestSeq.current += 1     // an answer for the previous text is no longer wanted
               setForm(f => ({ ...f, symbol }))
             }}
-            // A new signal gets its entry range as soon as a stock is chosen.
-            onSelect={symbol => { if (!form.id) { rangeEdited.current = false; requestSuggestion(symbol, false) } }}
+            // A new signal gets its entry range as soon as a stock is chosen; an exit
+            // price already typed gets its range recalculated for the new stock.
+            onSelect={symbol => {
+              if (!form.id) { rangeEdited.current = false; requestSuggestion(symbol, false) }
+              if (form.exit_price.trim() !== '' && !exitEdited.current) requestExitRange(symbol, form.exit_price)
+            }}
             required
           />
           <label className="field">
@@ -427,8 +602,28 @@ export default function SignalsPanel({
               type="number"
               step="0.01"
               value={form.exit_price}
-              onChange={e => setForm(f => ({ ...f, exit_price: e.target.value }))}
+              onChange={e => onExitPriceChange(e.target.value)}
               placeholder="₹"
+            />
+          </label>
+          <label className="field">
+            <span>Exit range — from</span>
+            <input
+              type="number"
+              step="0.01"
+              value={form.exit_low}
+              onChange={e => { exitEdited.current = true; setForm(f => ({ ...f, exit_low: e.target.value })) }}
+              placeholder="₹ low"
+            />
+          </label>
+          <label className="field">
+            <span>Exit range — to</span>
+            <input
+              type="number"
+              step="0.01"
+              value={form.exit_high}
+              onChange={e => { exitEdited.current = true; setForm(f => ({ ...f, exit_high: e.target.value })) }}
+              placeholder="₹ high"
             />
           </label>
           <label className="field">
@@ -447,19 +642,26 @@ export default function SignalsPanel({
           <span className="switch-label">
             {suggestBusy
               ? 'Calculating the entry range from the latest price…'
-              : suggestMsg
-                ? suggestMsg
-                : suggestion
-                  ? suggestionNote(suggestion)
-                  : 'The entry range is filled in from the latest price when you pick a stock. Edit it freely.'}
+              : exitBusy
+                ? 'Calculating the exit range…'
+                : suggestMsg
+                  ? suggestMsg
+                  : exitMsg
+                    ? exitMsg
+                    : suggestion
+                      ? suggestionNote(suggestion)
+                      : ''}
           </span>
           <div className="clean-form-actions">
             <button
               type="button"
               className="theme-btn"
-              disabled={suggestBusy || !form.symbol.trim()}
-              title="Replace the range with a fresh one from the latest price"
-              onClick={() => requestSuggestion(form.symbol, true)}
+              disabled={suggestBusy || exitBusy || !form.symbol.trim()}
+              title="Replace the entry range with a fresh one from the latest price, and recalculate the exit range from the exit price"
+              onClick={() => {
+                requestSuggestion(form.symbol, true)
+                if (form.exit_price.trim() !== '') requestExitRange(form.symbol, form.exit_price)
+              }}
             >
               Recalculate from live price
             </button>
@@ -491,91 +693,33 @@ export default function SignalsPanel({
       ) : signals.length === 0 ? (
         <div className="empty-state">No signals yet. Add your first stock above.</div>
       ) : (
-        <div className="signal-list">
-          {signals.map(s => {
-            const state = signalState(s)
-            const busy = busyId === s.id
+        <>
+          {([
+            ['Draft', 'Draft signals'],
+            ['Published', 'Published signals'],
+            ['Hidden', 'Hidden signals'],
+          ] as const).map(([group, title]) => {
+            const rows = signals.filter(sig => signalState(sig) === group)
+            if (rows.length === 0 && group === 'Hidden') return null
             return (
-            <div
-              className={`signal-row${state === 'Hidden' ? ' disabled' : ''}${highlightId === s.id ? ' hit-new' : ''}`}
-              key={s.id}
-            >
-              <div className="signal-row-main">
-                <span className="card-sym">{s.symbol}</span>
-                <span className={`card-val ${(s.change_pct ?? 0) >= 0 ? 'g' : 'r'}`}>
-                  {inr(s.last_price)} · {pct(s.change_pct)}
-                </span>
-                {state === 'Hidden' && <span className="tag-disabled">Hidden</span>}
-                {state === 'Draft' && <span className="tag-draft">Draft</span>}
-                {state === 'Published' && <span className="tag-published">Published</span>}
-                {state === 'Published' && s.push_state?.announced && (
-                  <span className="tag-sent">
-                    Notified{s.push_state.announced_at ? ` ${whenIST(s.push_state.announced_at)}` : ''}
-                  </span>
-                )}
-                {state === 'Published' && s.push_state?.changed_since && (
-                  <span className="tag-changed">Changed since last notification</span>
-                )}
-                {entryStates[s.id]?.armed && (
-                  <span className="tag-sent">
-                    Armed · {entryStates[s.id].direction === 'up' ? 'waiting to rise to entry' : 'waiting to fall to entry'}
-                  </span>
-                )}
-                {entryStates[s.id]?.done && <span className="tag-disabled">Detection paused</span>}
-                {entryStates[s.id]?.hit && !s.entry_reached_at && (
-                  <span className="tag-hit">Entry hit {whenIST(entryStates[s.id].hit!.detected_at)}</span>
-                )}
-                {s.entry_reached_at && (
-                  <span className="tag-published">Entry reached live {whenIST(s.entry_reached_at)}</span>
+              <div className="sg-group" key={group}>
+                <div className="sg-group-head">
+                  <span className="sg-group-title">{title}</span>
+                  <span className="sg-group-count">{rows.length}</span>
+                </div>
+                {rows.length === 0 ? (
+                  <div className="empty-state">
+                    {group === 'Draft' ? 'No drafts waiting.' : 'Nothing is published to the app.'}
+                  </div>
+                ) : (
+                  <div className="signal-list eh-list">
+                    {rows.map(sig => renderRow(sig))}
+                  </div>
                 )}
               </div>
-              <div className="signal-row-prices">
-                <PriceTag
-                  label={s.entry_low != null && s.entry_high != null ? 'Entry range' : 'Entry'}
-                  text={s.entry_low != null && s.entry_high != null ? rangeLabel(s.entry_low, s.entry_high) : undefined}
-                  value={s.entry_price}
-                />
-                <PriceTag label="Exit" value={s.exit_price} />
-                <PriceTag label="Stop loss" value={s.stop_loss} />
-              </div>
-              <div className="signal-row-actions">
-                {state === 'Draft' && (
-                  <button className="rescan-btn" disabled={busy} onClick={() => openPublish(s)}>
-                    {busy ? 'Working...' : 'Publish to app'}
-                  </button>
-                )}
-                {state === 'Published' && (
-                  <button className="theme-btn" disabled={busy} onClick={() => unpublish(s)}>
-                    {busy ? 'Working...' : 'Unpublish'}
-                  </button>
-                )}
-                {state === 'Published' && !s.push_state?.announced && (
-                  <button className="rescan-btn" disabled={busy} onClick={() => sendNotification(s, 'new')}>
-                    Send notification
-                  </button>
-                )}
-                {state === 'Published' && s.push_state?.announced && (
-                  <button
-                    className="theme-btn"
-                    disabled={busy}
-                    title="Already announced. Sends it again after an extra confirmation."
-                    onClick={() => sendNotification(s, 'new', true)}
-                  >
-                    Send again
-                  </button>
-                )}
-                {state === 'Published' && s.push_state?.announced && s.push_state.changed_since && (
-                  <button className="rescan-btn" disabled={busy} onClick={() => sendNotification(s, 'update')}>
-                    Send update notification
-                  </button>
-                )}
-                <button className="theme-btn" onClick={() => editSignal(s)}>Edit</button>
-                <button className="theme-btn" onClick={() => removeSignal(s.id)}>Remove</button>
-              </div>
-            </div>
             )
           })}
-        </div>
+        </>
       )}
 
       {publishTarget && (
@@ -618,7 +762,7 @@ export default function SignalsPanel({
 
 function PriceTag({ label, value, text }: { label: string; value?: number | null; text?: string }) {
   return (
-    <span className="price-tag">
+    <span className="price-tag eh-metric">
       <small>{label}</small>
       <strong>{text ?? (value != null ? inr(value) : '—')}</strong>
     </span>

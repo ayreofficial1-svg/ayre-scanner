@@ -160,7 +160,6 @@ export default function ExitCallsPanel({ onPushActivity }: { onPushActivity?: ()
     <div className="section" id="panel-send-exit-alert">
       <div className="section-header">
         <div className="section-title">Send exit alert</div>
-        <div className="section-sub">Goes to every phone and the app's Alerts</div>
       </div>
 
       {error && <div className="error-bar">{error}</div>}
@@ -224,7 +223,7 @@ export default function ExitCallsPanel({ onPushActivity }: { onPushActivity?: ()
                 ? suggestMsg
                 : suggestion
                   ? suggestionNote(suggestion)
-                  : 'The exit range is filled in from the latest price when you pick a stock. It is tighter than an entry range. Edit it freely.'}
+                  : ''}
           </span>
           <div className="clean-form-actions">
             <button
