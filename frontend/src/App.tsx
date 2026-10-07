@@ -8,17 +8,16 @@ import ScanRing from './components/ScanRing'
 import ScanProgress from './components/ScanProgress'
 import SignalCard from './components/SignalCard'
 import WatchlistTable from './components/WatchlistTable'
-import SignalsPanel from './components/SignalsPanel'
 import EntryHitsPanel from './components/EntryHitsPanel'
+import type { DraftOpenRequest } from './components/EntryHitsPanel'
 import EntryHitsWatcher from './components/EntryHitsWatcher'
-import ExitCallsPanel from './components/ExitCallsPanel'
-import NotificationsPanel from './components/NotificationsPanel'
-import MarketInsightPanel from './components/MarketInsightPanel'
+import NotificationsTab from './components/NotificationsTab'
+import type { SignalFocus } from './components/SignalsPanel'
 import LearnPanel from './components/LearnPanel'
 import WeeklyReportPanel from './components/WeeklyReportPanel'
 import DatePicker from './components/DatePicker'
 
-type View = 'scanner' | 'backtest' | 'signals' | 'insights' | 'learn' | 'weeklyReport'
+type View = 'scanner' | 'backtest' | 'signals' | 'notifications' | 'learn' | 'weeklyReport'
 type AuthState = 'checking' | 'authenticated' | 'login'
 type BacktestFilter = 'all' | 'signal' | 'watchlist' | 'none' | 'no_data'
 type TradeReadyTimes = Record<string, string>
@@ -179,6 +178,9 @@ export default function App() {
   const [theme, setTheme]           = useState<string>(() => localStorage.getItem('theme') ?? 'dark')
   const [auth, setAuth]             = useState<AuthState>('checking')
   const [view, setView]             = useState<View>('scanner')
+  // Set when "Draft signal" (or "Open draft") is pressed on an Entry hit: the
+  // Notifications tab opens that draft in its "Draft & publish signals" panel.
+  const [signalFocus, setSignalFocus] = useState<SignalFocus | null>(null)
   const [state, setState]           = useState<ScanState>(DEFAULT_STATE)
   const [tradeReadyTimes, setTradeReadyTimes] = useState<TradeReadyTimes>(loadTradeReadyTimes)
   const [backtestDate, setBacktestDate] = useState(todayIso)
@@ -204,6 +206,21 @@ export default function App() {
   }, [theme])
 
   const toggleTheme = () => setTheme(t => t === 'dark' ? 'light' : 'dark')
+
+  // Take the admin straight to the draft, ready to review, publish and announce.
+  const openDraft = useCallback((request: DraftOpenRequest) => {
+    setSignalFocus({
+      id: request.signalId,
+      nonce: Date.now(),
+      suggestion: request.suggestion ?? null,
+      message: request.created
+        ? `Draft created for ${request.symbol}. The entry range below is calculated from the latest price — edit it if you like, `
+          + 'then use "Publish to app" and "Send notification". Nothing has been published or sent yet.'
+        : `Draft for ${request.symbol} opened. Review it, then use "Publish to app" and "Send notification".`,
+    })
+    setView('notifications')
+    window.scrollTo({ top: 0 })
+  }, [])
 
   const checkAuth = useCallback(async () => {
     try {
@@ -580,7 +597,7 @@ export default function App() {
             <button className={view === 'scanner'   ? 'active' : ''} onClick={() => setView('scanner')}>Scanner</button>
             <button className={view === 'backtest'  ? 'active' : ''} onClick={() => setView('backtest')}>Backtest</button>
             <button className={view === 'signals'   ? 'active' : ''} onClick={() => setView('signals')}>Signals</button>
-            <button className={view === 'insights' ? 'active' : ''} onClick={() => setView('insights')}>Market Insight</button>
+            <button className={view === 'notifications' ? 'active' : ''} onClick={() => setView('notifications')}>Notifications</button>
             <button className={view === 'learn'     ? 'active' : ''} onClick={() => setView('learn')}>Learn</button>
             <button className={view === 'weeklyReport' ? 'active' : ''} onClick={() => setView('weeklyReport')}>Weekly Report</button>
           </nav>
@@ -593,15 +610,10 @@ export default function App() {
           )}
         </header>
 
-        {view === 'signals' && (
-          <>
-            <EntryHitsPanel />
-            <SignalsPanel />
-            <ExitCallsPanel />
-            <NotificationsPanel />
-          </>
+        {view === 'signals' && <EntryHitsPanel onOpenDraft={openDraft} />}
+        {view === 'notifications' && (
+          <NotificationsTab focus={signalFocus} onFocusDone={() => setSignalFocus(null)} />
         )}
-        {view === 'insights' && <MarketInsightPanel />}
         {view === 'learn' && <LearnPanel />}
         {view === 'weeklyReport' && <WeeklyReportPanel />}
 

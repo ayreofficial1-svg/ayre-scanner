@@ -70,7 +70,9 @@ export interface SignalPick {
   tags?: string[]
   last_price?: number | null
   change_pct?: number | null
-  entry_price?: number | null
+  entry_price?: number | null   // always the middle of the entry range when a range is set
+  entry_low?: number | null     // entry range, low end
+  entry_high?: number | null    // entry range, high end
   exit_price?: number | null
   stop_loss?: number | null
 }
@@ -156,7 +158,9 @@ export interface ExitCall {
   id: string
   symbol: string
   profit: number
-  exit_price: number
+  exit_price: number        // the middle of the range when a range was sent
+  exit_low?: number | null  // exit range, low end
+  exit_high?: number | null // exit range, high end
   created_at: string
   added_by?: string | null
 }
@@ -336,4 +340,25 @@ export interface ScanProgressInfo {
 export interface ScanProgressResponse {
   live: ScanProgressInfo
   backtest: ScanProgressInfo
+}
+
+// Suggested entry / exit ranges for one stock (/api/ranges/suggest). Admin only.
+// Calculated from the latest fetched price and the stock's own ATR14; the exit
+// range is always narrower than the entry range. Only a starting point.
+export interface PriceRange {
+  low: number
+  high: number
+}
+
+export interface RangeSuggestion {
+  symbol: string
+  price: number
+  price_source: 'sweep' | 'quotes' | 'fyers' | 'last_close' | 'given'
+  live: boolean            // false = market closed / last close
+  as_of: string
+  atr: number
+  basis: 'atr14' | 'estimate'
+  tick: number
+  entry: PriceRange
+  exit: PriceRange
 }

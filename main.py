@@ -78,6 +78,7 @@ from scanner.watchlist import (
 from scanner.engine import run_scan
 from scanner import sweep as sweep_mod
 from scanner import entry_detect
+from scanner.trade_range import suggest_ranges, atr14_from_frame
 from data import entry_hits
 from scanner.sweep import RUNTIME as _sweep
 from scanner.historical import (
@@ -1854,13 +1855,21 @@ def api_entries_create_draft(hit_id: str):
         # the earlier draft was removed or hidden: a new one may be created
     level = hit.get("level")
     fields = {"enabled": True}
-    if isinstance(level, (int, float)) and level > 0:
+    # Entry range from the latest fetched price (and the stock's own ATR14). It is only a
+    # starting point: the admin edits it on the Notifications tab before publishing. If no
+    # price is available, fall back to the old behaviour (the scanner's SMA44 level).
+    suggestion = _suggest_ranges_for(hit["symbol"])
+    if suggestion is not None:
+        fields["entry_low"] = suggestion["entry"]["low"]
+        fields["entry_high"] = suggestion["entry"]["high"]
+        fields["entry_price"] = round((fields["entry_low"] + fields["entry_high"]) / 2.0, 2)
+    elif isinstance(level, (int, float)) and level > 0:
         fields["entry_price"] = round(float(level), 2)
     entry = add_signal(symbol=hit["symbol"], rationale="", added_by=session.get("username"), **fields)
     entry_hits.set_status(hit_id, "draft_created", session.get("username"), draft_signal_id=entry["id"],
                           previous_draft_signal_id=linked)
     print(f"   📝  Draft signal created from scanner hit {hit['symbol']} by {session.get('username')} — Draft, nothing sent")
-    return jsonify({"signal": entry}), 201
+    return jsonify({"signal": entry, "suggestion": suggestion}), 201
 
 
 @app.route("/api/market")
@@ -2132,7 +2141,7 @@ def _signal_price_fields(payload: dict) -> tuple[dict, str | None]:
     than silently dropping it.
     """
     fields: dict = {}
-    for key in ("entry_price", "exit_price", "stop_loss"):
+    for key in ("entry_price", "exit_price", "stop_loss", "entry_low", "entry_high"):
         if key not in payload:
             continue
         raw = payload.get(key)
@@ -2140,10 +2149,150 @@ def _signal_price_fields(payload: dict) -> tuple[dict, str | None]:
             fields[key] = None
             continue
         try:
-            fields[key] = float(raw)
+            value = float(raw)
         except (TypeError, ValueError):
             return {}, f"{key.replace('_', ' ')} must be numeric"
+        if not math.isfinite(value):
+            return {}, f"{key.replace('_', ' ')} must be numeric"
+        fields[key] = value
+
+    # Entry range: both ends or neither. When a range is given, entry_price is
+    # always the middle of it, so entry detection, the app and "changed since
+    # last notification" keep working on one single level exactly as before.
+    if "entry_low" in fields or "entry_high" in fields:
+        low, high = fields.get("entry_low"), fields.get("entry_high")
+        if (low is None) != (high is None):
+            return {}, "entry range needs both a low and a high price"
+        if low is not None:
+            if low <= 0 or high <= 0:
+                return {}, "entry range prices must be greater than zero"
+            if low > high:
+                return {}, "entry range low cannot be higher than the high"
+            fields["entry_price"] = round((low + high) / 2.0, 2)
     return fields, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Suggested entry / exit ranges (website admin only)
+#
+# Starting points for the admin, calculated from the latest price we already
+# hold and the stock's own ATR14 (scanner/trade_range.py). Nothing here sends,
+# publishes or saves anything, and every number stays editable on the website.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stock_live_price(symbol: str) -> dict | None:
+    """
+    Latest price we hold for one stock, cheapest source first:
+      1. the one-minute sweep (no Fyers call),
+      2. the live-quotes poller cache (no Fyers call),
+      3. one Fyers quote request (only while source-confirmed market hours),
+      4. the last stored daily close (market closed / no live source).
+    Returns {"price", "source", "live", "as_of"} or None.
+    """
+    sym = symbol.strip().upper()
+    ticker = f"NSE:{sym}-EQ"
+    now_iso = datetime.datetime.now(_IST).isoformat(timespec="seconds")
+
+    def _ok(value) -> float | None:
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return None
+        return x if math.isfinite(x) and x > 0 else None
+
+    allowed = False
+    try:
+        allowed = bool(_fyers_market_data_allowed())
+    except Exception:
+        allowed = False
+
+    try:   # the sweep only answers while it is healthy and fresh, so it needs no extra gate
+        px = _ok(((_sweep.latest_ltp([ticker]) or {}).get(ticker)))
+    except Exception:
+        px = None
+    if px:
+        return {"price": px, "source": "sweep", "live": True, "as_of": now_iso}
+
+    if allowed:
+        with _quotes_lock:
+            px = _ok(_quotes_cache.get(sym))
+        if px:
+            return {"price": px, "source": "quotes", "live": True, "as_of": _quotes_updated_at or now_iso}
+
+        if _fyers is not None:
+            try:
+                row = fetch_constituents_quotes_bulk(_fyers, [sym]).get(sym) or {}
+                px = _ok(row.get("last_price"))
+            except Exception:
+                px = None
+            if px:
+                return {"price": px, "source": "fyers", "live": True, "as_of": now_iso}
+
+    try:
+        df = history_store.get_history(ticker)
+        if df is not None and len(df):
+            px = _ok(df["Close"].iloc[-1])
+            if px:
+                return {"price": px, "source": "last_close", "live": False,
+                        "as_of": str(df.index[-1])[:10]}
+    except Exception:
+        pass
+    return None
+
+
+def _suggest_ranges_for(symbol: str, price_override: float | None = None) -> dict | None:
+    """Live price + ATR14 -> suggested entry and exit ranges, or None without a usable price."""
+    sym = " ".join(str(symbol or "").split()).upper()
+    if not sym:
+        return None
+    quote = None
+    if price_override is not None:
+        quote = {"price": price_override, "source": "given", "live": False,
+                 "as_of": datetime.datetime.now(_IST).isoformat(timespec="seconds")}
+    else:
+        quote = _stock_live_price(sym)
+    if quote is None:
+        return None
+    atr = None
+    try:
+        atr = atr14_from_frame(history_store.get_history(f"NSE:{sym}-EQ"))
+    except Exception:
+        atr = None
+    ranges = suggest_ranges(quote["price"], atr)
+    if ranges is None:
+        return None
+    return {
+        "symbol": sym,
+        "price": ranges["price"],
+        "price_source": quote["source"],
+        "live": quote["live"],
+        "as_of": quote["as_of"],
+        "atr": ranges["atr"],
+        "basis": ranges["basis"],
+        "tick": ranges["tick"],
+        "entry": ranges["entry"],
+        "exit": ranges["exit"],
+    }
+
+
+@app.route("/api/ranges/suggest", methods=["GET"])
+def api_ranges_suggest():
+    """
+    Website-only. Suggested entry and exit ranges for one stock, from the latest
+    fetched price. ?symbol=RELIANCE. The exit range is always narrower than the
+    entry range. Response: {symbol, price, price_source, live, as_of, atr, basis,
+    tick, entry: {low, high}, exit: {low, high}}.
+    """
+    if not _is_admin():
+        return jsonify({"error": "Admin access required"}), 403
+    symbol = " ".join(str(request.args.get("symbol", "")).split()).upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+    suggestion = _suggest_ranges_for(symbol)
+    if suggestion is None:
+        return jsonify({"error": f"No price is available for {symbol} right now. Enter the range by hand.",
+                        "code": "no_price"}), 404
+    return jsonify(suggestion)
 
 
 @app.route("/api/uploads", methods=["POST"])
@@ -2572,9 +2721,11 @@ def api_exits_add():
     through the shared guard in alerts/manual_push.py).
 
     Body: {"symbol": "RELIANCE", "profit": 120.0, "exit_price": 2850.0,
+           "exit_low": 2845.0, "exit_high": 2855.0,
            "confirm": true, "send_again": false}
-    profit is per share in ₹; a negative number is a loss. These three values
-    are the whole exit call.
+    profit is per share in ₹; a negative number is a loss. exit_low/exit_high
+    (optional, both or neither) give an exit range; when present, exit_price is
+    stored as the middle of it and the notification shows the range.
 
     Response: {"exit": {...}, "notified": true|false} — notified is False when
     push isn't configured on the server (the call is still saved).
@@ -2587,9 +2738,30 @@ def api_exits_add():
     if not symbol:
         return jsonify({"error": "stock is required"}), 400
 
+    # Exit range (optional, both ends or neither). When given it replaces the single
+    # exit price: exit_price becomes the middle of the range.
+    exit_low = exit_high = None
+    raw_low, raw_high = payload.get("exit_low"), payload.get("exit_high")
+    has_low = raw_low not in (None, "")
+    has_high = raw_high not in (None, "")
+    if has_low != has_high:
+        return jsonify({"error": "exit range needs both a low and a high price"}), 400
+    if has_low:
+        try:
+            exit_low, exit_high = float(raw_low), float(raw_high)
+        except (TypeError, ValueError):
+            return jsonify({"error": "exit range must be numbers"}), 400
+        if not (math.isfinite(exit_low) and math.isfinite(exit_high)):
+            return jsonify({"error": "exit range must be numbers"}), 400
+        if exit_low <= 0 or exit_high <= 0:
+            return jsonify({"error": "exit range prices must be greater than zero"}), 400
+        if exit_low > exit_high:
+            return jsonify({"error": "exit range low cannot be higher than the high"}), 400
+
     try:
         profit = float(payload.get("profit"))
-        exit_price = float(payload.get("exit_price"))
+        exit_price = (round((exit_low + exit_high) / 2.0, 2) if exit_low is not None
+                      else float(payload.get("exit_price")))
     except (TypeError, ValueError):
         return jsonify({"error": "profit and exit price must be numbers"}), 400
     if not (math.isfinite(profit) and math.isfinite(exit_price)):
@@ -2610,13 +2782,14 @@ def api_exits_add():
                 symbol, profit, exit_price, admin,
                 payload.get("confirm") is True,
                 send_again=payload.get("send_again") is True,
+                exit_low=exit_low, exit_high=exit_high,
             )
             notified, audience = True, sent["audience"]
         except manual_push.SendRefused as refused:
             return jsonify({"error": refused.message, "code": refused.code}), refused.status
         except Exception as e:
             print(f"   ⚠️   Push: could not send exit call — {e}")
-    entry = add_exit(symbol, profit, exit_price, admin)
+    entry = add_exit(symbol, profit, exit_price, admin, exit_low=exit_low, exit_high=exit_high)
     return jsonify({"exit": entry, "notified": notified, "audience": audience}), 201
 
 
@@ -2646,13 +2819,16 @@ def api_exits_delete(exit_id: str):
 # "Send update notification" button can tell whether the levels changed since
 # the last notification.
 _SIGNAL_REVISION_FIELDS = ("symbol", "entry_price", "exit_price", "stop_loss")
+# Range ends are compared only when the last notification recorded them, so signals
+# announced before ranges existed never show a false "changed since last notification".
+_SIGNAL_RANGE_FIELDS = ("entry_low", "entry_high")
 
 
 def _signal_was_revised(previous: dict | None, entry: dict) -> bool:
     """True when the pick's symbol or one of its price levels actually changed."""
     if not previous:
         return False
-    for key in _SIGNAL_REVISION_FIELDS:
+    for key in _SIGNAL_REVISION_FIELDS + tuple(k for k in _SIGNAL_RANGE_FIELDS if k in previous):
         before, after = previous.get(key), entry.get(key)
         if key == "symbol":
             if str(before or "").upper() != str(after or "").upper():

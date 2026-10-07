@@ -1,22 +1,27 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import type { ExitCall } from '../types'
+import type { ExitCall, RangeSuggestion } from '../types'
 import { inr } from '../utils'
 import StockPicker from './StockPicker'
 import { postGuarded } from '../pushApi'
+import { fetchRangeSuggestion, priceText, rangeError, rangeLabel, suggestionNote } from '../rangeApi'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ExitCallsPanel
+// ExitCallsPanel — shown on the Notifications tab as "Send exit alert"
 //
-// Sits under the signal form on the Signals tab, separate from it. Pick a
-// stock, enter the profit and the exit price, and the call goes to the app's
-// Alerts section (and as a phone notification). An exit call is one-off — it
-// is sent once and kept below as history, not edited or kept "live" like a
+// Pick a stock, enter the profit and the exit range, and the call goes to the
+// app's Alerts section (and as a phone notification). An exit call is one-off —
+// it is sent once and kept below as history, not edited or kept "live" like a
 // signal. Profit is per share in ₹; enter a minus sign for a loss.
+//
+// Exit range: when a stock is picked the server suggests a range from the
+// latest fetched price and the stock's own volatility — always tighter than the
+// entry range, because an exit has to be hit. It is only a starting point; both
+// ends stay editable and the alert goes out with exactly what is in the form.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function emptyForm() {
-  return { symbol: '', profit: '', exit_price: '' }
+  return { symbol: '', profit: '', exit_low: '', exit_high: '' }
 }
 
 const signed = (n: number) => (n >= 0 ? '+' : '−') + inr(Math.abs(n))
@@ -29,13 +34,18 @@ const when = (iso: string) => {
   })
 }
 
-export default function ExitCallsPanel() {
+export default function ExitCallsPanel({ onPushActivity }: { onPushActivity?: () => void }) {
   const [exits, setExits] = useState<ExitCall[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [form, setForm] = useState(emptyForm)
   const [submitting, setSubmitting] = useState(false)
+  const [suggestion, setSuggestion] = useState<RangeSuggestion | null>(null)
+  const [suggestBusy, setSuggestBusy] = useState(false)
+  const [suggestMsg, setSuggestMsg] = useState<string | null>(null)
+  const suggestSeq = useRef(0)        // invalidates an answer that arrives after the stock changed
+  const rangeEdited = useRef(false)   // admin typed a range: never overwrite it automatically
 
   const load = async () => {
     try {
@@ -53,6 +63,38 @@ export default function ExitCallsPanel() {
 
   useEffect(() => { load() }, [])
 
+  const requestSuggestion = async (symbol: string, force: boolean) => {
+    const sym = symbol.trim().toUpperCase()
+    if (!sym) return
+    const seq = ++suggestSeq.current
+    setSuggestBusy(true)
+    setSuggestMsg(null)
+    const result = await fetchRangeSuggestion(sym)
+    if (seq !== suggestSeq.current) return
+    setSuggestBusy(false)
+    if (!result.ok) {
+      setSuggestMsg(result.error)
+      return
+    }
+    if (!force && rangeEdited.current) return
+    rangeEdited.current = false
+    setSuggestion(result.suggestion)
+    setForm(f => ({
+      ...f,
+      exit_low: priceText(result.suggestion.exit.low),
+      exit_high: priceText(result.suggestion.exit.high),
+    }))
+  }
+
+  const resetForm = () => {
+    suggestSeq.current += 1
+    rangeEdited.current = false
+    setSuggestion(null)
+    setSuggestMsg(null)
+    setSuggestBusy(false)
+    setForm(emptyForm())
+  }
+
   const sendExit = async (event: FormEvent) => {
     event.preventDefault()
     const symbol = form.symbol.trim().toUpperCase()
@@ -61,31 +103,41 @@ export default function ExitCallsPanel() {
     setNotice(null)
 
     const profit = Number(form.profit)
-    const exit_price = Number(form.exit_price)
-    if (form.profit.trim() === '' || Number.isNaN(profit)
-        || form.exit_price.trim() === '' || Number.isNaN(exit_price)) {
-      setError('Profit and exit price must be numbers')
+    if (form.profit.trim() === '' || Number.isNaN(profit)) {
+      setError('Profit must be a number')
       return
     }
-    if (exit_price <= 0) {
-      setError('Exit price must be greater than zero')
+    if (form.exit_low.trim() === '' && form.exit_high.trim() === '') {
+      setError('Enter the exit range (or pick the stock to have it calculated)')
       return
     }
+    const rangeProblem = rangeError('Exit range', form.exit_low, form.exit_high)
+    if (rangeProblem) {
+      setError(rangeProblem)
+      return
+    }
+    const exit_low = Number(form.exit_low)
+    const exit_high = Number(form.exit_high)
+    // The server stores the middle of the range as the exit price.
+    const exit_price = Math.round(((exit_low + exit_high) / 2) * 100) / 100
 
     // A push can't be taken back, so ask once before it goes out.
-    if (!window.confirm(`Send an exit alert for ${symbol} to everyone using the app?`)) return
+    if (!window.confirm(
+      `Send an exit alert for ${symbol} (exit range ${rangeLabel(exit_low, exit_high)}) to everyone using the app?`,
+    )) return
 
     setSubmitting(true)
     try {
-      const { ok, data } = await postGuarded('/api/exits', { symbol, profit, exit_price })
+      const { ok, data } = await postGuarded('/api/exits', { symbol, profit, exit_low, exit_high, exit_price })
       if (!ok) throw new Error(data.error || 'Failed to send exit call')
-      setForm(emptyForm())
+      resetForm()
       setNotice(
         data.notified
           ? `Exit call for ${symbol} sent to ${data.audience ?? 'the'} phone(s).`
           : `Exit call for ${symbol} saved, but push isn't set up on the server, so no phone was notified.`,
       )
       await load()
+      onPushActivity?.()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send exit call')
     } finally {
@@ -105,10 +157,10 @@ export default function ExitCallsPanel() {
   }
 
   return (
-    <div className="section">
+    <div className="section" id="panel-send-exit-alert">
       <div className="section-header">
-        <div className="section-title">Exit calls</div>
-        <div className="section-sub">Sent to the app's Alerts</div>
+        <div className="section-title">Send exit alert</div>
+        <div className="section-sub">Goes to every phone and the app's Alerts</div>
       </div>
 
       {error && <div className="error-bar">{error}</div>}
@@ -119,7 +171,12 @@ export default function ExitCallsPanel() {
           <StockPicker
             label="Stock"
             value={form.symbol}
-            onChange={symbol => setForm(f => ({ ...f, symbol }))}
+            onChange={symbol => {
+              suggestSeq.current += 1     // an answer for the previous text is no longer wanted
+              setForm(f => ({ ...f, symbol }))
+            }}
+            // The exit range is filled in as soon as a stock is chosen.
+            onSelect={symbol => { rangeEdited.current = false; requestSuggestion(symbol, false) }}
             required
           />
           <label className="field">
@@ -134,17 +191,52 @@ export default function ExitCallsPanel() {
             />
           </label>
           <label className="field">
-            <span>Exit price</span>
+            <span>Exit range — from</span>
             <input
               type="number"
               step="0.01"
               min="0"
-              value={form.exit_price}
-              onChange={e => setForm(f => ({ ...f, exit_price: e.target.value }))}
-              placeholder="₹"
+              value={form.exit_low}
+              onChange={e => { rangeEdited.current = true; setForm(f => ({ ...f, exit_low: e.target.value })) }}
+              placeholder="₹ low"
               required
             />
           </label>
+          <label className="field">
+            <span>Exit range — to</span>
+            <input
+              type="number"
+              step="0.01"
+              min="0"
+              value={form.exit_high}
+              onChange={e => { rangeEdited.current = true; setForm(f => ({ ...f, exit_high: e.target.value })) }}
+              placeholder="₹ high"
+              required
+            />
+          </label>
+        </div>
+
+        <div className="clean-form-footer" style={{ marginBottom: '0.5rem' }}>
+          <span className="switch-label">
+            {suggestBusy
+              ? 'Calculating the exit range from the latest price…'
+              : suggestMsg
+                ? suggestMsg
+                : suggestion
+                  ? suggestionNote(suggestion)
+                  : 'The exit range is filled in from the latest price when you pick a stock. It is tighter than an entry range. Edit it freely.'}
+          </span>
+          <div className="clean-form-actions">
+            <button
+              type="button"
+              className="theme-btn"
+              disabled={suggestBusy || !form.symbol.trim()}
+              title="Replace the range with a fresh one from the latest price"
+              onClick={() => requestSuggestion(form.symbol, true)}
+            >
+              Recalculate from live price
+            </button>
+          </div>
         </div>
 
         <div className="clean-form-footer">
@@ -177,8 +269,12 @@ export default function ExitCallsPanel() {
                   </strong>
                 </span>
                 <span className="price-tag">
-                  <small>Exit</small>
-                  <strong>{inr(x.exit_price)}</strong>
+                  <small>{x.exit_low != null && x.exit_high != null ? 'Exit range' : 'Exit'}</small>
+                  <strong>
+                    {x.exit_low != null && x.exit_high != null
+                      ? rangeLabel(x.exit_low, x.exit_high)
+                      : inr(x.exit_price)}
+                  </strong>
                 </span>
               </div>
               <div className="signal-row-actions">

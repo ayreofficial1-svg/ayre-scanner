@@ -16,6 +16,8 @@ Entry schema (JSON list, newest first)
       "added_by"  : "raghav",         # username from session
       "active"    : true,             # false once deactivated via DELETE
       "entry_price": 2850.0,          # optional — website admin panel field
+      "entry_low"  : 2840.0,          # optional entry range; entry_price = its middle
+      "entry_high" : 2860.0,
       "exit_price" : 3050.0,          # optional
       "stop_loss"  : 2760.0           # optional
     },
@@ -144,6 +146,10 @@ def _normalize_signal(entry: dict) -> dict:
         "end_at": (entry.get("end_at") or "").strip() or None,
         "tags": entry.get("tags") if isinstance(entry.get("tags"), list) else [],
         "entry_price": _to_float_or_none(entry.get("entry_price")),
+        # Entry range (website "Draft & publish signals" panel). entry_price is kept
+        # equal to the middle of the range, so detection and the app keep working.
+        "entry_low": _to_float_or_none(entry.get("entry_low")),
+        "entry_high": _to_float_or_none(entry.get("entry_high")),
         "exit_price": _to_float_or_none(entry.get("exit_price")),
         "stop_loss": _to_float_or_none(entry.get("stop_loss")),
     }
@@ -329,6 +335,8 @@ def set_notification_state(signal_id: str, kind: str) -> None:
         updated["notified_levels"] = {
             "symbol": updated.get("symbol"),
             "entry_price": updated.get("entry_price"),
+            "entry_low": updated.get("entry_low"),
+            "entry_high": updated.get("entry_high"),
             "exit_price": updated.get("exit_price"),
             "stop_loss": updated.get("stop_loss"),
         }

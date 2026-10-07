@@ -270,13 +270,33 @@ def format_rupees(value: float) -> str:
     return f"{'-' if value < 0 else ''}₹{digits}" + (f".{paise:02d}" if paise else "")
 
 
-def build_new_signal_text(symbol: str) -> tuple[str, str]:
+def format_range(low, high) -> str:
+    """₹538–₹543 (a single price when both ends are equal). Empty string if unusable."""
+    try:
+        lo, hi = float(low), float(high)
+    except (TypeError, ValueError):
+        return ""
+    if not (lo > 0 and hi > 0):
+        return ""
+    lo, hi = min(lo, hi), max(lo, hi)
+    if abs(hi - lo) < 1e-9:
+        return format_rupees(lo)
+    return f"{format_rupees(lo)}–{format_rupees(hi)}"
+
+
+def build_new_signal_text(symbol: str, entry_low=None, entry_high=None) -> tuple[str, str]:
     heading, line = _pick("new", _NEW_PICK)
+    zone = format_range(entry_low, entry_high)
+    if zone:
+        line = f"{line} Entry range {zone}."
     return f"{heading}: {symbol}", line
 
 
-def build_revised_signal_text(symbol: str) -> tuple[str, str]:
+def build_revised_signal_text(symbol: str, entry_low=None, entry_high=None) -> tuple[str, str]:
     heading, line = _pick("revised", _REVISED)
+    zone = format_range(entry_low, entry_high)
+    if zone:
+        line = f"{line} Entry range {zone}."
     return f"{heading}: {symbol}", line
 
 
@@ -286,11 +306,15 @@ def build_entry_reached_text(symbol: str) -> tuple[str, str]:
     return f"{heading}: {symbol}", f"{symbol} {line} Open Signals for details."
 
 
-def build_exit_text(stock: str, profit: float, exit_price: float) -> tuple[str, str]:
+def build_exit_text(
+    stock: str, profit: float, exit_price: float, exit_low=None, exit_high=None,
+) -> tuple[str, str]:
     loss = profit < 0
     heading = _pick("exit-loss" if loss else "exit", _EXIT_LOSS if loss else _EXIT_PROFIT)
     label = "Loss" if loss else "Profit"
+    # An exit range, when given, replaces the single exit price in the text.
+    where = format_range(exit_low, exit_high) or format_rupees(exit_price)
     return (
         f"{heading}: {stock}",
-        f"{label} {format_rupees(abs(profit))} | Exit {format_rupees(exit_price)}",
+        f"{label} {format_rupees(abs(profit))} | Exit {where}",
     )

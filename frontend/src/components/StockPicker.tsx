@@ -39,12 +39,15 @@ export default function StockPicker({
   onChange,
   placeholder = 'Start typing a symbol or name…',
   required,
+  onSelect,
 }: {
   label?: string
   value: string
   onChange: (symbol: string) => void
   placeholder?: string
   required?: boolean
+  /** Called only when a stock is actually chosen from the list (click or Enter), not on every keystroke. */
+  onSelect?: (symbol: string) => void
 }) {
   const [directory, setDirectory] = useState<StockDirectoryEntry[]>([])
   const [query, setQuery] = useState(value)
@@ -86,6 +89,7 @@ export default function StockPicker({
     onChange(s.symbol)
     setQuery(s.symbol)
     setOpen(false)
+    onSelect?.(s.symbol)
   }
 
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {

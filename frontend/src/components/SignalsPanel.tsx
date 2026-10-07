@@ -1,18 +1,26 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import type { SignalPick, SignalEntryState } from '../types'
+import type { SignalPick, SignalEntryState, RangeSuggestion } from '../types'
 import { inr, pct } from '../utils'
 import StockPicker from './StockPicker'
 import { postGuarded, usePushStatus, whenIST } from '../pushApi'
+import { fetchRangeSuggestion, priceText, rangeError, rangeLabel, suggestionNote } from '../rangeApi'
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SignalsPanel
+// SignalsPanel — shown on the Notifications tab as "Draft & publish signals"
 //
-// Pick a stock, set Entry / Exit / Stop Loss, and it stays live in the app
-// until manually disabled or removed. Everything else the old form exposed
-// (rationale, category, image, scheduling window, featured/pinned ordering)
-// is still accepted by the API for backward compatibility but is no longer
-// surfaced here — this tab now only edits the fields it's actually for.
+// Pick a stock, set the Entry range / Exit price / Stop Loss, and it stays live
+// in the app until manually disabled or removed. Everything else the old form
+// exposed (rationale, category, image, scheduling window, featured/pinned
+// ordering) is still accepted by the API for backward compatibility but is no
+// longer surfaced here — this panel only edits the fields it's actually for.
+//
+// Entry range: when a stock is picked (or a draft is created from an Entry hit)
+// the server suggests a range from the latest fetched price and the stock's own
+// volatility. It is only a starting point — both ends stay editable, and the
+// range is saved and sent exactly as it stands in the form. The server keeps
+// "entry price" (used by entry detection and the app) equal to the middle of
+// the range.
 //
 // Publication gate: a saved signal is a DRAFT (admin only). Only the
 // "Publish to app" button makes it visible to app users. Saving, editing and
@@ -25,7 +33,8 @@ function emptyForm() {
   return {
     id: '',
     symbol: '',
-    entry_price: '',
+    entry_low: '',
+    entry_high: '',
     exit_price: '',
     stop_loss: '',
     enabled: true,
@@ -43,7 +52,24 @@ function signalState(s: SignalPick): SignalState {
   return s.published === false ? 'Draft' : 'Published'
 }
 
-export default function SignalsPanel() {
+// Sent by the page when "Draft signal" was pressed on an Entry hit: open that
+// draft here (ranges loaded, editable) and bring this panel into view.
+export interface SignalFocus {
+  id: string
+  nonce: number
+  message?: string
+  suggestion?: RangeSuggestion | null
+}
+
+export default function SignalsPanel({
+  focus = null,
+  onFocusDone,
+  onPushActivity,
+}: {
+  focus?: SignalFocus | null
+  onFocusDone?: () => void
+  onPushActivity?: () => void
+}) {
   const [signals, setSignals] = useState<SignalPick[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -54,7 +80,15 @@ export default function SignalsPanel() {
   const [publishTarget, setPublishTarget] = useState<SignalPick | null>(null)
   const [alsoNotify, setAlsoNotify] = useState(false)
   const [entryStates, setEntryStates] = useState<Record<string, SignalEntryState>>({})
+  const [highlightId, setHighlightId] = useState<string | null>(null)
+  const [suggestion, setSuggestion] = useState<RangeSuggestion | null>(null)
+  const [suggestBusy, setSuggestBusy] = useState(false)
+  const [suggestMsg, setSuggestMsg] = useState<string | null>(null)
   const { status: pushStatus, refresh: refreshPush } = usePushStatus()
+  const panelRef = useRef<HTMLDivElement>(null)
+  const suggestSeq = useRef(0)         // invalidates an answer that arrives after the stock changed
+  const rangeEdited = useRef(false)    // admin typed in the range: never overwrite it automatically
+  const handledFocus = useRef(0)
 
   const load = async () => {
     setLoading(true)
@@ -78,13 +112,34 @@ export default function SignalsPanel() {
 
   useEffect(() => { load() }, [])
 
-  const resetForm = () => setForm(emptyForm())
+  const clearSuggestion = () => {
+    suggestSeq.current += 1
+    rangeEdited.current = false
+    setSuggestion(null)
+    setSuggestMsg(null)
+    setSuggestBusy(false)
+  }
+
+  const resetForm = () => {
+    clearSuggestion()
+    setForm(emptyForm())
+  }
+
+  const scrollToPanel = () => {
+    panelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
 
   const editSignal = (signal: SignalPick) => {
+    clearSuggestion()
+    // A signal saved before ranges existed has one entry price: show it as a
+    // zero-width range that can simply be widened.
+    const low = signal.entry_low ?? signal.entry_price ?? null
+    const high = signal.entry_high ?? signal.entry_price ?? null
     setForm({
       id: signal.id,
       symbol: signal.symbol,
-      entry_price: signal.entry_price != null ? String(signal.entry_price) : '',
+      entry_low: priceText(low),
+      entry_high: priceText(high),
       exit_price: signal.exit_price != null ? String(signal.exit_price) : '',
       stop_loss: signal.stop_loss != null ? String(signal.stop_loss) : '',
       enabled: signal.enabled ?? signal.active ?? true,
@@ -92,8 +147,52 @@ export default function SignalsPanel() {
       reached: !!signal.entry_reached_at,
       entry_was: signal.entry_price != null ? String(signal.entry_price) : '',
     })
-    window.scrollTo({ top: 0, behavior: 'smooth' })
+    scrollToPanel()
   }
+
+  // Ask the server for an entry range from the latest price. `force` = the admin
+  // pressed "Recalculate", so it replaces whatever is in the fields; otherwise it
+  // only fills the fields while the admin has not typed a range of their own.
+  const requestSuggestion = async (symbol: string, force: boolean) => {
+    const sym = symbol.trim().toUpperCase()
+    if (!sym) return
+    const seq = ++suggestSeq.current
+    setSuggestBusy(true)
+    setSuggestMsg(null)
+    const result = await fetchRangeSuggestion(sym)
+    if (seq !== suggestSeq.current) return      // stock changed / form reset meanwhile
+    setSuggestBusy(false)
+    if (!result.ok) {
+      setSuggestMsg(result.error)
+      return
+    }
+    if (!force && rangeEdited.current) return
+    rangeEdited.current = false
+    setSuggestion(result.suggestion)
+    setForm(f => ({
+      ...f,
+      entry_low: priceText(result.suggestion.entry.low),
+      entry_high: priceText(result.suggestion.entry.high),
+    }))
+  }
+
+  // "Draft signal" on an Entry hit sent us here: open that draft in the form
+  // (its calculated range is already saved on it) and bring the panel into view.
+  useEffect(() => {
+    if (!focus || loading || handledFocus.current === focus.nonce) return
+    handledFocus.current = focus.nonce
+    const target = signals.find(s => s.id === focus.id)
+    if (target) {
+      editSignal(target)
+      setHighlightId(target.id)
+    } else {
+      scrollToPanel()
+    }
+    if (target && focus.suggestion) setSuggestion(focus.suggestion)
+    if (focus.message) setNotice(focus.message)
+    onFocusDone?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focus, loading, signals])
 
   const addSignal = async (event: FormEvent) => {
     event.preventDefault()
@@ -102,11 +201,17 @@ export default function SignalsPanel() {
     setNotice(null)
 
     const numOrNull = (v: string) => (v.trim() === '' ? null : Number(v))
-    const entry_price = numOrNull(form.entry_price)
+    const rangeProblem = rangeError('Entry range', form.entry_low, form.entry_high)
+    if (rangeProblem) {
+      setError(rangeProblem)
+      return
+    }
+    const entry_low = numOrNull(form.entry_low)
+    const entry_high = numOrNull(form.entry_high)
     const exit_price = numOrNull(form.exit_price)
     const stop_loss = numOrNull(form.stop_loss)
-    if ([entry_price, exit_price, stop_loss].some(v => v !== null && Number.isNaN(v))) {
-      setError('Entry, exit and stop loss must be numeric')
+    if ([exit_price, stop_loss].some(v => v !== null && Number.isNaN(v))) {
+      setError('Exit and stop loss must be numeric')
       return
     }
 
@@ -119,7 +224,10 @@ export default function SignalsPanel() {
           id: form.id || undefined,
           symbol: form.symbol.trim().toUpperCase(),
           enabled: form.enabled,
-          entry_price,
+          // The server keeps "entry price" equal to the middle of the range.
+          entry_low,
+          entry_high,
+          ...(entry_low === null ? { entry_price: null } : {}),
           exit_price,
           stop_loss,
         }),
@@ -214,6 +322,7 @@ export default function SignalsPanel() {
       )
       await load()
       refreshPush()
+      if (alsoNotify) onPushActivity?.()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to change publication')
     } finally {
@@ -225,9 +334,12 @@ export default function SignalsPanel() {
     if (busyId) return
     const audience = pushStatus?.signal_devices
     const who = audience != null ? `${audience} phone(s) with signal alerts on` : 'phones with signal alerts on'
+    const zone = signal.entry_low != null && signal.entry_high != null
+      ? `\n\nThe notification will show the entry range ${rangeLabel(signal.entry_low, signal.entry_high)}.`
+      : ''
     const message = kind === 'new'
-      ? `Send a "new signal" notification for ${signal.symbol} to ${who}?\n\nA notification cannot be recalled.`
-      : `Send a "signal updated" notification for ${signal.symbol} to ${who}?\n\nA notification cannot be recalled.`
+      ? `Send a "new signal" notification for ${signal.symbol} to ${who}?${zone}\n\nA notification cannot be recalled.`
+      : `Send a "signal updated" notification for ${signal.symbol} to ${who}?${zone}\n\nA notification cannot be recalled.`
     if (!window.confirm(again ? `${message}\n\nThis was already sent once. Send it again?` : message)) return
 
     setBusyId(signal.id)
@@ -242,6 +354,7 @@ export default function SignalsPanel() {
       setNotice(`Notification for ${signal.symbol} sent to ${data.audience} phone(s).`)
       await load()
       refreshPush()
+      onPushActivity?.()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to send notification')
     } finally {
@@ -250,9 +363,10 @@ export default function SignalsPanel() {
   }
 
   return (
-    <div className="section">
+    <div className="section" id="panel-draft-publish-signals" ref={panelRef}>
       <div className="section-header">
-        <div className="section-title">Signals</div>
+        <div className="section-title">Draft &amp; publish signals</div>
+        <div className="section-sub">Set the entry range, publish to the app, then send the notification</div>
       </div>
 
       {error && <div className="error-bar">{error}</div>}
@@ -264,7 +378,7 @@ export default function SignalsPanel() {
       )}
       {form.id && form.reached && (
         <div className="warn-bar">
-          "Entry reached" is live in the app for this signal. If you change the entry price or the stock,
+          "Entry reached" is live in the app for this signal. If you change the entry range or the stock,
           it is withdrawn from the app at save time and entry detection starts again.
         </div>
       )}
@@ -279,17 +393,32 @@ export default function SignalsPanel() {
           <StockPicker
             label="Stock"
             value={form.symbol}
-            onChange={symbol => setForm(f => ({ ...f, symbol }))}
+            onChange={symbol => {
+              suggestSeq.current += 1     // an answer for the previous text is no longer wanted
+              setForm(f => ({ ...f, symbol }))
+            }}
+            // A new signal gets its entry range as soon as a stock is chosen.
+            onSelect={symbol => { if (!form.id) { rangeEdited.current = false; requestSuggestion(symbol, false) } }}
             required
           />
           <label className="field">
-            <span>Entry price</span>
+            <span>Entry range — from</span>
             <input
               type="number"
               step="0.01"
-              value={form.entry_price}
-              onChange={e => setForm(f => ({ ...f, entry_price: e.target.value }))}
-              placeholder="₹"
+              value={form.entry_low}
+              onChange={e => { rangeEdited.current = true; setForm(f => ({ ...f, entry_low: e.target.value })) }}
+              placeholder="₹ low"
+            />
+          </label>
+          <label className="field">
+            <span>Entry range — to</span>
+            <input
+              type="number"
+              step="0.01"
+              value={form.entry_high}
+              onChange={e => { rangeEdited.current = true; setForm(f => ({ ...f, entry_high: e.target.value })) }}
+              placeholder="₹ high"
             />
           </label>
           <label className="field">
@@ -312,6 +441,29 @@ export default function SignalsPanel() {
               placeholder="₹"
             />
           </label>
+        </div>
+
+        <div className="clean-form-footer" style={{ marginBottom: '0.5rem' }}>
+          <span className="switch-label">
+            {suggestBusy
+              ? 'Calculating the entry range from the latest price…'
+              : suggestMsg
+                ? suggestMsg
+                : suggestion
+                  ? suggestionNote(suggestion)
+                  : 'The entry range is filled in from the latest price when you pick a stock. Edit it freely.'}
+          </span>
+          <div className="clean-form-actions">
+            <button
+              type="button"
+              className="theme-btn"
+              disabled={suggestBusy || !form.symbol.trim()}
+              title="Replace the range with a fresh one from the latest price"
+              onClick={() => requestSuggestion(form.symbol, true)}
+            >
+              Recalculate from live price
+            </button>
+          </div>
         </div>
 
         <div className="clean-form-footer">
@@ -344,7 +496,10 @@ export default function SignalsPanel() {
             const state = signalState(s)
             const busy = busyId === s.id
             return (
-            <div className={`signal-row${state === 'Hidden' ? ' disabled' : ''}`} key={s.id}>
+            <div
+              className={`signal-row${state === 'Hidden' ? ' disabled' : ''}${highlightId === s.id ? ' hit-new' : ''}`}
+              key={s.id}
+            >
               <div className="signal-row-main">
                 <span className="card-sym">{s.symbol}</span>
                 <span className={`card-val ${(s.change_pct ?? 0) >= 0 ? 'g' : 'r'}`}>
@@ -375,7 +530,11 @@ export default function SignalsPanel() {
                 )}
               </div>
               <div className="signal-row-prices">
-                <PriceTag label="Entry" value={s.entry_price} />
+                <PriceTag
+                  label={s.entry_low != null && s.entry_high != null ? 'Entry range' : 'Entry'}
+                  text={s.entry_low != null && s.entry_high != null ? rangeLabel(s.entry_low, s.entry_high) : undefined}
+                  value={s.entry_price}
+                />
                 <PriceTag label="Exit" value={s.exit_price} />
                 <PriceTag label="Stop loss" value={s.stop_loss} />
               </div>
@@ -457,11 +616,11 @@ export default function SignalsPanel() {
   )
 }
 
-function PriceTag({ label, value }: { label: string; value?: number | null }) {
+function PriceTag({ label, value, text }: { label: string; value?: number | null; text?: string }) {
   return (
     <span className="price-tag">
       <small>{label}</small>
-      <strong>{value != null ? inr(value) : '—'}</strong>
+      <strong>{text ?? (value != null ? inr(value) : '—')}</strong>
     </span>
   )
 }

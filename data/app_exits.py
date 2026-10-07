@@ -14,7 +14,9 @@ Entry schema (JSON list, newest first)
       "id"         : "b3f1...",          # uuid4 hex
       "symbol"     : "RELIANCE",         # stock name, as picked on the website
       "profit"     : 120.0,              # ₹ per share; negative = a loss
-      "exit_price" : 2850.0,             # ₹
+      "exit_price" : 2850.0,             # ₹ (middle of the range when one was given)
+      "exit_low"   : 2845.0,             # ₹, optional exit range
+      "exit_high"  : 2855.0,             # ₹, optional exit range
       "created_at" : "<ISO timestamp>",  # bookkeeping only
       "added_by"   : "raghav"            # username from session, bookkeeping only
     },
@@ -68,8 +70,13 @@ def load_exits() -> list[dict]:
         return _load()
 
 
-def add_exit(symbol: str, profit: float, exit_price: float, added_by: str | None) -> dict:
-    """Save a new exit call (newest first) and return it."""
+def add_exit(symbol: str, profit: float, exit_price: float, added_by: str | None,
+             exit_low: float | None = None, exit_high: float | None = None) -> dict:
+    """
+    Save a new exit call (newest first) and return it. exit_price is the single
+    price (the middle of the range when a range was given); exit_low/exit_high
+    are the optional exit range and are stored only when both are present.
+    """
     entry = {
         "id"        : uuid.uuid4().hex,
         "symbol"    : " ".join(str(symbol or "").split()).upper(),
@@ -78,6 +85,9 @@ def add_exit(symbol: str, profit: float, exit_price: float, added_by: str | None
         "created_at": _now_iso(),
         "added_by"  : added_by or "unknown",
     }
+    if exit_low is not None and exit_high is not None:
+        entry["exit_low"] = float(exit_low)
+        entry["exit_high"] = float(exit_high)
     with _lock:
         entries = _load()
         entries.insert(0, entry)

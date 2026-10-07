@@ -122,7 +122,7 @@ def send_manual(
 
 def send_new_signal(signal: dict, admin, confirm, send_again=False) -> dict:
     symbol = str(signal.get("symbol") or "").strip().upper()
-    title, body = push.build_new_signal_text(symbol)
+    title, body = push.build_new_signal_text(symbol, signal.get("entry_low"), signal.get("entry_high"))
     return send_manual(
         kind="signal", key=symbol, title=title, body=body,
         data={"type": "signal", "symbol": symbol, "signal_id": signal.get("id")},
@@ -132,7 +132,7 @@ def send_new_signal(signal: dict, admin, confirm, send_again=False) -> dict:
 
 def send_revised_signal(signal: dict, admin, confirm, send_again=False) -> dict:
     symbol = str(signal.get("symbol") or "").strip().upper()
-    title, body = push.build_revised_signal_text(symbol)
+    title, body = push.build_revised_signal_text(symbol, signal.get("entry_low"), signal.get("entry_high"))
     return send_manual(
         kind="signal_update", key=symbol, title=title, body=body,
         data={"type": "signal_update", "symbol": symbol, "signal_id": signal.get("id")},
@@ -150,11 +150,15 @@ def send_entry_reached(signal: dict, admin, confirm, send_again=False) -> dict:
     )
 
 
-def send_exit(stock: str, profit: float, exit_price: float, admin, confirm, send_again=False) -> dict:
-    title, body = push.build_exit_text(stock, profit, exit_price)
+def send_exit(stock: str, profit: float, exit_price: float, admin, confirm, send_again=False,
+              exit_low=None, exit_high=None) -> dict:
+    title, body = push.build_exit_text(stock, profit, exit_price, exit_low, exit_high)
+    data = {"type": "exit", "symbol": stock, "profit": profit, "exit_price": exit_price}
+    if exit_low is not None and exit_high is not None:
+        data.update({"exit_low": exit_low, "exit_high": exit_high})
     return send_manual(
         kind="exit", key=stock, title=title, body=body,
-        data={"type": "exit", "symbol": stock, "profit": profit, "exit_price": exit_price},
+        data=data,
         topic=None, admin=admin, confirm=confirm, send_again=send_again,
     )
 

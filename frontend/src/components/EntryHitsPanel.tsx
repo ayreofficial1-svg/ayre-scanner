@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { EntryHit, EntryHitsResponse } from '../types'
+import type { EntryHit, EntryHitsResponse, RangeSuggestion } from '../types'
 import { inr } from '../utils'
 import { whenIST } from '../pushApi'
 
@@ -10,9 +10,21 @@ import { whenIST } from '../pushApi'
 // admin-only: nothing here reaches app users until you press a button and
 // confirm. The panel asks OUR backend every 12 s while the tab is visible
 // (never Fyers). The beep, the sound switch and the tab-title counter live in
-// EntryHitsWatcher (page header, runs on every tab). Actions: Publish entry reached (admin signals), Create draft
-// signal (scanner hits), Dismiss, Re-arm.
+// EntryHitsWatcher (page header, runs on every tab). Actions: Publish entry reached (admin signals), Draft signal
+// (scanner hits), Dismiss, Re-arm.
+//
+// "Draft signal" saves a Draft with an entry range calculated from the latest price, then hands over to the
+// page (onOpenDraft), which switches to the Notifications tab and opens that draft in "Draft & publish signals"
+// so it can be reviewed, published and announced there.
 // ─────────────────────────────────────────────────────────────────────────────
+
+// What the page needs to take the admin to a draft on the Notifications tab.
+export interface DraftOpenRequest {
+  signalId: string
+  symbol: string
+  created: boolean                       // false = an existing draft is being reopened
+  suggestion?: RangeSuggestion | null    // the range the server just calculated (new drafts only)
+}
 
 const POLL_MS = 12000
 
@@ -36,7 +48,7 @@ async function post(url: string, body: Record<string, unknown> = {}) {
   return { ok: res.ok, status: res.status, data }
 }
 
-export default function EntryHitsPanel() {
+export default function EntryHitsPanel({ onOpenDraft }: { onOpenDraft?: (request: DraftOpenRequest) => void }) {
   const [data, setData] = useState<EntryHitsResponse | null>(null)
   const [days, setDays] = useState(1)
   const [error, setError] = useState<string | null>(null)
@@ -95,11 +107,17 @@ export default function EntryHitsPanel() {
   })
 
   const createDraft = (hit: EntryHit) => run(hit, async () => {
-    if (!window.confirm(`Create a Draft signal for ${hit.symbol}?\n\nIt is not visible in the app and nothing is sent. You review it in the Signals panel and publish it yourself.`)) return
+    if (!window.confirm(`Create a Draft signal for ${hit.symbol}?\n\nIt is saved as a Draft with an entry range calculated from the latest price. It is not visible in the app and nothing is sent. You will be taken to the Notifications tab to review it, publish it and send the notification yourself.`)) return
     const { ok, data: d } = await post(`/api/entries/hits/${hit.id}/create-draft`)
     if (!ok) throw new Error(d.error || 'Failed to create draft')
-    setNotice(`Draft signal created for ${hit.symbol}. Find it in the Signals panel below.`)
+    const signal = d.signal as { id?: string } | undefined
+    const suggestion = (d.suggestion ?? null) as RangeSuggestion | null
     await load()
+    if (signal?.id && onOpenDraft) {
+      onOpenDraft({ signalId: signal.id, symbol: hit.symbol, created: true, suggestion })
+    } else {
+      setNotice(`Draft signal created for ${hit.symbol}. Find it under "Draft & publish signals" on the Notifications tab.`)
+    }
   })
 
   const openPublish = (hit: EntryHit) => {
@@ -236,7 +254,16 @@ export default function EntryHitsPanel() {
                   )}
                   {h.kind === 'scanner' && !h.draft_signal_id && (
                     <button className="rescan-btn" disabled={busy} onClick={() => createDraft(h)}>
-                      Create draft signal
+                      Draft signal
+                    </button>
+                  )}
+                  {h.kind === 'scanner' && h.draft_signal_id && onOpenDraft && (
+                    <button
+                      className="theme-btn"
+                      disabled={busy}
+                      onClick={() => onOpenDraft({ signalId: h.draft_signal_id!, symbol: h.symbol, created: false })}
+                    >
+                      Open draft
                     </button>
                   )}
                   {!done && (
