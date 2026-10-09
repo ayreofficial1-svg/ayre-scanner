@@ -95,7 +95,7 @@ from data.app_signals import (
     set_notification_state, set_entry_reached, ENTRY_REACHED_ADMIN_FIELDS,
 )
 from data.app_devices import (
-    register_device, unregister_device, device_count,
+    register_device, unregister_device, device_count, remove_uid,
 )
 from data.app_exits import load_exits, add_exit, delete_exit
 from alerts import push as push_alerts
@@ -515,6 +515,13 @@ _AUTH_PUBLIC_API = {
 _APP_ACCOUNT_RULES = {
     "/api/devices/register",
     "/api/devices/unregister",
+    "/api/account/delete",
+}
+
+# Account rules that work for an unverified email too: someone who never
+# verified must still be able to delete their own account.
+_APP_ACCOUNT_RULES_UNVERIFIED_OK = {
+    "/api/account/delete",
 }
 
 # Website login throttle (in-memory, per client IP). Website only.
@@ -672,7 +679,11 @@ def _require_authentication():
         user, err = app_auth.verify_bearer(token)
         if err:
             return _auth_error(*err)
-        if APP_REQUIRE_VERIFIED_EMAIL and not user["email_verified"]:
+        if (
+            APP_REQUIRE_VERIFIED_EMAIL
+            and not user["email_verified"]
+            and rule not in _APP_ACCOUNT_RULES_UNVERIFIED_OK
+        ):
             return _auth_error(403, "email_not_verified", "Verify your email to continue")
         g.app_user = user
         return None
@@ -2930,6 +2941,26 @@ def api_devices_unregister():
     payload = request.get_json(silent=True) or {}
     unregister_device(str(payload.get("token") or ""), uid=g.app_user["uid"])
     return jsonify({"registered": False})
+
+
+@app.route("/api/account/delete", methods=["POST"])
+def api_account_delete():
+    """
+    Permanently deletes the calling app user's account.
+
+    The account is removed from Firebase first; then every push device
+    registered to it (all of the person's phones) is dropped, so nothing keeps
+    being sent to a deleted account. Safe to retry: an account that is already
+    gone still gets its devices cleared. Admin accounts are never affected —
+    this only ever acts on the verified app token's own uid.
+    """
+    uid = g.app_user["uid"]
+    err = app_auth.delete_user(uid)
+    if err:
+        return _auth_error(*err)
+    removed = remove_uid(uid)
+    print(f"   🗑️   App account deleted ({removed} device(s) removed)")
+    return jsonify({"deleted": True})
 
 
 @app.route("/api/push/status", methods=["GET"])

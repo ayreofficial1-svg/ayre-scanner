@@ -132,6 +132,24 @@ def unregister_device(token: str, uid: str | None = None) -> bool:
         return True
 
 
+def remove_uid(uid: str) -> int:
+    """
+    Drop every device registered to [uid] (all of an account's phones), e.g.
+    when the account is deleted. Returns how many were removed.
+    """
+    uid = (uid or "").strip()
+    if not uid:
+        return 0
+    with _lock:
+        devices = _load()
+        doomed = [t for t, d in devices.items() if d.get("uid") == uid]
+        for token in doomed:
+            del devices[token]
+        if doomed:
+            _save(devices)
+        return len(doomed)
+
+
 def remove_tokens(tokens: list[str]) -> int:
     """Drop several tokens at once (dead tokens reported by FCM). Returns count removed."""
     if not tokens:

@@ -78,3 +78,23 @@ def verify_bearer(token: str):
         "email_verified": bool(decoded.get("email_verified", False)),
         "name": decoded.get("name"),
     }, None
+
+
+def delete_user(uid: str):
+    """
+    Permanently delete a Firebase account. Returns None on success, or an
+    (status, code, message) tuple on failure. A user that is already gone
+    counts as success, so a retried request finishes cleanly.
+    """
+    if _fb_auth is None or not firebase_app.is_configured():
+        return (503, "auth_unavailable", "Sign-in service is temporarily unavailable")
+    app_obj = firebase_app.get_app()
+    if app_obj is None:
+        return (503, "auth_unavailable", "Sign-in service is temporarily unavailable")
+    try:
+        _fb_auth.delete_user(uid, app=app_obj)
+    except _fb_auth.UserNotFoundError:
+        return None
+    except Exception:
+        return (502, "delete_failed", "Could not delete the account right now")
+    return None
