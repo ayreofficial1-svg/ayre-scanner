@@ -116,6 +116,8 @@ from data.breadth import load_full_breadth, save_full_breadth
 from data.market_close import load_close_snapshot, save_close_snapshot
 from config.settings import APP_ASSET_DIR
 from config.settings import APP_REQUIRE_VERIFIED_EMAIL
+from config.settings import APP_ENTRY_REACHED_ENABLED
+from data.app_signal_payload import to_app_signal
 from auth import app_auth
 from flask import g
 from config.settings import RA_REGISTRATION_NUMBER, DISCLAIMER
@@ -633,20 +635,10 @@ def _is_static_asset(path: str) -> bool:
 # GETs the Flutter app uses. Matched against the Flask route rule. Anything not
 # listed here is admin-only (cookie session) by default.
 _APP_READABLE_RULES = {
-    "/api/market",
-    "/api/market/gainers",
-    "/api/market/losers",
-    "/api/market/most-active",
-    "/api/market/<string:market_key>/constituents",
-    "/api/sentiment",
     "/api/signals",
     "/api/learn",
     "/api/learn/<string:article_id>",
     "/api/insights",
-    "/api/insights/volatility",
-    "/api/insights/momentum",
-    "/api/insights/volume-surge",
-    "/api/breadth/full",
     "/api/weekly-report",
     "/api/compliance",
     "/api/app/me",
@@ -1757,6 +1749,9 @@ def api_entries_publish_reached(hit_id: str):
     """
     if not _is_admin():
         return jsonify({"error": "Admin access required"}), 403
+    if not APP_ENTRY_REACHED_ENABLED:
+        return jsonify({"error": "Publishing \"entry reached\" is on hold. Nothing was changed.",
+                        "code": "feature_held"}), 409
     payload = request.get_json(silent=True) or {}
     if payload.get("confirm") is not True:
         return jsonify({"error": "Confirmation required", "code": "confirm_required"}), 400
@@ -2486,10 +2481,14 @@ def _signal_push_state(signal: dict) -> dict:
 @app.route("/api/signals", methods=["GET"])
 def api_signals_list():
     """
-    List of admin-picked stocks with live price/% change attached.
+    List of admin-picked stocks.
 
-    Response shape
-    ──────────────
+    App feed (app token / no ?all=1): analyst-typed fields only, built by
+    data.app_signal_payload.to_app_signal (explicit allow-list). No live price,
+    no % change, no entry_reached_* (unless APP_ENTRY_REACHED_ENABLED).
+
+    Response shape (app)
+    ────────────────────
     {
         "signals": [
             {
@@ -2497,14 +2496,18 @@ def api_signals_list():
                 "symbol"     : "RELIANCE",
                 "rationale"  : "Breakout above SMA44 with rising volume.",
                 "date_added" : "2026-07-03",
-                "added_by"   : "raghav",
-                "last_price" : 2850.45,
-                "change_pct" : 1.23
+                "entry_price": 2850.0,
+                "exit_price" : 3050.0,
+                "stop_loss"  : 2760.0,
+                ...
             },
             ...
         ],
         "updated_at": "<ISO timestamp>"
     }
+
+    Admin feed (?all=1 with a website session) additionally carries
+    last_price / change_pct and push_state for the admin panel.
     """
     global _fyers
     # Server-side decision (never a client parameter alone): only a signed-in
@@ -2529,30 +2532,26 @@ def api_signals_list():
             reverse=True,
         )
 
+    # Quotes are fetched for the admin panel ONLY. The app feed never touches
+    # the market-data provider and never carries a price field.
     quotes: dict[str, dict] = {}
-    symbols = [s["symbol"] for s in signals if s.get("symbol")]
-    if symbols and _fyers is not None and _fyers_market_data_allowed():
-        quotes = fetch_constituents_quotes_bulk(_fyers, symbols)
+    if include_hidden:
+        symbols = [s["symbol"] for s in signals if s.get("symbol")]
+        if symbols and _fyers is not None and _fyers_market_data_allowed():
+            quotes = fetch_constituents_quotes_bulk(_fyers, symbols)
 
     enriched = []
     for s in signals:
-        q = quotes.get(str(s.get("symbol", "")).upper(), {})
-        item = {
-            **s,
-            "last_price": q.get("last_price"),
-            "change_pct": q.get("change_pct"),
-        }
         if include_hidden:
+            q = quotes.get(str(s.get("symbol", "")).upper(), {})
+            item = {
+                **s,
+                "last_price": q.get("last_price"),
+                "change_pct": q.get("change_pct"),
+            }
             item["push_state"] = _signal_push_state(s)
         else:
-            # Publication / notification bookkeeping is admin-only; the app
-            # feed keeps its original shape.
-            for key in _SIGNAL_ADMIN_ONLY_FIELDS:
-                item.pop(key, None)
-            # No stock is featured or pinned in the app.
-            item["featured"] = False
-            item["pinned"] = False
-            item["display_order"] = 0
+            item = to_app_signal(s, APP_ENTRY_REACHED_ENABLED)
         enriched.append(item)
 
     return jsonify({

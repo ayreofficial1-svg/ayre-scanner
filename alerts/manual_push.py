@@ -21,7 +21,9 @@ both get through.
 
 import threading
 
-from config.settings import PUSH_DAILY_MAX_MANUAL, PUSH_DUPLICATE_WINDOW_SECONDS
+from config.settings import (
+    PUSH_DAILY_MAX_MANUAL, PUSH_DUPLICATE_WINDOW_SECONDS, APP_ENTRY_REACHED_ENABLED,
+)
 from data.app_devices import list_devices
 from data import push_audit
 from alerts import push
@@ -142,6 +144,9 @@ def send_revised_signal(signal: dict, admin, confirm, send_again=False) -> dict:
 
 def send_entry_reached(signal: dict, admin, confirm, send_again=False) -> dict:
     symbol = str(signal.get("symbol") or "").strip().upper()
+    if not APP_ENTRY_REACHED_ENABLED:
+        _refuse("entry_reached", symbol, admin, 409, "feature_held",
+                "Entry-reached publishing is on hold (APP_ENTRY_REACHED_ENABLED is off).")
     title, body = push.build_entry_reached_text(symbol)
     return send_manual(
         kind="entry_reached", key=symbol, title=title, body=body,

@@ -343,6 +343,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# ── Compliance hold: "entry reached" facts ───────────────────────────────────
+# OFF by default. While False the server (a) never includes entry_reached_* in
+# the app feed, (b) refuses "Publish entry reached" with 409 feature_held and
+# (c) refuses to send the entry_reached push. Detection code stays dormant.
+APP_ENTRY_REACHED_ENABLED    = _env_bool("APP_ENTRY_REACHED_ENABLED", False)
+
+
 HISTORY_STORE_ENABLED        = _env_bool("HISTORY_STORE_ENABLED", True)
 # IST wall-clock time (HH:MM) of the daily download on weekdays.
 HISTORY_STORE_DOWNLOAD_TIME  = _env_str("HISTORY_STORE_DOWNLOAD_TIME", "08:45")
