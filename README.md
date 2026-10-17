@@ -1,3 +1,12 @@
+> **Status after compliance removal (2026-10-17).** App tokens may only read `/api/signals`,
+> `/api/learn`, `/api/learn/<id>`, `/api/insights`, `/api/weekly-report`, `/api/compliance` and
+> `/api/app/me`. The `/api/market*`, `/api/sentiment`, `/api/breadth/full` and
+> `/api/insights/{volatility,momentum,volume-surge}` endpoints, and the breadth, market-poller and
+> close-snapshot jobs that fed them, have been removed. The app feed of `/api/signals` is an
+> allow-list of analyst-typed fields. "Entry reached" publishing is held (`APP_ENTRY_REACHED_ENABLED`,
+> default off). Production must set `SCANNER_ADMIN_USERS`. Endpoint tables below that list removed
+> routes are historical.
+
 # Nifty 500 Swing Scanner — Fyers API
 
 ## Project Structure

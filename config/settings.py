@@ -169,11 +169,6 @@ APP_INSIGHTS_FILE      = _persist("app_insights.json")
 APP_WEEKLY_REPORT_FILE = _persist("app_weekly_report.json")
 APP_EXITS_FILE         = _persist("app_exits.json")   # exit calls sent from the Signals tab
 APP_ASSET_DIR          = "static/uploads"
-# Sentiment is computed automatically from Nifty-500 breadth as of Phase 2
-# (see data/app_sentiment.py) — APP_SENTIMENT_FILE/APP_SENTIMENT_DEFAULT (the
-# old hand-set-value file and its placeholder score) are retired; nothing
-# else in the repo referenced them (verified by repo-wide search).
-
 # Optional: restrict POST/DELETE on /api/signals and /api/learn to a subset of
 # SCANNER_USERS. Comma-separated usernames, e.g. "raghav,admin".
 # If unset, any authenticated session may write (matches today's single-tier auth).
@@ -237,18 +232,6 @@ APP_UNIVERSE_STATS_FILE = "universe_stats.json"
 # read back on page load / after a restart. Zero Fyers cost — see
 # data/backtest_store.py.
 BACKTEST_STATE_FILE = "backtest_state.json"
-
-# ── Full Nifty-500 breadth poller ✅ ───────────────────────────────────────────
-# Fixed hourly slots, offset 15 minutes after each scanner slot (HH:30) so
-# the two schedules are visibly independent. No 15 — market closes 15:30,
-# so there's no 15:45 slot. 6 refreshes/day; see main.py::_breadth_loop.
-BREADTH_CHECK_HOURS  = [9, 10, 11, 12, 13, 14]
-BREADTH_CHECK_MINUTE = 45
-
-# Cached full-universe breadth snapshot, written by _breadth_loop, read by
-# GET /api/breadth/full. Persisted so a restart doesn't blank the Home
-# donut until the next hourly slot.
-BREADTH_FULL_FILE = "breadth_full.json"
 
 # ── End-of-session closing snapshot ✅ ─────────────────────────────────────────
 # The last full reading of the index board, movers, index constituents,

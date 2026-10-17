@@ -62,7 +62,7 @@ def _json_safe(value):
 from auth.fyers_auth import reconnect_fyers, get_cached_token, client_from_cached_token
 from config.settings import (
     ACTIVE_CHECK_HOURS, ACTIVE_CHECK_MINUTE, PASSIVE_CHECK_INTERVAL,
-    FYERS_APP_ID_FULL, BREADTH_CHECK_HOURS, BREADTH_CHECK_MINUTE,
+    FYERS_APP_ID_FULL,
 )
 from data.symbols import (
     fetch_nifty500, fetch_nifty500_with_meta, get_universe_meta,
@@ -87,7 +87,7 @@ from scanner.historical import (
 )
 from utils.logger import get_log_summary
 from utils.scan_progress import LIVE_PROGRESS, BACKTEST_PROGRESS
-from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk, fetch_full_market_breadth
+from data.quotes import fetch_ltp_bulk, fetch_constituents_quotes_bulk
 from alerts import manual_push
 from data import push_audit
 from data.app_signals import (
@@ -102,7 +102,6 @@ from alerts import push as push_alerts
 from data.app_learn import load_articles, add_article, update_article, delete_article, get_article
 from data.app_insights import load_insights, add_insight, update_insight, delete_insight
 from data.app_weekly_report import load_reports, add_report, update_report, delete_report
-from data.app_sentiment import compute_sentiment
 from data.universe_stats import load_universe_stats, save_universe_stats
 from data.backtest_store import (
     load_backtest_state, save_backtest_state, now_iso as _bt_now_iso, VALID_FILTERS as _BT_FILTERS,
@@ -112,8 +111,7 @@ from data.scan_store import (
     list_saved as _list_saved_scans,
 )
 from utils.scan_control import ScanCancelled, FyersAuthError
-from data.breadth import load_full_breadth, save_full_breadth
-from data.market_close import load_close_snapshot, save_close_snapshot
+from data.market_close import load_close_snapshot
 from config.settings import APP_ASSET_DIR
 from config.settings import APP_REQUIRE_VERIFIED_EMAIL
 from config.settings import APP_ENTRY_REACHED_ENABLED
@@ -201,12 +199,6 @@ _last_auth_date: datetime.date | None = None
 _symbols_meta: dict = {}   # provenance of _symbols (source / count / complete) from data.symbols
 _start_time = time.time()   # for /api/status uptime tracking
 
-# Full Nifty-500 breadth snapshot cache (spec §4), populated at startup from
-# disk and refreshed only by _breadth_loop's paced batch — read-only cache
-# for GET /api/breadth/full, never fetched at request time.
-_breadth_full_lock  = threading.Lock()
-_breadth_full_cache : dict | None = None
-
 # Market hours (IST) — scanner runs only within this window.
 # NSE regular session opens at 09:15; scans are intentionally fixed to
 # 09:30, 10:30, ... 15:30 so the first data pull has a settled opening range.
@@ -214,29 +206,16 @@ _MARKET_OPEN  = datetime.time(9,  15)
 _MARKET_CLOSE = datetime.time(15, 30)
 _POST_CLOSE_PASSIVE_START = datetime.time(16, 0)
 
-# ── End-of-session index close ───────────────────────────────────────────────
-# The Fyers WebSocket is shut down after the close, and every live market
-# endpoint is fed by it — so without a saved copy the app would have nothing to
-# show overnight, at weekends or on holidays. _close_snapshot_loop() keeps one
-# snapshot of the last reading: refreshed every _CLOSE_SNAPSHOT_INTERVAL_SECONDS
-# during the session, then the INDEX values are read again at 15:30:00 IST — the
-# bell — and once more _CLOSE_INDEX_SETTLE_SECONDS later to pick up any final
-# tick that arrives just after it. That is the number users see as the day's
-# close, until the next session.
-#
-# This is a read of ticks the WebSocket has already delivered: no REST call, no
-# extra Fyers request and no scan. Movers, constituents and the Insights charts
-# are NOT re-collected at the close; they keep the last reading they already had
-# (the last minute of the session for the live lists, the last scanner run for
-# the Insights charts). See data/market_close.py for the file shape.
-_CLOSE_SNAPSHOT_INTERVAL_SECONDS = 60
-_CLOSE_INDEX_SETTLE_SECONDS      = 30                     # re-read after the bell (0 = off)
+# ── End-of-session close snapshot (read-only legacy) ─────────────────────────
+# The app no longer reads any market endpoint, and the loop that captured the
+# index close has been removed. A snapshot file written by an older build may
+# still be loaded at startup; it is read by the status endpoint and the stream
+# close-window check, and is never refreshed. See data/market_close.py.
 _CLOSE_CAPTURE_DEADLINE          = datetime.time(15, 45)  # give up + keep last reading
 # The official close is the last index tick at or before the bell. A couple of
 # seconds of grace covers network/delivery lag on a tick the exchange stamped
 # 15:29:59; anything arriving later than that is a post-close value and is
 # never used as the close.
-_CLOSE_TICK_GRACE_SECONDS        = 2.0
 
 _close_lock: threading.Lock = threading.Lock()
 _close_snapshot: dict | None = None
@@ -253,10 +232,6 @@ _YAHOO_FRESH_TICK_MAX_AGE_SECONDS = 5 * 60
 
 # ── Market snapshot cache ─────────────────────────────────────────────────────
 _market_lock = threading.Lock()
-_market_cache = {
-    "data"      : None,
-    "expires_at": 0.0,
-}
 _market_status_cache = {
     "data"      : None,
     "expires_at": 0.0,
@@ -1878,212 +1853,7 @@ def api_entries_create_draft(hit_id: str):
     return jsonify({"signal": entry, "suggestion": suggestion}), 201
 
 
-@app.route("/api/market")
-def api_market():
-    """
-    Returns live snapshot for all markets in carousel order.
-
-    Response shape
-    ──────────────
-    {
-        "markets": [
-            {
-                "key"   : "nifty",
-                "name"  : "Nifty 50",
-                "value" : 22150.50,
-                "change": 0.45,
-                "points": 99.70
-            },
-            { "key": "sensex",     "name": "Sensex",     ... },
-            { "key": "bank_nifty", "name": "Bank Nifty", ... }
-        ],
-        "source"    : "fyers_ws" | "fyers" | "nse" | "yahoo" | "fallback",
-        "updated_at": "<ISO timestamp>"
-    }
-
-    "fyers_ws" means this came straight from the live WebSocket feed (the
-    common case during market hours) — "fyers"/"nse"/"yahoo" mean the
-    WebSocket hadn't ticked yet and a one-off REST call filled in instead.
-
-    Flutter integration notes
-    ──────────────────────────
-    - Poll this endpoint at the frontend's display refresh cadence.
-      Backend caching and Fyers gating keep external requests bounded.
-    - markets list is always in fixed order: Nifty → Sensex → Bank Nifty.
-    - Infinite carousel: nextIndex = (currentIndex + 1) % markets.length
-    - On tap, pass markets[i].key to GET /api/market/<key>/constituents.
-    """
-    return jsonify(_get_market_snapshot())
-
-
 # ── Movers — gainers / losers / most-active, straight from Fyers ─────────────
-_MOVERS_CACHE_TTL = 15  # seconds; only matters for the REST-fallback path
-_movers_lock  = threading.Lock()
-_movers_cache = {"data": None, "expires_at": 0.0}
-
-
-def _get_movers_payload() -> dict:
-    """
-    {"gainers": [...], "losers": [...], "most_active": [...], "source": ...}
-
-    Primary source is the live Fyers WebSocket (_fyers_stream.movers()) —
-    ranked across the full deduplicated Nifty 50 + Sensex 30 + Bank Nifty
-    universe, computed from ticks already in memory, no extra API calls.
-
-    Falls back to deriving the same ranking from the (REST/NSE-backed,
-    60s-cached) constituents endpoints when the socket hasn't produced
-    enough ticks yet — e.g. just after startup — cached for 15s so rapid
-    polling never re-derives on every request.
-    """
-    now = time.time()
-    if _market_is_closed_now():
-        closed = _closing_movers_payload()
-        if closed is not None:
-            return closed
-
-    if _fyers_market_data_allowed():
-        try:
-            live = _fyers_stream.movers()
-        except Exception:
-            live = None
-        if live:
-            return {**live, "source": "fyers_ws", "updated_at": datetime.datetime.now().isoformat()}
-
-    with _movers_lock:
-        cached = _movers_cache["data"]
-        if cached is not None and _movers_cache["expires_at"] > now:
-            return cached
-
-    rows: list[dict] = []
-    for market_cfg in MARKETS:
-        payload = _get_constituents(market_cfg)
-        for s in payload.get("stocks", []):
-            if s.get("last_price") is None or s.get("change_pct") is None:
-                continue
-            rows.append(s)
-
-    # De-duplicate by symbol (a stock can appear in more than one index).
-    by_symbol = {s["symbol"]: s for s in rows if s.get("symbol")}
-    rows = list(by_symbol.values())
-
-    if not rows:
-        # No priced stocks from any source — show the last saved reading
-        # rather than three empty lists.
-        closed = _closing_movers_payload()
-        if closed is not None:
-            return closed
-
-    gainers = sorted(rows, key=lambda r: r["change_pct"], reverse=True)[:10]
-    losers  = sorted(rows, key=lambda r: r["change_pct"])[:10]
-    active  = sorted(rows, key=lambda r: r.get("volume") or 0, reverse=True)[:10]
-
-    data = {
-        "gainers"    : gainers,
-        "losers"     : losers,
-        "most_active": active,
-        "source"     : "derived",
-        "updated_at" : datetime.datetime.now().isoformat(),
-    }
-    with _movers_lock:
-        _movers_cache["data"]       = data
-        _movers_cache["expires_at"] = now + _MOVERS_CACHE_TTL
-    return data
-
-
-@app.route("/api/market/gainers")
-def api_market_gainers():
-    """Top 10 gainers across Nifty 50 + Sensex 30 + Bank Nifty, deduplicated."""
-    payload = _get_movers_payload()
-    return jsonify({
-        "stocks"     : payload["gainers"],
-        "source"     : payload["source"],
-        "updated_at" : payload["updated_at"],
-        "market_closed": payload.get("market_closed", False),
-    })
-
-
-@app.route("/api/market/losers")
-def api_market_losers():
-    """Top 10 losers across Nifty 50 + Sensex 30 + Bank Nifty, deduplicated."""
-    payload = _get_movers_payload()
-    return jsonify({
-        "stocks"     : payload["losers"],
-        "source"     : payload["source"],
-        "updated_at" : payload["updated_at"],
-        "market_closed": payload.get("market_closed", False),
-    })
-
-
-@app.route("/api/market/most-active")
-def api_market_most_active():
-    """Top 10 stocks by traded volume across Nifty 50 + Sensex 30 + Bank Nifty, deduplicated."""
-    payload = _get_movers_payload()
-    return jsonify({
-        "stocks"     : payload["most_active"],
-        "source"     : payload["source"],
-        "updated_at" : payload["updated_at"],
-        "market_closed": payload.get("market_closed", False),
-    })
-
-
-@app.route("/api/market/<string:market_key>/constituents")
-def api_market_constituents(market_key: str):
-    """
-    Returns top-50 constituent stocks for the selected market.
-
-    URL
-    ───
-    GET /api/market/nifty/constituents
-    GET /api/market/sensex/constituents
-    GET /api/market/bank_nifty/constituents
-
-    Response shape
-    ──────────────
-    {
-        "market_key" : "nifty",
-        "market_name": "Nifty 50",
-        "count"      : 50,
-        "stocks": [
-            {
-                "rank"         : 1,
-                "symbol"       : "RELIANCE",
-                "company_name" : "Reliance Industries Ltd.",
-                "last_price"   : 2850.45,
-                "change_pct"   : 1.23,
-                "change_points": 34.55,
-                "open"         : 2820.00,
-                "high"         : 2865.00,
-                "low"          : 2810.00,
-                "year_high"    : 3050.00,
-                "year_low"     : 2180.00,
-                "volume"       : 4500000,
-                "market_cap"   : 1923456.78    (crores, may be null)
-            },
-            ...
-        ],
-        "source"    : "nse",
-        "updated_at": "<ISO timestamp>"
-    }
-
-    Error: unknown market_key → HTTP 404 { "error": "..." }
-
-    Flutter integration notes
-    ──────────────────────────
-    - Navigate to a new page when a market card is tapped.
-    - Pass market_key and market_name as route arguments.
-    - Fetch this endpoint once on page load; refresh on pull-to-refresh.
-    - stocks[i].change_pct > 0 → green text, < 0 → red text.
-    - Backend caches constituent data for 60 s — safe to call on every
-      page entry without hammering NSE.
-    """
-    market_cfg = next((m for m in MARKETS if m["market_key"] == market_key), None)
-    if market_cfg is None:
-        valid = [m["market_key"] for m in MARKETS]
-        return jsonify({
-            "error": f"Unknown market key: '{market_key}'. Valid keys: {valid}"
-        }), 404
-
-    return jsonify(_get_constituents(market_cfg))
 
 
 @app.route("/api/quotes")
@@ -3015,155 +2785,8 @@ def api_push_send():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Consumer app: Insights tab (sentiment gauge placeholder)
+# Consumer app: analyst insight notes (GET /api/insights, see below)
 # ─────────────────────────────────────────────────────────────────────────────
-
-@app.route("/api/sentiment", methods=["GET"])
-def api_sentiment():
-    """
-    Sentiment gauge value (0-100), computed live from the cached full
-    Nifty-500 breadth snapshot via data/app_sentiment.py::compute_sentiment
-    — see that module's docstring for the formula. This reads the same
-    in-memory `_breadth_full_cache` GET /api/breadth/full serves, so this
-    route makes no Fyers call and no disk read of its own; the manual
-    admin-set value (formerly load_sentiment/save_sentiment) was retired
-    in Phase 1/2.
-
-    Also merges in, when the live Fyers feed has ticked enough stocks,
-    real advances/declines/unchanged counted across the full tracked
-    universe (Nifty 50 + Sensex 30 + Bank Nifty, deduplicated) — this is a
-    smaller, different universe from the Nifty-500 breadth the score
-    itself is computed from, and is included purely as supplementary
-    display data, exactly as before.
-
-    Response shape
-    ──────────────
-    {
-        "sentiment" : 65 | null,
-        "updated_at": "<as_of timestamp>" | null,
-        "note"      : "312 of 490 stocks advancing" | null,
-        "advances"  : 312 | absent,
-        "declines"  : 178 | absent,
-        "unchanged" : 10  | absent
-    }
-
-    sentiment/updated_at/note are null together when there's no breadth
-    snapshot yet or coverage is too thin to trust (see compute_sentiment).
-    advances/declines/unchanged are omitted entirely (not null) until the
-    live WebSocket has enough data — the Flutter app already falls back to
-    its own locally-computed breadth in that case, so omitting rather than
-    sending nulls/zeros avoids it briefly showing "0 advances".
-    """
-    with _breadth_full_lock:
-        breadth_snapshot = dict(_breadth_full_cache) if _breadth_full_cache else None
-    data = compute_sentiment(breadth_snapshot)
-    try:
-        live_breadth = _fyers_stream.breadth()
-    except Exception:
-        live_breadth = None
-    if live_breadth:
-        data = {**data, **live_breadth}
-    elif _market_is_closed_now():
-        closing_breadth = _closing_breadth()
-        if closing_breadth:
-            data = {**data, **closing_breadth}
-    return jsonify(data)
-
-
-@app.route("/api/breadth/full")
-def api_breadth_full():
-    """
-    Full Nifty-500 breadth (spec §4.6) — a pure cache read for the
-    frontend. The 10-call Fyers fetch happens only in the background
-    poller (_breadth_loop), never on request.
-    """
-    with _breadth_full_lock:
-        data = dict(_breadth_full_cache) if _breadth_full_cache else None
-    if not data:
-        return jsonify({
-            "as_of": None,
-            "advances": 0,
-            "declines": 0,
-            "unchanged": 0,
-            "avg_change_pct": 0.0,
-            "coverage": 0,
-        })
-    return jsonify(data)
-
-
-@app.route("/api/insights/volatility")
-def api_insights_volatility():
-    """
-    Histogram buckets of ATR% across all tracked stocks (spec §2.4).
-    Cache-only — reads _state["universe_stats"], no Fyers calls at
-    request time. Refreshes at scan cadence (up to 7×/day).
-    """
-    stats = _state.get("universe_stats") or {}
-    buckets = {"0-1%": 0, "1-2%": 0, "2-3%": 0, "3%+": 0}
-    for row in stats.values():
-        atr_pct = row.get("atr_pct")
-        if atr_pct is None:
-            continue
-        if atr_pct < 1:
-            buckets["0-1%"] += 1
-        elif atr_pct < 2:
-            buckets["1-2%"] += 1
-        elif atr_pct < 3:
-            buckets["2-3%"] += 1
-        else:
-            buckets["3%+"] += 1
-    return jsonify({
-        "buckets": buckets,
-        "as_of": _state.get("universe_stats_as_of"),
-    })
-
-
-@app.route("/api/insights/momentum")
-def api_insights_momentum():
-    """
-    Bullish/bearish MACD tilt across all tracked stocks (spec §2.4).
-    Cache-only, same as /api/insights/volatility.
-    """
-    stats = _state.get("universe_stats") or {}
-    bullish = bearish = 0
-    for row in stats.values():
-        flag = row.get("macd_bullish")
-        if flag is True:
-            bullish += 1
-        elif flag is False:
-            bearish += 1
-    return jsonify({
-        "bullish": bullish,
-        "bearish": bearish,
-        "as_of": _state.get("universe_stats_as_of"),
-    })
-
-
-@app.route("/api/insights/volume-surge")
-def api_insights_volume_surge():
-    """
-    Top N stocks by volume surge (today's volume ÷ 20-day average volume),
-    descending (spec §2.4). Cache-only, same as the other /api/insights/*
-    endpoints. ?limit=N overrides the default of 15 (clamped to 1-50).
-    """
-    stats = _state.get("universe_stats") or {}
-    try:
-        limit = int(request.args.get("limit", 15))
-    except (TypeError, ValueError):
-        limit = 15
-    limit = max(1, min(limit, 50))
-
-    rows = [
-        {"symbol": sym, "volume_surge": row["volume_surge"], "close": row.get("close")}
-        for sym, row in stats.items()
-        if row.get("volume_surge") is not None
-    ]
-    rows.sort(key=lambda r: r["volume_surge"], reverse=True)
-
-    return jsonify({
-        "items": rows[:limit],
-        "as_of": _state.get("universe_stats_as_of"),
-    })
 
 
 @app.route("/api/compliance")
@@ -3545,41 +3168,6 @@ def serve_react(path: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# "Fyers busy" guard — shared by everything in the breadth poller (spec §3/§4)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_BUSY_COOLDOWN_SECONDS = 20   # buffer after a scan/backtest ends, before
-                               # anything new is allowed to fire
-
-
-def _fyers_busy_for_extras() -> bool:
-    """
-    True if a scheduled scan, a manual rescan, or a backtest is running
-    right now, or finished less than _BUSY_COOLDOWN_SECONDS ago.
-
-    A manual rescan calls the exact same _do_scan() function a scheduled
-    scan does, and sets the exact same _state["scanning"] flag — so this
-    never needs to distinguish "manual" from "automatic" scans. The
-    backtest job is the one genuinely separate path, which is why it gets
-    its own check via _backtest_jobs.
-
-    This is a *skip* primitive. _breadth_loop() builds a wait-then-fire
-    primitive on top of it (spec §4.4), which is what actually gives the
-    breadth poller "pause and continue after scanning is done" behavior
-    rather than "skip this cycle and wait an hour."
-    """
-    if _state.get("scanning") or _heavy_kind is not None:
-        return True
-    with _backtest_lock:
-        if any(j.get("status") == "running" for j in _backtest_jobs.values()):
-            return True
-    last_finished = _state.get("last_heavy_fyers_op_at")
-    if last_finished and (time.time() - last_finished) < _BUSY_COOLDOWN_SECONDS:
-        return True
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Scan
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3702,9 +3290,8 @@ def _do_scan(lock_held: bool = False):
         if _notices:
             _state["notice"] = " ".join(_notices)
 
-        # Insights (spec §2) — persist so a restart doesn't blank the charts
-        # until the next scan, and update the in-memory copy the
-        # /api/insights/* endpoints read from.
+        # Universe stats — internal scanner output; persisted so a restart
+        # does not lose it. No app endpoint serves it.
         _state["universe_stats"] = universe_stats
         saved_stats = save_universe_stats(universe_stats)
         _state["universe_stats_as_of"] = saved_stats["as_of"]
@@ -3802,24 +3389,6 @@ def _next_scan_slot_after(now: datetime.datetime | None = None) -> datetime.date
 def _seconds_until_next_scan_slot() -> float:
     now = datetime.datetime.now(_IST)
     return max(0.0, (_next_scan_slot_after(now) - now).total_seconds())
-
-
-def _next_breadth_slot_after(now: datetime.datetime | None = None) -> datetime.datetime | None:
-    """
-    Next fixed full-breadth poller slot (HH:45 IST, spec §4.3) still to come
-    today. Returns None once today's slots are exhausted — analogous to
-    _seconds_until_next_active_slot's None-when-exhausted contract (not
-    _next_scan_slot_after's always-wraps-to-tomorrow one), so _breadth_loop's
-    "no more slots today" branch has something to detect.
-    """
-    now = now or datetime.datetime.now(_IST)
-    for h in BREADTH_CHECK_HOURS:
-        target = now.replace(
-            hour=h, minute=BREADTH_CHECK_MINUTE, second=0, microsecond=0
-        )
-        if target > now:
-            return target
-    return None
 
 
 def _clock_hour_at_or_after(now: datetime.datetime) -> datetime.datetime:
@@ -4570,108 +4139,6 @@ def _sweep_loop() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Full Nifty-500 breadth poller (spec §4) — independent thread and schedule
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _refresh_full_breadth() -> None:
-    """
-    The paced 10-call Fyers batch (spec §4.2): advances/declines/unchanged +
-    average change % across the full Nifty 500, cached for GET
-    /api/breadth/full. Called only from _breadth_loop, only once the busy
-    guard has cleared and the market is source-confirmed open.
-    """
-    global _breadth_full_cache
-
-    if _fyers is None or not _symbols:
-        return
-
-    result = _sweep.latest_breadth()          # from the one-minute sweep: 0 Fyers calls
-    if result is not None:
-        print("   📊  Breadth taken from the one-minute sweep (no extra Fyers calls).")
-    else:
-        try:
-            result = fetch_full_market_breadth(_fyers, _symbols)
-        except Exception as e:
-            print(f"   ⚠️  Breadth poller: fetch error: {e}")
-            return
-
-    if not result:
-        print("   ⚠️  Breadth poller: no usable data returned this cycle.")
-        return
-
-    data = save_full_breadth(
-        advances       = result["advances"],
-        declines       = result["declines"],
-        unchanged      = result["unchanged"],
-        avg_change_pct = result["avg_change_pct"],
-        coverage       = result["coverage"],
-    )
-    with _breadth_full_lock:
-        _breadth_full_cache = data
-
-    print(
-        f"   📊  Full breadth refreshed: {data['advances']} adv / "
-        f"{data['declines']} dec / {data['unchanged']} unch "
-        f"(coverage {data['coverage']}/{len(_symbols)})"
-    )
-
-
-_BREADTH_MAX_WAIT_SECONDS = 15 * 60   # generous bound: scans normally take
-                                        # 2–4 min; backtests can run longer
-
-
-def _breadth_loop() -> None:
-    """
-    Full Nifty-500 breadth poller — fixed hourly slots (spec §4.3), 15
-    minutes offset from the scanner's own schedule.
-
-    Runs on its own daemon thread, started independently in main() — never
-    called from or blocking on _scan_loop / _do_scan. A slow breadth fetch
-    can therefore never delay a scan slot, and a slow scan can never
-    silently swallow a breadth slot: two threads, two schedules, one shared
-    guard (_fyers_busy_for_extras, which only *reads* state) is the whole
-    coordination mechanism.
-    """
-    print(
-        f"📊  Breadth poller started — slots at "
-        f"{', '.join(f'{h:02d}:{BREADTH_CHECK_MINUTE:02d}' for h in BREADTH_CHECK_HOURS)} IST"
-    )
-    while True:
-        now = datetime.datetime.now(_IST)
-
-        if not _is_market_open():
-            time.sleep(300)   # cheap poll while closed; no Fyers calls here
-            continue
-
-        next_slot = _next_breadth_slot_after(now)
-        if next_slot is None:
-            time.sleep(_seconds_until_next_scan_slot())  # reuse existing helper's shape
-            continue
-
-        _sleep_until(next_slot)   # reuse the existing helper as-is
-
-        # ── This slot's fire time has arrived. If a scan/rescan/backtest is
-        #    running right now, WAIT for it to finish rather than skipping —
-        #    this is the "pause, then continue" behavior. ──
-        waited = 0
-        while _fyers_busy_for_extras() and waited < _BREADTH_MAX_WAIT_SECONDS:
-            time.sleep(5)
-            waited += 5
-
-        if _fyers_busy_for_extras():
-            # Still busy after the max wait (an unusually long backtest,
-            # say) — give up on THIS slot rather than firing late into the
-            # next one's territory. The next loop iteration computes the
-            # next fixed slot fresh, so this never double-fires or drifts.
-            continue
-
-        if not _fyers_market_data_allowed():
-            continue   # market status may have changed while we were waiting
-
-        _refresh_full_breadth()   # the paced 10-call batch from §4.2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Live quotes poller
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4754,136 +4221,6 @@ def _closing_snapshot_is_for(day: datetime.date) -> bool:
     return bool(snap) and snap.get("trade_date") == day.isoformat()
 
 
-def _store_close_snapshot(snapshot: dict) -> None:
-    """
-    Keep `snapshot` in memory and on disk. Never lets an older session, or an
-    intraday reading, replace a finalised close for the same day.
-    """
-    global _close_snapshot
-    snapshot = _json_safe(snapshot)
-    with _close_lock:
-        current = _close_snapshot
-        if current:
-            if snapshot["trade_date"] < current["trade_date"]:
-                return
-            if (
-                snapshot["trade_date"] == current["trade_date"]
-                and current.get("final")
-                and not snapshot.get("final")
-            ):
-                return
-        _close_snapshot = snapshot
-    try:
-        save_close_snapshot(snapshot)
-    except Exception as e:
-        print(f"   ⚠️  Could not save closing snapshot: {e}")
-
-
-def _read_index_board(today: datetime.date) -> list | None:
-    """
-    The three index rows from the live tick cache, or None unless all three
-    have ticked *today* — a stale cache from a previous session (or a holiday)
-    can never be mistaken for today's reading.
-
-    Deliberately ignores _fyers_market_data_allowed(): the tick cache is still
-    in memory just after the close, which is exactly when this runs. It only
-    reads memory — no network call of any kind.
-    """
-    last_tick = _fyers_stream.last_tick_at()
-    if last_tick is None:
-        return None
-    if datetime.datetime.fromtimestamp(last_tick, _IST).date() != today:
-        return None
-    try:
-        board = _fyers_stream.index_board(MARKETS, last_known=True)
-    except Exception:
-        return None
-    return board["markets"] if board else None
-
-
-def _build_close_snapshot(today: datetime.date) -> dict | None:
-    """An intraday reading of everything the live feed holds (memory only)."""
-    markets = _read_index_board(today)
-    if not markets:
-        return None
-
-    try:
-        movers = _fyers_stream.movers()
-    except Exception:
-        movers = None
-
-    constituents: dict[str, list] = {}
-    for market_cfg in MARKETS:
-        try:
-            rows = _fyers_stream.constituents(market_cfg["market_key"])
-        except Exception:
-            rows = None
-        if rows:
-            constituents[market_cfg["market_key"]] = rows
-
-    try:
-        breadth = _fyers_stream.breadth()
-    except Exception:
-        breadth = None
-
-    return {
-        "trade_date" : today.isoformat(),
-        "captured_at": datetime.datetime.now(_IST).isoformat(),
-        "final"      : False,
-        "markets"    : markets,
-        "movers"     : movers,
-        "constituents": constituents,
-        "breadth"    : breadth,
-    }
-
-
-def _read_index_board_at_close(today: datetime.date) -> list | None:
-    """
-    The three index rows as of the bell: for each index, the last tick that
-    arrived at or before 15:30:00 IST (+ a small delivery-lag grace). Ticks
-    that arrive after the bell are ignored, so a later or recalculated value
-    can never replace the real closing level. None if any index has no tick
-    in that window.
-    """
-    close_dt = datetime.datetime.combine(today, _MARKET_CLOSE, tzinfo=_IST)
-    cutoff_ts = close_dt.timestamp() + _CLOSE_TICK_GRACE_SECONDS
-    try:
-        board = _fyers_stream.index_board_at(MARKETS, cutoff_ts)
-    except Exception:
-        return None
-    return board["markets"] if board else None
-
-
-def _capture_index_close(today: datetime.date) -> bool:
-    """
-    Refresh ONLY the index values in today's snapshot with the readings as of
-    the bell and mark it final. Everything else in the snapshot is left
-    exactly as the last intraday reading had it.
-    """
-    markets = _read_index_board_at_close(today)
-    if not markets:
-        return False
-    current = _close_snapshot_get()
-    if not current or current.get("trade_date") != today.isoformat():
-        return False
-    _store_close_snapshot({
-        **current,
-        "markets"    : markets,
-        "captured_at": datetime.datetime.now(_IST).isoformat(),
-        "final"      : True,
-    })
-    return True
-
-
-def _promote_last_reading_to_final(today: datetime.date) -> None:
-    """The live feed gave us nothing after the close — keep the last intraday
-    reading as the close rather than leaving today unfinalised."""
-    current = _close_snapshot_get()
-    if current and current.get("trade_date") == today.isoformat() and not current.get("final"):
-        _store_close_snapshot({**current, "final": True})
-        print("   🏁  No post-close ticks — last intraday reading kept as the close.")
-
-
 def _close_window_holds_stream() -> bool:
     """
     True from 15:30 until the index close has been taken, on a day that traded.
@@ -4899,114 +4236,6 @@ def _close_window_holds_stream() -> bool:
     if _close_capture_done_for == now.date():
         return False
     return _closing_snapshot_is_for(now.date())
-
-
-def _close_snapshot_tick() -> float:
-    """One pass of the snapshot loop. Returns how many seconds to sleep."""
-    global _close_index_captured_for, _close_capture_done_for
-    now = datetime.datetime.now(_IST)
-    today = now.date()
-    if now.weekday() >= 5:
-        return 300.0
-    close_dt = _today_at(now, _MARKET_CLOSE)
-
-    # ── In session: keep the "last reading" fresh ───────────────────────────
-    if _is_market_open() and _fyers_market_data_allowed():
-        snapshot = _build_close_snapshot(today)
-        if snapshot is not None:
-            _store_close_snapshot(snapshot)
-        # Wake right at the bell rather than up to a minute after it.
-        to_bell = (close_dt - now).total_seconds()
-        if 0 < to_bell < _CLOSE_SNAPSHOT_INTERVAL_SECONDS:
-            return max(0.05, to_bell)
-        return float(_CLOSE_SNAPSHOT_INTERVAL_SECONDS)
-
-    # ── After the bell: index close, then leave it alone ────────────────────
-    if _close_capture_done_for == today:
-        return 60.0
-    current = _close_snapshot_get()
-    if current and current.get("trade_date") == today.isoformat() and current.get("final"):
-        _close_capture_done_for = today          # e.g. restarted after the close
-        return 60.0
-    if now < close_dt:
-        return 60.0
-    if not _closing_snapshot_is_for(today):
-        # Holiday, or the server only started after the close: nothing to finalise.
-        _close_capture_done_for = today
-        return 60.0
-
-    # (1) The bell reading: the latest index ticks, as close to 15:30:00 as the
-    #     loop can get. Saved at once so users never wait for the re-read below.
-    if _close_index_captured_for != today:
-        if _capture_index_close(today):
-            _close_index_captured_for = today
-            print(f"   🏁  Index close saved for {today.isoformat()} at "
-                  f"{datetime.datetime.now(_IST).strftime('%H:%M:%S')} IST.")
-        else:
-            # No index tick at or before the bell (e.g. the feed was down at
-            # the close). Waiting cannot help — any tick arriving now is a
-            # post-close value — so keep the last in-session reading as the
-            # close instead of ever using a later one.
-            _promote_last_reading_to_final(today)
-            _close_capture_done_for = today
-            return 60.0
-
-    # (2) One re-read a few seconds on, to pick up a final tick that lands just
-    #     after the bell. Index values only; harmless if it finds nothing new.
-    settle_at = close_dt + datetime.timedelta(seconds=_CLOSE_INDEX_SETTLE_SECONDS)
-    if now < settle_at:
-        return max(0.5, min(5.0, (settle_at - now).total_seconds()))
-    _capture_index_close(today)
-    _close_capture_done_for = today
-    return 60.0
-
-
-def _close_snapshot_loop() -> None:
-    """
-    Independent daemon thread (like the Fyers stream poller): it only reads the
-    in-memory tick cache and writes the snapshot file. It makes no network call
-    and never touches scanner state.
-    """
-    print(
-        f"🏁  Index-close loop started (reading every {_CLOSE_SNAPSHOT_INTERVAL_SECONDS}s "
-        f"in session; index close at {_MARKET_CLOSE.strftime('%H:%M')} IST "
-        f"+ {_CLOSE_INDEX_SETTLE_SECONDS}s re-read)"
-    )
-    while True:
-        sleep_for = 30.0
-        try:
-            sleep_for = _close_snapshot_tick()
-        except Exception as e:
-            print(f"   ⚠️  index-close loop error: {e}")
-        time.sleep(sleep_for)
-
-
-def _closing_board_payload() -> dict | None:
-    snap = _close_snapshot_get()
-    if not snap or not snap.get("markets"):
-        return None
-    return {
-        "markets"      : snap["markets"],
-        "source"       : "market_close",
-        "updated_at"   : snap["captured_at"],
-        "market_closed": _market_is_closed_now(),
-        "trade_date"   : snap["trade_date"],
-    }
-
-
-def _closing_movers_payload() -> dict | None:
-    snap = _close_snapshot_get()
-    movers = (snap or {}).get("movers") or {}
-    if not (movers.get("gainers") or movers.get("losers") or movers.get("most_active")):
-        return None
-    return {
-        "gainers"      : movers.get("gainers", []),
-        "losers"       : movers.get("losers", []),
-        "most_active"  : movers.get("most_active", []),
-        "source"       : "market_close",
-        "updated_at"   : snap["captured_at"],
-        "market_closed": _market_is_closed_now(),
-    }
 
 
 def _closing_constituents_payload(market_cfg: dict) -> dict | None:
@@ -5025,11 +4254,6 @@ def _closing_constituents_payload(market_cfg: dict) -> dict | None:
     }
 
 
-def _closing_breadth() -> dict | None:
-    snap = _close_snapshot_get()
-    return (snap or {}).get("breadth") or None
-
-
 def _close_snapshot_summary() -> dict | None:
     snap = _close_snapshot_get()
     if not snap:
@@ -5044,231 +4268,6 @@ def _close_snapshot_summary() -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Market snapshot — Nifty 50 + Sensex + Bank Nifty
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _get_market_snapshot() -> dict:
-    """
-    Live Fyers WebSocket ticks are read fresh on every call (see
-    _get_constituents() for why — in-memory reads are free, so caching
-    them only adds needless staleness). The cache below applies only to
-    the NSE/Fyers-REST/Yahoo fallback path, which does cost a real network
-    call and is reached only before the WebSocket has produced a tick for
-    all three indices (e.g. just after startup/reconnect).
-    """
-    now = time.time()
-
-    # Market closed (evenings, overnight, pre-open, weekends): serve the saved
-    # closing values. They don't change until the next session, so there is
-    # nothing to fetch — and nothing that can fail and leave the board empty.
-    if _market_is_closed_now():
-        closed = _closing_board_payload()
-        if closed is not None:
-            return closed
-
-    # Primary source: the live Fyers WebSocket — zero extra API calls, just
-    # reads whatever the socket has already received, fresh every time.
-    if _fyers_market_data_allowed():
-        try:
-            live = _fyers_stream.index_board(MARKETS)
-        except Exception:
-            live = None
-        if live is not None:
-            with _market_lock:
-                _market_cache["data"]       = live  # kept only as an emergency last-resort value
-                _market_cache["expires_at"] = now
-            return live
-
-    with _market_lock:
-        cached = _market_cache["data"]
-        if cached is not None and _market_cache["expires_at"] > now:
-            return cached
-
-    # Fallback waterfall — only reached while the WebSocket hasn't produced
-    # a full tick yet (e.g. just after startup/reconnect). Fyers REST is
-    # tried first per-request when allowed, since Fyers is now the primary
-    # source end-to-end; NSE and Yahoo remain as safety nets so the board
-    # never goes blank, and outside market hours NSE/Yahoo are used alone
-    # (Fyers is not called at all when data use isn't allowed).
-    if _fyers_market_data_allowed():
-        fetchers = (_fetch_market_from_fyers, _fetch_market_from_nse, _fetch_market_from_yahoo)
-    else:
-        fetchers = (_fetch_market_from_nse, _fetch_market_from_yahoo)
-    for fetcher in fetchers:
-        try:
-            data = fetcher()
-            with _market_lock:
-                _market_cache["data"]       = data
-                _market_cache["expires_at"] = now + 5
-            return data
-        except Exception:
-            continue
-
-    # Every live source failed: the last saved reading beats a stale in-memory
-    # value, and far beats the made-up numbers below.
-    closed = _closing_board_payload()
-    if closed is not None:
-        return closed
-
-    # Return stale cache before giving up
-    with _market_lock:
-        if _market_cache["data"] is not None:
-            return _market_cache["data"]
-
-    # Absolute last resort
-    timestamp    = datetime.datetime.now().isoformat()
-    markets_list = [
-        {"key": "nifty",      "name": "Nifty 50",    "value": 22150.50, "change": 0.45, "points":  99.70},
-        {"key": "sensex",     "name": "Sensex",       "value": 73200.10, "change": 0.38, "points": 277.10},
-        {"key": "bank_nifty", "name": "Bank Nifty",   "value": 46800.00, "change": 0.30, "points": 140.00},
-    ]
-    return {"markets": markets_list, "source": "fallback", "updated_at": timestamp}
-
-
-def _fetch_market_from_nse() -> dict:
-    """
-    Primary source: NSE allIndices API.
-    Fetches Nifty 50, Sensex, and Bank Nifty in a single HTTP call.
-    """
-    session  = _get_nse_session()
-    response = session.get("https://www.nseindia.com/api/allIndices", timeout=10)
-    response.raise_for_status()
-    indices  = response.json().get("data", [])
-
-    # Build a normalised lookup keyed by indexSymbol
-    lookup: dict[str, dict] = {
-        str(item.get("indexSymbol") or item.get("index") or "").upper().strip(): item
-        for item in indices
-    }
-
-    found: dict[str, dict] = {}
-    for market in MARKETS:
-        item = lookup.get(market["nse_allindices_key"])
-        if item:
-            found[market["market_key"]] = _normalize_market_item(
-                market["display_name"], {
-                    "value" : item.get("last",          0),
-                    "change": item.get("percentChange", 0),
-                    "points": item.get("change",        0),
-                }
-            )
-
-    if len(found) < len(MARKETS):
-        missing = [m["market_key"] for m in MARKETS if m["market_key"] not in found]
-        raise RuntimeError(
-            f"NSE allIndices missing markets: {missing}. "
-            f"Available keys (first 10): {list(lookup.keys())[:10]}"
-        )
-
-    return _build_market_payload(found, source="nse")
-
-
-def _fetch_market_from_fyers() -> dict:
-    """
-    First fallback: Fyers quotes API using the existing trading connection.
-    Fetches all three index symbols in a single call.
-    """
-    if _fyers is None:
-        raise RuntimeError("Fyers connection unavailable")
-
-    symbols_str = ",".join(m["fyers_symbol"] for m in MARKETS)
-    response    = _fyers.quotes(data={"symbols": symbols_str})
-
-    if not response or response.get("s") != "ok":
-        raise RuntimeError(f"Fyers quote error: {response}")
-
-    found: dict[str, dict] = {}
-    for item in response.get("d", []):
-        symbol = str(item.get("n") or item.get("symbol") or "").upper()
-        values = item.get("v") or item
-        for market in MARKETS:
-            # Match by the Fyers symbol string (e.g. "NSE:NIFTY50-INDEX")
-            if market["fyers_symbol"].upper() in symbol:
-                found[market["market_key"]] = _normalize_market_item(
-                    market["display_name"], values
-                )
-                break
-
-    if len(found) < len(MARKETS):
-        missing = [m["market_key"] for m in MARKETS if m["market_key"] not in found]
-        raise RuntimeError(f"Incomplete Fyers market payload. Missing: {missing}")
-
-    return _build_market_payload(found, source="fyers")
-
-
-def _fetch_market_from_yahoo() -> dict:
-    """
-    Second fallback: Yahoo Finance. May throttle under heavy polling.
-    """
-    yahoo_symbols = ",".join(m["yahoo_symbol"] for m in MARKETS)
-    response = requests.get(
-        "https://query1.finance.yahoo.com/v7/finance/quote",
-        params={"symbols": yahoo_symbols},
-        timeout=10,
-    )
-    response.raise_for_status()
-    results = response.json().get("quoteResponse", {}).get("result", [])
-
-    found: dict[str, dict] = {}
-    for item in results:
-        symbol = str(item.get("symbol") or "").upper()
-        values = {
-            "value" : item.get("regularMarketPrice"),
-            "change": item.get("regularMarketChangePercent"),
-            "points": item.get("regularMarketChange"),
-        }
-        for market in MARKETS:
-            if market["yahoo_symbol"].upper() == symbol:
-                found[market["market_key"]] = _normalize_market_item(
-                    market["display_name"], values
-                )
-                break
-
-    if len(found) < len(MARKETS):
-        missing = [m["market_key"] for m in MARKETS if m["market_key"] not in found]
-        raise RuntimeError(f"Incomplete Yahoo market payload. Missing: {missing}")
-
-    return _build_market_payload(found, source="yahoo")
-
-
-def _build_market_payload(found: dict[str, dict], source: str) -> dict:
-    """
-    Assemble the canonical /api/market response.
-    Markets are always emitted in MARKETS list order for a stable carousel.
-    """
-    markets_list = []
-    for market in MARKETS:
-        entry = found[market["market_key"]].copy()
-        entry["key"] = market["market_key"]
-        markets_list.append(entry)
-
-    return {
-        "markets"   : markets_list,
-        "source"    : source,
-        "updated_at": datetime.datetime.now().isoformat(),
-    }
-
-
-def _normalize_market_item(name: str, values: dict) -> dict:
-    value  = _pick_number(values, "value",  "lp", "ltp", "last_price")
-    change = _pick_number(values, "change", "change_pct", "chp", "percent_change")
-    points = _pick_number(values, "points", "change_points", "ch")
-    return {
-        "name"  : name,
-        "value" : round(value,  2),
-        "change": round(change, 2),
-        "points": round(points, 2),
-    }
-
-
-def _pick_number(values: dict, *keys: str) -> float:
-    for key in keys:
-        raw = values.get(key)
-        if raw is None:
-            continue
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            continue
-    raise ValueError(f"Missing numeric value for keys: {keys}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5623,39 +4622,6 @@ def _get_nse_session() -> requests.Session:
 # Background pollers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _start_market_poller(interval_seconds: int = 5) -> None:
-    """
-    Background thread that refreshes the market snapshot cache.
-    Cache is always warm — Flutter clients get instant responses.
-    Fyers is only allowed after Yahoo/NSE confirm the market is open. Outside
-    market hours the poll slows to PASSIVE_CHECK_INTERVAL and uses free sources.
-    """
-    def _poll():
-        try:
-            _get_nse_session()
-        except Exception:
-            pass
-
-        while True:
-            try:
-                _get_market_snapshot()
-            except Exception:
-                pass
-            if _fyers_market_data_allowed():
-                sleep = interval_seconds
-            elif _is_market_open():
-                sleep = 60
-            else:
-                sleep = PASSIVE_CHECK_INTERVAL
-            time.sleep(sleep)
-
-    t = threading.Thread(target=_poll, daemon=True, name="market-poller")
-    t.start()
-    print(
-        f"📡  Market poller started "
-        f"({interval_seconds}s while source-confirmed open; "
-        f"{PASSIVE_CHECK_INTERVAL // 60}m outside market hours; NSE/Yahoo free-source fallback)"
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5663,7 +4629,7 @@ def _start_market_poller(interval_seconds: int = 5) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global _fyers, _symbols, _breadth_full_cache, _close_snapshot
+    global _fyers, _symbols, _close_snapshot
 
     parser = argparse.ArgumentParser(description="Nifty 500 Swing Trading Scanner")
     parser.add_argument("--verbose", action="store_true")
@@ -5682,13 +4648,11 @@ def main():
     _set_universe(*fetch_nifty500_with_meta())
     print("   Auth will run automatically after Yahoo/NSE confirm a trading day, before the first scan slot.")
 
-    # Restore cached Insights stats and full-breadth snapshot from disk so
-    # neither screen is blank between process restart and the next
-    # scan / breadth slot.
+    # Restore the cached universe stats (internal scanner output, not served
+    # to the app) from disk.
     loaded_stats = load_universe_stats()
     _state["universe_stats"]       = loaded_stats["stats"]
     _state["universe_stats_as_of"] = loaded_stats["as_of"]
-    _breadth_full_cache = load_full_breadth()
     _close_snapshot     = load_close_snapshot()
 
     # Restore today's latest saved scheduled scan so a restart does not blank
@@ -5735,42 +4699,22 @@ def main():
     threading.Thread(target=_history_loop, daemon=True, name="history-store-loop").start()
     threading.Thread(target=_sweep_loop, daemon=True, name="sweep-loop").start()
 
-    breadth_slot_labels = [f"{h:02d}:{BREADTH_CHECK_MINUTE:02d}" for h in BREADTH_CHECK_HOURS]
-    print(
-        f"📊  Starting full Nifty-500 breadth poller "
-        f"({breadth_slot_labels[0]}–{breadth_slot_labels[-1]} IST via {', '.join(breadth_slot_labels)}) …"
-    )
-    threading.Thread(target=_breadth_loop, daemon=True, name="breadth-loop").start()
 
     if push_alerts.is_configured():
         print("🔔  Push notifications enabled (FCM)")
     else:
         print("🔕  Push notifications off — set FIREBASE_SERVICE_ACCOUNT_JSON to enable")
 
-    _start_market_poller(interval_seconds=60)
     _start_quotes_poller(interval_seconds=15)
     _start_fyers_stream_poller(check_interval_seconds=30)
-    threading.Thread(target=_close_snapshot_loop, daemon=True, name="close-snapshot-loop").start()
 
     url = f"http://localhost:{args.port}"
     print(f"🌐  Opening {url} …")
     print(f"    Press Ctrl+C to stop.\n")
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
 
-    # threaded=True: with the live market-data endpoints now doing a real
-    # (if occasional) synchronous network call on their REST-fallback path
-    # (NSE/Fyers/Yahoo — only reached before the WebSocket has produced a
-    # tick), a single-threaded dev server would serialize *every* request
-    # behind that one slow call — not just other market-data requests, but
-    # scanner/website requests too. Flutter now also fires several market
-    # requests concurrently per screen per refresh tick (Home, Index Detail,
-    # Equity Detail, Insights each polling independently every 4s), so
-    # without this the requests in one tick queue up behind each other even
-    # when every one of them is a fast in-memory read. This is exactly the
-    # kind of load the existing per-cache locks (_market_lock,
-    # _constituents_lock, _movers_lock, and fyers_stream's own lock) were
-    # already written to support concurrently — enabling threading here was
-    # the missing piece, not a new design.
+    # threaded=True so one slow request (a scan trigger, an NSE directory
+    # fetch) does not block every other website request behind it.
     app.run(host="0.0.0.0", port=args.port, debug=False, use_reloader=False, threaded=True)
 
 
