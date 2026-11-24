@@ -1,7 +1,7 @@
 {
   "scripts": {
     "build": "cd frontend && npm ci && npm run build",
-    "start": "python main.py --port $PORT"
+    "start": "gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 8 --timeout 120 --graceful-timeout 30"
   },
   "engines": {
     "node": "20.x"

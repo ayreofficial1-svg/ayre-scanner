@@ -4628,9 +4628,95 @@ def _get_nse_session() -> requests.Session:
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    global _fyers, _symbols, _close_snapshot
+_startup_lock = threading.Lock()
+_startup_done = False
 
+
+def start_background_services() -> bool:
+    """
+    One-time server startup: load the universe and saved state from disk, then
+    start every background job (scan loop, history loop, sweep loop, quotes
+    poller, Fyers stream poller).
+
+    Safe to call from more than one place or thread: the first call does the
+    work and returns True, every later call returns False and does nothing.
+    It never opens a browser and never starts a web server, so it is the same
+    code path for `python main.py` (local) and gunicorn (Railway).
+    """
+    global _fyers, _symbols, _close_snapshot, _startup_done
+
+    with _startup_lock:
+        if _startup_done:
+            return False
+        _startup_done = True   # set first so a failure below is never retried into duplicate threads
+
+        _set_universe(*fetch_nifty500_with_meta())
+        print("   Auth will run automatically after Yahoo/NSE confirm a trading day, before the first scan slot.")
+
+        # Restore the cached universe stats (internal scanner output, not served
+        # to the app) from disk.
+        loaded_stats = load_universe_stats()
+        _state["universe_stats"]       = loaded_stats["stats"]
+        _state["universe_stats_as_of"] = loaded_stats["as_of"]
+        _close_snapshot     = load_close_snapshot()
+
+        # Restore today's latest saved scheduled scan so a restart does not blank
+        # the Scanner page until the next slot.
+        try:
+            _saved_live = _load_scan_result("live", datetime.datetime.now(_IST).date().isoformat())
+            if _saved_live and not _state["signals"]:
+                _p = _saved_live["payload"]
+                _state["signals"]         = _p.get("signals", [])
+                _state["watchlist_items"] = _p.get("watchlist_items", [])
+                _state["scan_time"]       = _p.get("scan_time")
+                _state["total_scanned"]   = _p.get("total_scanned", 0)
+                _state["total_attempted"] = _p.get("total_attempted", 0)
+                _state["scan_report"]     = _p.get("scan_report")
+                print(f"📂  Restored today's saved scan ({_state['scan_time']})")
+        except Exception as exc:
+            print(f"⚠️   Could not restore saved live scan: {exc}")
+
+        # A backtest that was running when the server stopped can never finish —
+        # clear it so every user sees the last completed result instead of a
+        # spinner that never ends. The previous results are kept untouched.
+        with _backtest_lock:
+            if _backtest_state.get("running_job"):
+                interrupted = _backtest_state["running_job"].get("date")
+                _backtest_state["running_job"] = None
+                _backtest_state["error"] = (
+                    f"The backtest for {interrupted} was interrupted by a server restart. "
+                    "Run it again if you need it; the previous results are shown."
+                )
+                _bt_commit_locked()
+
+        history_store.load_on_startup()          # disk → memory, no Fyers calls
+
+        summary = get_log_summary()
+        print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")
+        print(f"    Stocks     : {len(_symbols)}")
+
+        slot_labels = [f"{h:02d}:{ACTIVE_CHECK_MINUTE:02d}" for h in ACTIVE_CHECK_HOURS]
+        print(
+            f"\n🔄  Starting fixed-slot scan loop "
+            f"({slot_labels[0]}–{slot_labels[-1]} IST via {', '.join(slot_labels)}) …"
+        )
+        threading.Thread(target=_scan_loop, daemon=True, name="scan-loop").start()
+        threading.Thread(target=_history_loop, daemon=True, name="history-store-loop").start()
+        threading.Thread(target=_sweep_loop, daemon=True, name="sweep-loop").start()
+
+
+        if push_alerts.is_configured():
+            print("🔔  Push notifications enabled (FCM)")
+        else:
+            print("🔕  Push notifications off — set FIREBASE_SERVICE_ACCOUNT_JSON to enable")
+
+        _start_quotes_poller(interval_seconds=15)
+        _start_fyers_stream_poller(check_interval_seconds=30)
+
+    return True
+
+
+def main():
     parser = argparse.ArgumentParser(description="Nifty 500 Swing Trading Scanner")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--port",    type=int, default=5000)
@@ -4645,68 +4731,7 @@ def main():
         print("     cd frontend && npm install && npm run build\n")
         print("     Or for dev: npm run dev → open http://localhost:5173\n")
 
-    _set_universe(*fetch_nifty500_with_meta())
-    print("   Auth will run automatically after Yahoo/NSE confirm a trading day, before the first scan slot.")
-
-    # Restore the cached universe stats (internal scanner output, not served
-    # to the app) from disk.
-    loaded_stats = load_universe_stats()
-    _state["universe_stats"]       = loaded_stats["stats"]
-    _state["universe_stats_as_of"] = loaded_stats["as_of"]
-    _close_snapshot     = load_close_snapshot()
-
-    # Restore today's latest saved scheduled scan so a restart does not blank
-    # the Scanner page until the next slot.
-    try:
-        _saved_live = _load_scan_result("live", datetime.datetime.now(_IST).date().isoformat())
-        if _saved_live and not _state["signals"]:
-            _p = _saved_live["payload"]
-            _state["signals"]         = _p.get("signals", [])
-            _state["watchlist_items"] = _p.get("watchlist_items", [])
-            _state["scan_time"]       = _p.get("scan_time")
-            _state["total_scanned"]   = _p.get("total_scanned", 0)
-            _state["total_attempted"] = _p.get("total_attempted", 0)
-            _state["scan_report"]     = _p.get("scan_report")
-            print(f"📂  Restored today's saved scan ({_state['scan_time']})")
-    except Exception as exc:
-        print(f"⚠️   Could not restore saved live scan: {exc}")
-
-    # A backtest that was running when the server stopped can never finish —
-    # clear it so every user sees the last completed result instead of a
-    # spinner that never ends. The previous results are kept untouched.
-    with _backtest_lock:
-        if _backtest_state.get("running_job"):
-            interrupted = _backtest_state["running_job"].get("date")
-            _backtest_state["running_job"] = None
-            _backtest_state["error"] = (
-                f"The backtest for {interrupted} was interrupted by a server restart. "
-                "Run it again if you need it; the previous results are shown."
-            )
-            _bt_commit_locked()
-
-    history_store.load_on_startup()          # disk → memory, no Fyers calls
-
-    summary = get_log_summary()
-    print(f"\n📋  Signal log : {summary['total_signals']} signals across {summary['days_logged']} day(s)")
-    print(f"    Stocks     : {len(_symbols)}")
-
-    slot_labels = [f"{h:02d}:{ACTIVE_CHECK_MINUTE:02d}" for h in ACTIVE_CHECK_HOURS]
-    print(
-        f"\n🔄  Starting fixed-slot scan loop "
-        f"({slot_labels[0]}–{slot_labels[-1]} IST via {', '.join(slot_labels)}) …"
-    )
-    threading.Thread(target=_scan_loop, daemon=True, name="scan-loop").start()
-    threading.Thread(target=_history_loop, daemon=True, name="history-store-loop").start()
-    threading.Thread(target=_sweep_loop, daemon=True, name="sweep-loop").start()
-
-
-    if push_alerts.is_configured():
-        print("🔔  Push notifications enabled (FCM)")
-    else:
-        print("🔕  Push notifications off — set FIREBASE_SERVICE_ACCOUNT_JSON to enable")
-
-    _start_quotes_poller(interval_seconds=15)
-    _start_fyers_stream_poller(check_interval_seconds=30)
+    start_background_services()
 
     url = f"http://localhost:{args.port}"
     print(f"🌐  Opening {url} …")
@@ -4718,5 +4743,16 @@ def main():
     app.run(host="0.0.0.0", port=args.port, debug=False, use_reloader=False, threaded=True)
 
 
+def _running_under_gunicorn() -> bool:
+    # gunicorn exports SERVER_SOFTWARE=gunicorn/<version> before it loads the app.
+    return "gunicorn" in os.environ.get("SERVER_SOFTWARE", "").lower()
+
+
 if __name__ == "__main__":
     main()
+elif _running_under_gunicorn():
+    # `gunicorn main:app` imports this module instead of running main(), so
+    # start the background jobs here. Run gunicorn with exactly ONE worker
+    # (--workers 1) and without --preload, otherwise every scan would run once
+    # per worker and notifications could be sent twice.
+    start_background_services()
