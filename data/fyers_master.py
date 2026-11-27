@@ -86,6 +86,18 @@ def _read_disk() -> str | None:
         return None
 
 
+def cached_equity_name(symbol: str) -> str | None:
+    """Read the company name from the on-disk master without fetching market data."""
+    text = _read_disk()
+    if text is None:
+        return None
+    ticker = f"NSE:{symbol.upper()}-EQ"
+    for row in csv.reader(io.StringIO(text)):
+        if len(row) > 1 and ticker in row:
+            return row[1].strip() or None
+    return None
+
+
 def _parse(text: str) -> dict | None:
     rows = list(csv.reader(io.StringIO(text)))
     if len(rows) < 1000:

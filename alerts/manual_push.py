@@ -26,6 +26,7 @@ from config.settings import (
 )
 from data.app_devices import list_devices
 from data import push_audit
+from data.fyers_master import cached_equity_name
 from alerts import push
 
 _guard_lock = threading.Lock()
@@ -122,24 +123,28 @@ def send_manual(
 
 # ── Typed helpers (payloads identical to the existing notify_* functions) ────
 
-def send_new_signal(signal: dict, admin, confirm, send_again=False) -> dict:
+def _send_signal(signal: dict, admin, confirm, send_again, *, revised: bool) -> dict:
     symbol = str(signal.get("symbol") or "").strip().upper()
-    title, body = push.build_new_signal_text(symbol, signal.get("entry_low"), signal.get("entry_high"))
+    stock = str(signal.get("name") or "").strip() or cached_equity_name(symbol) or symbol
+    return_pct = push.potential_return_pct(signal.get("entry_price"), signal.get("exit_price"))
+    title, body = push.build_signal_text(stock, return_pct, revised=revised)
+    kind = "signal_update" if revised else "signal"
     return send_manual(
-        kind="signal", key=symbol, title=title, body=body,
-        data={"type": "signal", "symbol": symbol, "signal_id": signal.get("id")},
+        kind=kind, key=symbol, title=title, body=body,
+        data={
+            "type": kind, "symbol": symbol, "signal_id": signal.get("id"),
+            "stock_name": stock, "potential_return_pct": return_pct,
+        },
         topic="signals", admin=admin, confirm=confirm, send_again=send_again,
     )
+
+
+def send_new_signal(signal: dict, admin, confirm, send_again=False) -> dict:
+    return _send_signal(signal, admin, confirm, send_again, revised=False)
 
 
 def send_revised_signal(signal: dict, admin, confirm, send_again=False) -> dict:
-    symbol = str(signal.get("symbol") or "").strip().upper()
-    title, body = push.build_revised_signal_text(symbol, signal.get("entry_low"), signal.get("entry_high"))
-    return send_manual(
-        kind="signal_update", key=symbol, title=title, body=body,
-        data={"type": "signal_update", "symbol": symbol, "signal_id": signal.get("id")},
-        topic="signals", admin=admin, confirm=confirm, send_again=send_again,
-    )
+    return _send_signal(signal, admin, confirm, send_again, revised=True)
 
 
 def send_entry_reached(signal: dict, admin, confirm, send_again=False) -> dict:
@@ -155,15 +160,11 @@ def send_entry_reached(signal: dict, admin, confirm, send_again=False) -> dict:
     )
 
 
-def send_exit(stock: str, profit: float, exit_price: float, admin, confirm, send_again=False,
-              exit_low=None, exit_high=None) -> dict:
-    title, body = push.build_exit_text(stock, profit, exit_price, exit_low, exit_high)
-    data = {"type": "exit", "symbol": stock, "profit": profit, "exit_price": exit_price}
-    if exit_low is not None and exit_high is not None:
-        data.update({"exit_low": exit_low, "exit_high": exit_high})
+def send_exit(stock: str, profit: float, admin, confirm, send_again=False) -> dict:
+    title, body = push.build_exit_text(stock, profit)
     return send_manual(
         kind="exit", key=stock, title=title, body=body,
-        data=data,
+        data={"type": "exit", "symbol": stock, "profit": profit},
         topic=None, admin=admin, confirm=confirm, send_again=send_again,
     )
 

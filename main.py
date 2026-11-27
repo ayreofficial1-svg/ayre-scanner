@@ -2615,10 +2615,9 @@ def api_exits_add():
     if push_alerts.is_configured():
         try:
             sent = manual_push.send_exit(
-                symbol, profit, exit_price, admin,
+                symbol, profit, admin,
                 payload.get("confirm") is True,
                 send_again=payload.get("send_again") is True,
-                exit_low=exit_low, exit_high=exit_high,
             )
             notified, audience = True, sent["audience"]
         except manual_push.SendRefused as refused:

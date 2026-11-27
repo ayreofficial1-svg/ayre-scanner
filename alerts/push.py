@@ -30,13 +30,12 @@ Notification kinds (the app tells them apart by data["type"])
   signal         a published pick, announced by the admin → opens Signals
   signal_update  an already-announced pick changed → opens Signals
   entry_reached  a published pick reached its entry level → opens Signals
-  exit           exit call (stock, profit, exit price) → opens the Alerts screen
+  exit           exit call (stock, profit) → opens the Alerts screen
   general        custom message from the Notifications panel
 
 Wording is plain and short: a 2-3 word heading, the stock, one short line.
-Each kind has a pool of variations; one is picked at random and never the
-same as the previous one. The app keeps a matching pool
-(lib/services/notification_copy.dart) for entries it records itself.
+Entry and exit calls vary their headings. Pick announcements and updates
+use a fixed title and the potential return calculated from the saved prices.
 
 Credentials: see FIREBASE_SERVICE_ACCOUNT_* in config/settings.py.
 """
@@ -45,6 +44,7 @@ import os
 import json
 import base64
 import datetime
+import math
 import random
 import re
 import threading
@@ -218,24 +218,6 @@ def send_to_devices(
 
 # ── Wording ──────────────────────────────────────────────────────────────────
 
-_NEW_PICK = [
-    ("New Pick",        "A fresh pick is ready."),
-    ("New Signal",      "Check Signals on Home."),
-    ("Fresh Setup",     "A new setup is available."),
-    ("New Opportunity", "See Signals on Home."),
-    ("Buy Setup",       "A new setup is ready."),
-    ("Fresh Pick",      "Take a look in Signals."),
-    ("Buy Signal",      "Open Signals on Home."),
-]
-
-_REVISED = [
-    ("Signal Updated", "The signal has been updated."),
-    ("Pick Revised",   "The existing pick has changed."),
-    ("Updated Signal", "Check the latest details."),
-    ("Setup Updated",  "The setup has been updated."),
-    ("Pick Updated",   "Open Signals for the change."),
-]
-
 _ENTRY_REACHED = [
     ("Level Reached",       "has reached its entry level."),
     ("Entry Level Reached", "touched its entry level."),
@@ -270,34 +252,24 @@ def format_rupees(value: float) -> str:
     return f"{'-' if value < 0 else ''}₹{digits}" + (f".{paise:02d}" if paise else "")
 
 
-def format_range(low, high) -> str:
-    """₹538–₹543 (a single price when both ends are equal). Empty string if unusable."""
+def potential_return_pct(entry_price, exit_price) -> float | None:
+    """Percentage change from the analyst's saved entry to the saved exit."""
     try:
-        lo, hi = float(low), float(high)
-    except (TypeError, ValueError):
-        return ""
-    if not (lo > 0 and hi > 0):
-        return ""
-    lo, hi = min(lo, hi), max(lo, hi)
-    if abs(hi - lo) < 1e-9:
-        return format_rupees(lo)
-    return f"{format_rupees(lo)}–{format_rupees(hi)}"
+        entry, exit = float(entry_price), float(exit_price)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (0 < entry < math.inf and 0 < exit < math.inf):
+        return None
+    change = (exit - entry) / entry * 100
+    return change if math.isfinite(change) else None
 
 
-def build_new_signal_text(symbol: str, entry_low=None, entry_high=None) -> tuple[str, str]:
-    heading, line = _pick("new", _NEW_PICK)
-    zone = format_range(entry_low, entry_high)
-    if zone:
-        line = f"{line} Entry range {zone}."
-    return f"{heading}: {symbol}", line
-
-
-def build_revised_signal_text(symbol: str, entry_low=None, entry_high=None) -> tuple[str, str]:
-    heading, line = _pick("revised", _REVISED)
-    zone = format_range(entry_low, entry_high)
-    if zone:
-        line = f"{line} Entry range {zone}."
-    return f"{heading}: {symbol}", line
+def build_signal_text(stock: str, return_pct: float | None, *, revised: bool) -> tuple[str, str]:
+    heading = "Pick Updated" if revised else "Fresh Pick"
+    body = "Open Signals for details."
+    if return_pct is not None:
+        body = f"Potential return: {return_pct:.2f}%."
+    return f"{heading}: {stock}", body
 
 
 def build_entry_reached_text(symbol: str) -> tuple[str, str]:
@@ -306,15 +278,8 @@ def build_entry_reached_text(symbol: str) -> tuple[str, str]:
     return f"{heading}: {symbol}", f"{symbol} {line} Open Signals for details."
 
 
-def build_exit_text(
-    stock: str, profit: float, exit_price: float, exit_low=None, exit_high=None,
-) -> tuple[str, str]:
+def build_exit_text(stock: str, profit: float) -> tuple[str, str]:
     loss = profit < 0
     heading = _pick("exit-loss" if loss else "exit", _EXIT_LOSS if loss else _EXIT_PROFIT)
     label = "Loss" if loss else "Profit"
-    # An exit range, when given, replaces the single exit price in the text.
-    where = format_range(exit_low, exit_high) or format_rupees(exit_price)
-    return (
-        f"{heading}: {stock}",
-        f"{label} {format_rupees(abs(profit))} | Exit {where}",
-    )
+    return f"{heading}: {stock}", f"{label} {format_rupees(abs(profit))}. Open Alerts for details."
